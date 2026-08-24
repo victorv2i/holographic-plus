@@ -128,6 +128,41 @@ def test_outbox_failure_rolls_back_the_fact_transaction(tmp_path):
             WriteRequest("key-1", "must roll back", "test"),
         )
     assert conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0] == 0
+
+
+def test_late_batch_failure_rolls_back_prior_embedding_outbox_job(tmp_path):
+    _path, conn = _db(tmp_path)
+    outbox = EmbeddingOutbox(conn, SPEC)
+    calls = 0
+
+    def fail_second(connection, request, observation_id):
+        nonlocal calls
+        del observation_id
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("late batch failure")
+        return FactWriteResult(_fact(connection, request.content))
+
+    service = MemoryWriteService(
+        conn,
+        fail_second,
+        MemoryPolicy({"client-a": ("private",)}),
+        embedding_enqueue=outbox.enqueue_in_transaction,
+    )
+    context = ConnectionContext("client-a", "client-a", "client-a", "session")
+    writes = (
+        (WriteRequest("batch-1", "first vector fact", "test"), None),
+        (WriteRequest("batch-2", "second vector fact", "test"), None),
+    )
+
+    with pytest.raises(RuntimeError, match="late batch failure"):
+        service.write_batch(context, writes)
+
+    assert conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM embedding_jobs").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM memory_write_log").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 0
+    conn.close()
     conn.close()
 
 
@@ -152,9 +187,12 @@ def test_backfill_processor_success_and_crash_safe_lease_reclaim(tmp_path):
     result = other.process_one(now=start + timedelta(seconds=6))
 
     assert result is not None and result.outcome == "embedded"
-    assert conn.execute(
-        "SELECT COUNT(*) FROM fact_embeddings WHERE fact_id = ?", (fact_id,)
-    ).fetchone()[0] == 1
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM fact_embeddings WHERE fact_id = ?", (fact_id,)
+        ).fetchone()[0]
+        == 1
+    )
     assert outbox.health()["activation_safe"] is True
     conn.close()
 
@@ -173,7 +211,10 @@ def test_retry_then_dead_letter_is_bounded_and_health_degrades(tmp_path):
     )
     start = datetime(2030, 1, 1, tzinfo=timezone.utc)
     assert processor.process_one(now=start).outcome == "pending"
-    assert processor.process_one(now=start + timedelta(seconds=10)).outcome == "dead_letter"
+    assert (
+        processor.process_one(now=start + timedelta(seconds=10)).outcome
+        == "dead_letter"
+    )
     health = outbox.health()
     assert health["dead_letter"] == 1
     assert health["activation_safe"] is False
@@ -188,7 +229,10 @@ def test_expired_exhausted_lease_dead_letters_without_another_model_call(tmp_pat
     outbox.enqueue_backfill()
     embedder = FakeEmbedder()
     processor = EmbeddingJobProcessor(
-        outbox, _writer(conn, embedder), worker_id="worker", max_attempts=1,
+        outbox,
+        _writer(conn, embedder),
+        worker_id="worker",
+        max_attempts=1,
         lease_seconds=1,
     )
     start = datetime(2030, 1, 1, tzinfo=timezone.utc)
@@ -207,12 +251,18 @@ def test_final_attempt_live_lease_is_not_dead_lettered_by_second_claimer(tmp_pat
     outbox.enqueue_backfill()
     start = datetime(2030, 1, 1, tzinfo=timezone.utc)
     first = EmbeddingJobProcessor(
-        outbox, _writer(conn, FakeEmbedder()), worker_id="first",
-        max_attempts=1, lease_seconds=30,
+        outbox,
+        _writer(conn, FakeEmbedder()),
+        worker_id="first",
+        max_attempts=1,
+        lease_seconds=30,
     )
     second = EmbeddingJobProcessor(
-        outbox, _writer(conn, FakeEmbedder()), worker_id="second",
-        max_attempts=1, lease_seconds=30,
+        outbox,
+        _writer(conn, FakeEmbedder()),
+        worker_id="second",
+        max_attempts=1,
+        lease_seconds=30,
     )
     claimed = first.claim(now=start)
     assert claimed is not None and claimed.attempts == 1
@@ -224,7 +274,9 @@ def test_final_attempt_live_lease_is_not_dead_lettered_by_second_claimer(tmp_pat
     assert tuple(live) == ("processing", claimed.lease_token, "first")
 
     assert second.claim(now=start + timedelta(seconds=31)) is None
-    assert conn.execute("SELECT status FROM embedding_jobs").fetchone()[0] == "dead_letter"
+    assert (
+        conn.execute("SELECT status FROM embedding_jobs").fetchone()[0] == "dead_letter"
+    )
     conn.close()
 
 
@@ -253,9 +305,14 @@ def test_writer_identity_rejects_unbound_model_or_prefix_configuration(tmp_path)
         )
     with pytest.raises(ValueError, match="none prefix"):
         SQLiteStoredEmbeddingWriter(
-            conn, FakeEmbedder(), document_identity=SPEC.document_identity,
-            embedding_version="v1", model_fingerprint="v1",
-            prefix_policy="none", dimensions=2, query_prefix="query: ",
+            conn,
+            FakeEmbedder(),
+            document_identity=SPEC.document_identity,
+            embedding_version="v1",
+            model_fingerprint="v1",
+            prefix_policy="none",
+            dimensions=2,
+            query_prefix="query: ",
         )
     conn.close()
 
@@ -297,19 +354,26 @@ def test_nonempty_prefix_binding_uses_one_query_document_pair_hash(tmp_path):
     policy = f"sha256-{digest}"
     identity = f"fake:model:document:{policy}:v1"
     spec = EmbeddingSpec(
-        identity, "v1", 2, model_fingerprint="v1",
-        prefix_policy=policy, query_prefix=query_prefix,
+        identity,
+        "v1",
+        2,
+        model_fingerprint="v1",
+        prefix_policy=policy,
+        query_prefix=query_prefix,
         document_prefix=document_prefix,
     )
     writer = SQLiteStoredEmbeddingWriter(
-        conn, FakeEmbedder(), document_identity=identity,
-        embedding_version="v1", model_fingerprint="v1",
-        prefix_policy=policy, query_prefix=query_prefix,
-        document_prefix=document_prefix, dimensions=2,
+        conn,
+        FakeEmbedder(),
+        document_identity=identity,
+        embedding_version="v1",
+        model_fingerprint="v1",
+        prefix_policy=policy,
+        query_prefix=query_prefix,
+        document_prefix=document_prefix,
+        dimensions=2,
     )
-    EmbeddingJobProcessor(
-        EmbeddingOutbox(conn, spec), writer, worker_id="binding-test"
-    )
+    EmbeddingJobProcessor(EmbeddingOutbox(conn, spec), writer, worker_id="binding-test")
     conn.close()
 
 
@@ -338,7 +402,9 @@ def test_supervisor_surfaces_processor_retry_as_last_error(tmp_path):
 
 
 @pytest.mark.parametrize("mutation", ["invalidate", "supersede", "erase"])
-def test_post_model_revalidation_never_stores_stale_or_erased_content(tmp_path, mutation):
+def test_post_model_revalidation_never_stores_stale_or_erased_content(
+    tmp_path, mutation
+):
     path, conn = _db(tmp_path)
     fact_id = _fact(conn, "private content")
     replacement = _fact(conn, "replacement") if mutation == "supersede" else None
@@ -371,9 +437,12 @@ def test_post_model_revalidation_never_stores_stale_or_erased_content(tmp_path, 
     result = processor.process_one()
 
     assert result.outcome == "skipped_stale"
-    assert conn.execute(
-        "SELECT COUNT(*) FROM fact_embeddings WHERE fact_id = ?", (fact_id,)
-    ).fetchone()[0] == 0
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM fact_embeddings WHERE fact_id = ?", (fact_id,)
+        ).fetchone()[0]
+        == 0
+    )
     conn.close()
 
 
@@ -396,9 +465,12 @@ def test_conflict_winner_revives_completed_skip_and_gets_embedded(tmp_path):
     conn.commit()
 
     assert processor.process_one().outcome == "embedded"
-    assert conn.execute(
-        "SELECT COUNT(*) FROM fact_embeddings WHERE fact_id = ?", (fact_id,)
-    ).fetchone()[0] == 1
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM fact_embeddings WHERE fact_id = ?", (fact_id,)
+        ).fetchone()[0]
+        == 1
+    )
     conn.close()
 
 

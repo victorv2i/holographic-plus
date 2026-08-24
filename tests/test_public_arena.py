@@ -4,11 +4,14 @@ import json
 
 import pytest
 
+from enfold.hybrid_retrieval import named_anchor_tokens
+from memory_eval import public_arena
 from memory_eval.public_arena import (
     EnfoldCoreFtsCurrentProvider,
     EnfoldOfflineHybridProvider,
     PUBLIC_ARENA_PATH,
     REQUIRED_CASE_TYPES,
+    _proper_anchor_tokens,
     load_public_arena,
     main,
     run_public_arena,
@@ -157,6 +160,24 @@ def test_core_provider_abstains_when_named_query_anchor_is_absent():
     arena = load_public_arena()
     with EnfoldCoreFtsCurrentProvider(arena) as provider:
         assert provider.search("What budget was approved for Project Ember?") == []
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "Tell me about GPT-5 and Project Ember",
+        "I prefer Atlas for launch planning",
+        "Could Mina review Quartz?",
+        "What did Avery decide about Project-Zaffre?",
+        "Please show Our current roadmap",
+        "Atlas says Tell Mina about Quartz",
+        "please Tell me about Atlas",
+    ],
+)
+def test_public_arena_named_anchors_match_core_hybrid_retrieval(query, monkeypatch):
+    assert _proper_anchor_tokens(query) == named_anchor_tokens(query)
+    monkeypatch.setattr(public_arena, "_core_named_anchor_tokens", None)
+    assert _proper_anchor_tokens(query) == named_anchor_tokens(query)
 
 
 def test_offline_hybrid_arena_is_deterministic_and_honestly_identified():

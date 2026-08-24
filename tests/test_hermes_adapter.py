@@ -45,11 +45,11 @@ class ReadOnlyFallback:
 
 @dataclass
 class FakeHermesHost:
-    agent_id: str = "wonny"
+    agent_id: str = "avery"
     session_id: str = "session-42"
-    parent_agent_id: str | None = "wonny-main"
+    parent_agent_id: str | None = "avery-main"
     project_root: str = "/work/enfold"
-    repository: str = "victor/enfold"
+    repository: str = "avery/enfold"
     branch: str = "adapter"
     commit_sha: str = "abc123"
 
@@ -67,6 +67,19 @@ def adapter(tmp_path: Path, transport=RecordingTransport, **kwargs):
     )
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("connect_timeout", float("nan")),
+        ("connect_timeout", float("inf")),
+        ("request_timeout", 0),
+    ],
+)
+def test_adapter_config_rejects_invalid_timeouts(tmp_path, field, value):
+    with pytest.raises(ValueError, match="timeouts must be positive"):
+        HermesAdapterConfig(tmp_path / "enfold.sock", **{field: value})
+
+
 def test_fake_host_context_becomes_immutable_handshake_provenance(tmp_path):
     memory = adapter(tmp_path).open_host_session(
         FakeHermesHost(), access_scopes=("private", "project:enfold")
@@ -75,15 +88,41 @@ def test_fake_host_context_becomes_immutable_handshake_provenance(tmp_path):
 
     assert context.client_id == HERMES_CLIENT_ID
     assert context.surface == "hermes"
-    assert context.agent_id == "wonny"
+    assert context.agent_id == "avery"
     assert context.session_id == "session-42"
-    assert context.parent_agent_id == "wonny-main"
+    assert context.parent_agent_id == "avery-main"
     assert context.project_root == "/work/enfold"
-    assert context.repository == "victor/enfold"
+    assert context.repository == "avery/enfold"
     assert context.branch == "adapter"
     assert context.commit_sha == "abc123"
     assert context.access_scopes == ("private", "project:enfold")
     assert memory.context == context
+
+
+def test_adapter_passes_supervisor_credential_to_every_session(tmp_path):
+    root = HermesProtocolAdapter(
+        HermesAdapterConfig(
+            tmp_path / "enfold.sock", credential="credential-from-supervisor"
+        ),
+        transport_factory=RecordingTransport,
+    )
+
+    root.open_session(HermesSessionContext("avery", "s-1", ("private",)))
+
+    assert RecordingTransport.instances[0].config.credential == (
+        "credential-from-supervisor"
+    )
+
+
+def test_adapter_config_repr_omits_plaintext_credential(tmp_path):
+    credential = "operator-" + "credential-value"
+
+    rendered = repr(
+        HermesAdapterConfig(tmp_path / "enfold.sock", credential=credential)
+    )
+
+    assert credential not in rendered
+    assert "credential=" not in rendered
 
 
 def test_mapping_host_is_supported_but_scopes_are_explicit(tmp_path):
@@ -98,24 +137,24 @@ def test_mapping_host_is_supported_but_scopes_are_explicit(tmp_path):
 
 def test_write_maps_fields_and_uses_stable_event_idempotency(tmp_path):
     memory = adapter(tmp_path).open_session(
-        HermesSessionContext("wonny", "s-1", ("private",))
+        HermesSessionContext("avery", "s-1", ("private",))
     )
 
     first = memory.write(
-        "Victor prefers concise replies",
+        "Avery prefers concise replies",
         event_id="message-123",
         source_type="conversation",
         scope="private",
         category="user_pref",
-        asserted_by="victor",
+        asserted_by="avery",
     )
     second = memory.write(
-        "Victor prefers concise replies",
+        "Avery prefers concise replies",
         event_id="message-123",
         source_type="conversation",
         scope="private",
         category="user_pref",
-        asserted_by="victor",
+        asserted_by="avery",
     )
 
     calls = RecordingTransport.instances[0].calls
@@ -129,8 +168,8 @@ def test_write_maps_fields_and_uses_stable_event_idempotency(tmp_path):
 
 def test_idempotency_is_session_and_event_specific(tmp_path):
     root = adapter(tmp_path)
-    a = root.open_session(HermesSessionContext("wonny", "s-1", ("private",)))
-    b = root.open_session(HermesSessionContext("wonny", "s-2", ("private",)))
+    a = root.open_session(HermesSessionContext("avery", "s-1", ("private",)))
+    b = root.open_session(HermesSessionContext("avery", "s-2", ("private",)))
 
     assert a.idempotency_key("turn-1") == a.idempotency_key("turn-1")
     assert a.idempotency_key("turn-1") != a.idempotency_key("turn-2")
@@ -141,17 +180,17 @@ def test_idempotency_is_session_and_event_specific(tmp_path):
 
 def test_all_read_operations_map_to_proxy(tmp_path):
     memory = adapter(tmp_path).open_session(
-        HermesSessionContext("wonny", "s-1", ("private",))
+        HermesSessionContext("avery", "s-1", ("private",))
     )
 
-    memory.search("Victor", category="person", limit=5)
+    memory.search("Avery", category="person", limit=5)
     memory.memory_context("current project", token_budget=144, scope="private")
     memory.evidence(7, limit=3)
-    memory.history(subject_key="victor", predicate_key="preference")
+    memory.history(subject_key="avery", predicate_key="preference")
     memory.conflicts(scope="private", unresolved_only=False)
 
     assert RecordingTransport.instances[0].calls == [
-        ("memory.search", {"query": "Victor", "category": "person", "limit": 5}, None),
+        ("memory.search", {"query": "Avery", "category": "person", "limit": 5}, None),
         (
             "memory.context",
             {"query": "current project", "token_budget": 144, "scope": "private"},
@@ -160,7 +199,7 @@ def test_all_read_operations_map_to_proxy(tmp_path):
         ("memory.evidence", {"fact_id": 7, "limit": 3}, None),
         (
             "memory.history",
-            {"subject_key": "victor", "predicate_key": "preference"},
+            {"subject_key": "avery", "predicate_key": "preference"},
             None,
         ),
         (
@@ -173,16 +212,16 @@ def test_all_read_operations_map_to_proxy(tmp_path):
 
 def test_conflict_resolution_maps_to_authoritative_write(tmp_path):
     memory = adapter(tmp_path).open_session(
-        HermesSessionContext("wonny", "s-1", ("private",))
+        HermesSessionContext("avery", "s-1", ("private",))
     )
-    memory.resolve_conflict("conflict-1", 7, reason="Victor selected it")
+    memory.resolve_conflict("conflict-1", 7, reason="Avery selected it")
     assert RecordingTransport.instances[0].calls == [
         (
             "memory.resolve_conflict",
             {
                 "conflict_id": "conflict-1",
                 "resolution_fact_id": 7,
-                "reason": "Victor selected it",
+                "reason": "Avery selected it",
             },
             None,
         )
@@ -191,7 +230,7 @@ def test_conflict_resolution_maps_to_authoritative_write(tmp_path):
 
 def test_extraction_enqueue_maps_to_attributed_daemon_surface(tmp_path):
     memory = adapter(tmp_path).open_session(
-        HermesSessionContext("wonny", "s-1", ("private",))
+        HermesSessionContext("avery", "s-1", ("private",))
     )
     memory.enqueue_extraction(
         "USER: durable preference", source="session_end", metadata={"hook": "session_end"}
@@ -214,7 +253,7 @@ def test_offline_write_fails_explicitly_and_never_uses_read_fallback(tmp_path):
     fallback = ReadOnlyFallback()
     memory = adapter(
         tmp_path, OfflineTransport, degraded_provider=fallback
-    ).open_session(HermesSessionContext("wonny", "s-1", ("private",)))
+    ).open_session(HermesSessionContext("avery", "s-1", ("private",)))
 
     with pytest.raises(EnfoldTransportError, match="offline"):
         memory.write(
@@ -230,28 +269,28 @@ def test_read_fallback_is_opt_in_and_visibly_degraded(tmp_path):
     fallback = ReadOnlyFallback()
     memory = adapter(
         tmp_path, OfflineTransport, degraded_provider=fallback
-    ).open_session(HermesSessionContext("wonny", "s-1", ("private",)))
+    ).open_session(HermesSessionContext("avery", "s-1", ("private",)))
 
-    result = memory.search("Victor", limit=2)
+    result = memory.search("Avery", limit=2)
 
     assert isinstance(result, DegradedReadResult)
     assert result.degraded is True
     assert result.result == {"facts": [{"content": "cached"}]}
-    assert fallback.calls[0][0:2] == ("memory.search", {"query": "Victor", "limit": 2})
+    assert fallback.calls[0][0:2] == ("memory.search", {"query": "Avery", "limit": 2})
     assert fallback.calls[0][2] == memory.context
 
 
 def test_read_without_fallback_fails_explicitly(tmp_path):
     memory = adapter(tmp_path, OfflineTransport).open_session(
-        HermesSessionContext("wonny", "s-1", ("private",))
+        HermesSessionContext("avery", "s-1", ("private",))
     )
     with pytest.raises(EnfoldTransportError, match="offline"):
-        memory.search("Victor")
+        memory.search("Avery")
 
 
 def test_reserved_fields_cannot_spoof_write_contract(tmp_path):
     memory = adapter(tmp_path).open_session(
-        HermesSessionContext("wonny", "s-1", ("private",))
+        HermesSessionContext("avery", "s-1", ("private",))
     )
     with pytest.raises(ValueError, match="reserved"):
         memory.write(

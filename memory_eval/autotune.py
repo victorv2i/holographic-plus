@@ -152,7 +152,7 @@ def _parse_scalar(value: str) -> Any:
 def _fallback_live_plugin_config(path: Path) -> dict[str, Any]:
     """Tiny fallback parser for the flat hermes-memory-store block.
 
-    PyYAML is available in Victor's Hermes environment, but Enfold's package
+    PyYAML is available in Avery's Hermes environment, but Enfold's package
     deps do not require it. This parser intentionally handles only the simple
     scalar shape used by the retrieval config block.
     """

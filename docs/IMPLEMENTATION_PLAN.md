@@ -87,7 +87,7 @@ Deliverables:
 - regression cases for differently worded updates, negation, changed
   preferences, event coexistence, and false supersession.
 
-Exit gate: the Morning Briefing and Wonny-model stale-truth cases select or
+Exit gate: the Morning Briefing and sample-model stale-truth cases select or
 flag current truth correctly without regressing event history. No non-private
 write is enabled until all search, history, evidence, dense, and dedup reads
 enforce server-granted scopes. Privacy-erasure tests remove every materialized
@@ -139,7 +139,7 @@ shows that on-demand assembly is insufficient.
 
 Private evaluation:
 
-- Victor Memory Arena with direct, paraphrase, state-update, preference,
+- Personal-memory Arena with direct, paraphrase, state-update, preference,
   decision, relationship, timeline, contradiction, multi-hop, abstention, and
   privacy cases.
 

@@ -67,11 +67,13 @@ def test_fresh_high_trust_state_paraphrase_outranks_old_low_trust_match(tmp_path
     _fact(conn, 2, fresh, trust_score=0.95, memory_kind="state")
     conn.commit()
     query = "Where are nightly copies kept?"
-    embedder = TableEmbedder({
-        query: (1.0, 0.0),
-        old: (0.98, 0.2),
-        fresh: (0.95, 0.1),
-    })
+    embedder = TableEmbedder(
+        {
+            query: (1.0, 0.0),
+            old: (0.98, 0.2),
+            fresh: (0.95, 0.1),
+        }
+    )
 
     rows = HybridRetriever(
         conn,
@@ -164,16 +166,30 @@ def test_default_formula_components_sum_to_reported_score(tmp_path):
         now=datetime(2026, 7, 12, 12, tzinfo=timezone.utc),
     ).search(query, min_trust=0)[0]
 
-    expected = 0.90 * (
-        0.35 * row["fts_score"]
-        + 0.25 * row["jaccard_score"]
-        + 0.40 * row["dense_score"]
-    ) + 0.05 * 0.8 + 0.02 * 0.75 + 0.03 * 1.0
+    expected = (
+        0.90
+        * (
+            0.35 * row["fts_score"]
+            + 0.25 * row["jaccard_score"]
+            + 0.40 * row["dense_score"]
+        )
+        + 0.05 * 0.8
+        + 0.02 * 0.75
+        + 0.03 * 1.0
+    )
     assert row["score"] == pytest.approx(expected)
     conn.close()
 
 
-@pytest.mark.parametrize("field", ["trust_weight", "score_floor", "recency_half_life_days"])
+@pytest.mark.parametrize(
+    "field", ["trust_weight", "score_floor", "recency_half_life_days"]
+)
 def test_ranking_config_rejects_non_finite_values(field):
     with pytest.raises(ValueError):
         RankingConfig(**{field: float("nan")})
+
+
+@pytest.mark.parametrize("value", [float("nan"), -0.01, 1.01])
+def test_ranking_config_rejects_invalid_fts_query_coverage_weight(value):
+    with pytest.raises(ValueError):
+        RankingConfig(fts_query_coverage_weight=value)

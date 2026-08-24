@@ -17,8 +17,8 @@ import sqlite3
 from typing import Any, Callable, Mapping, Sequence
 
 from .context import TRUNCATION_MARKER, pack_context
-from .core_store import insert_fact
-from .extraction_enqueue import ExtractionEnqueuer
+from .core_store import build_visibility_predicate, insert_fact
+from .extraction_enqueue import ExtractionEnqueuer, MAX_EXTRACTION_PAYLOAD_BYTES
 from .embedding_jobs import EmbeddingOutbox
 from .hybrid_retrieval import RetrieverFactory, deterministic_retriever_factory
 from .policy import (
@@ -38,7 +38,6 @@ from .provenance import ConnectionContext, WriteRequest
 from .projections import changes, entities, entity_dossier, timeline
 from .schema import require_compatible_schema
 from .state_slots import StateCandidate, list_state_conflicts, resolve_state_conflict
-from .temporal import fact_history
 from .write_service import (
     FactWriteResult,
     IdempotencyConflict,
@@ -54,16 +53,45 @@ class ServiceRequestError(RequestHandlingError):
         super().__init__(code, message)
 
 
+@dataclass(frozen=True, slots=True)
+class AtomicWriteBatchResult:
+    """Internal batch responses with an explicit commit decision."""
+
+    responses: tuple[dict[str, Any], ...]
+    committed: bool
+
+
 _FACT_FIELDS = (
-    "fact_id", "content", "category", "tags", "trust_score",
-    "retrieval_count", "helpful_count", "created_at", "updated_at",
-    "valid_from", "invalid_at", "superseded_by", "memory_kind",
-    "subject_key", "predicate_key", "object_value", "object_entity_id",
-    "confidence", "source_authority", "scope", "sensitivity",
-    "correction_status", "schema_version", "conflict_group",
+    "fact_id",
+    "content",
+    "category",
+    "tags",
+    "trust_score",
+    "retrieval_count",
+    "helpful_count",
+    "created_at",
+    "updated_at",
+    "valid_from",
+    "invalid_at",
+    "superseded_by",
+    "memory_kind",
+    "subject_key",
+    "predicate_key",
+    "object_value",
+    "object_entity_id",
+    "confidence",
+    "source_authority",
+    "scope",
+    "sensitivity",
+    "correction_status",
+    "schema_version",
+    "conflict_group",
 )
 _MIN_CONTEXT_TOKEN_BUDGET = 16
 _MAX_CONTEXT_TOKEN_BUDGET = 4096
+# Write text is capped well below the 1 MiB protocol frame so the service can
+# return the stored fact and its provenance without exceeding the transport.
+MAX_WRITE_TEXT_BYTES = 256 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,7 +104,10 @@ class OutputBounds:
     max_fact_chars: int = 2_000
     search_max_total_chars: int = 12_000
     context_max_total_chars: int = 16_000
+    evidence_max_total_bytes: int = 512 * 1024
+    history_max_total_bytes: int = 512 * 1024
     context_mmr_lambda: float = 0.7
+    conflicts_max_total_bytes: int = 512 * 1024
 
     def __post_init__(self) -> None:
         integer_bounds = (
@@ -85,8 +116,14 @@ class OutputBounds:
             self.max_fact_chars,
             self.search_max_total_chars,
             self.context_max_total_chars,
+            self.evidence_max_total_bytes,
+            self.history_max_total_bytes,
+            self.conflicts_max_total_bytes,
         )
-        if any(isinstance(value, bool) or not isinstance(value, int) for value in integer_bounds):
+        if any(
+            isinstance(value, bool) or not isinstance(value, int)
+            for value in integer_bounds
+        ):
             raise ValueError("output bounds must be integers")
         if (
             isinstance(self.default_min_trust, bool)
@@ -102,6 +139,12 @@ class OutputBounds:
             raise ValueError("max_fact_chars is too small for the truncation marker")
         if self.search_max_total_chars < 512 or self.context_max_total_chars < 512:
             raise ValueError("total character caps must be at least 512")
+        if (
+            self.evidence_max_total_bytes < 512
+            or self.history_max_total_bytes < 512
+            or self.conflicts_max_total_bytes < 512
+        ):
+            raise ValueError("total byte caps must be at least 512")
         if (
             isinstance(self.context_mmr_lambda, bool)
             or not isinstance(self.context_mmr_lambda, (int, float))
@@ -144,7 +187,9 @@ def _reject_nested_identity(value: Any, *, path: str = "params") -> None:
 
 def _text(value: Any, name: str) -> str:
     if not isinstance(value, str) or not value.strip():
-        raise ServiceRequestError("invalid_params", f"{name} must be a non-empty string")
+        raise ServiceRequestError(
+            "invalid_params", f"{name} must be a non-empty string"
+        )
     return value.strip()
 
 
@@ -159,7 +204,12 @@ def _number(value: Any, name: str, default: float) -> float:
         return default
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ServiceRequestError("invalid_params", f"{name} must be a number")
-    result = float(value)
+    try:
+        result = float(value)
+    except OverflowError as exc:
+        raise ServiceRequestError(
+            "invalid_params", f"{name} must be a number"
+        ) from exc
     if not math.isfinite(result) or not 0.0 <= result <= 1.0:
         raise ServiceRequestError("invalid_params", f"{name} must be between 0 and 1")
     return result
@@ -167,7 +217,9 @@ def _number(value: Any, name: str, default: float) -> float:
 
 def _positive_int(value: Any, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        raise ServiceRequestError("invalid_params", f"{name} must be a positive integer")
+        raise ServiceRequestError(
+            "invalid_params", f"{name} must be a positive integer"
+        )
     return value
 
 
@@ -198,13 +250,48 @@ def _serialized_chars(value: Mapping[str, Any]) -> int:
     return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
 
 
+def _serialized_bytes(value: Mapping[str, Any]) -> int:
+    return len(
+        json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    )
+
+
 def _truncate_fact_content(fact: dict[str, Any], maximum: int) -> bool:
     content = fact.get("content")
     if not isinstance(content, str) or len(content) <= maximum:
         return False
-    fact["content"] = content[:maximum - len(TRUNCATION_MARKER)].rstrip() + TRUNCATION_MARKER
+    fact["content"] = (
+        content[: maximum - len(TRUNCATION_MARKER)].rstrip() + TRUNCATION_MARKER
+    )
     fact["content_truncated"] = True
     return True
+
+
+def _truncate_text_field(item: dict[str, Any], field: str, maximum: int) -> bool:
+    content = item.get(field)
+    if not isinstance(content, str) or len(content) <= maximum:
+        return False
+    item[field] = (
+        content[: maximum - len(TRUNCATION_MARKER)].rstrip() + TRUNCATION_MARKER
+    )
+    item[f"{field}_truncated"] = True
+    return True
+
+
+def _write_text(value: Any, name: str) -> str:
+    result = _text(value, name)
+    if len(result.encode("utf-8")) > MAX_WRITE_TEXT_BYTES:
+        raise ServiceRequestError(
+            "invalid_params",
+            f"{name} must not exceed {MAX_WRITE_TEXT_BYTES} UTF-8 bytes",
+        )
+    return result
+
+
+def _optional_write_text(value: Any, name: str) -> str | None:
+    if value is None:
+        return None
+    return _write_text(value, name)
 
 
 def _boolean(value: Any, name: str, default: bool) -> bool:
@@ -223,7 +310,45 @@ def _json_object(value: Any, name: str) -> str:
     try:
         return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
     except (TypeError, ValueError, RecursionError) as exc:
-        raise ServiceRequestError("invalid_params", f"{name} must contain JSON values") from exc
+        raise ServiceRequestError(
+            "invalid_params", f"{name} must contain JSON values"
+        ) from exc
+
+
+def _extraction_payload_bytes(
+    context: ConnectionContext,
+    transcript: str,
+    source: str,
+    scope: str,
+    metadata: Mapping[str, Any],
+) -> int:
+    envelope = {
+        "version": 1,
+        "transcript": transcript,
+        "source": source,
+        "scope": scope,
+        "provenance": {
+            "client_id": context.client_id,
+            "surface": context.surface,
+            "agent_id": context.agent_id,
+            "session_id": context.session_id,
+            "parent_agent_id": context.parent_agent_id,
+            "project_root": context.project_root,
+            "repository": context.repository,
+            "branch": context.branch,
+            "commit_sha": context.commit_sha,
+            "access_scopes": list(context.access_scopes),
+        },
+        "metadata": dict(metadata),
+    }
+    payload = json.dumps(
+        envelope,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    return len(payload.encode("utf-8"))
 
 
 def _protocol_context(context: ClientContext) -> ConnectionContext:
@@ -305,7 +430,8 @@ class EnfoldService:
             policy,
             embedding_enqueue=(
                 embedding_outbox.enqueue_in_transaction
-                if embedding_outbox is not None else None
+                if embedding_outbox is not None
+                else None
             ),
             near_dedup=NearDedupConfig(
                 enabled=near_dedup_enabled,
@@ -313,12 +439,12 @@ class EnfoldService:
             ),
             query_embedder=query_embedder,
         )
-        self._retriever_factory = (
-            retriever_factory or deterministic_retriever_factory()
-        )
+        self._retriever_factory = retriever_factory or deterministic_retriever_factory()
         self._extraction_enqueuer = extraction_enqueuer
         if extraction_processing_mode not in {
-            "deferred", "disabled", "daemon-supervised",
+            "deferred",
+            "disabled",
+            "daemon-supervised",
         }:
             raise ValueError("extraction_processing_mode is invalid")
         self._extraction_processing_mode = extraction_processing_mode
@@ -357,71 +483,82 @@ class EnfoldService:
         }
         route = routes.get(request.method)
         if route is None:
-            raise ServiceRequestError("unsupported_method", f"unsupported service method: {request.method}")
+            raise ServiceRequestError(
+                "unsupported_method", f"unsupported service method: {request.method}"
+            )
         return route(effective, request.params)
+
+    def handle_write_batch(
+        self,
+        context: ClientContext,
+        requests: Sequence[Request],
+        *,
+        before_commit: Callable[[], None] | None = None,
+    ) -> AtomicWriteBatchResult:
+        """Apply ordered memory writes atomically through the normal policy path."""
+
+        if isinstance(requests, (str, bytes)) or not isinstance(requests, Sequence):
+            raise TypeError("requests must be a sequence")
+        if not requests:
+            return AtomicWriteBatchResult((), committed=True)
+        for request in requests:
+            if not isinstance(request, Request):
+                raise TypeError("batch entries must be Request objects")
+            if request.schema_version != SUPPORTED_SCHEMA_VERSION:
+                raise ServiceRequestError(
+                    "incompatible_schema",
+                    f"request schema {request.schema_version}; service schema {SUPPORTED_SCHEMA_VERSION}",
+                )
+            if request.method != "memory.write":
+                raise ServiceRequestError(
+                    "unsupported_method", "write batch accepts only memory.write"
+                )
+            _reject_nested_identity(request.params)
+        effective = self._authorize(context)
+        try:
+            prepared = tuple(
+                self._prepare_write(effective, request.params) for request in requests
+            )
+            batch = self._writes.write_batch(
+                effective,
+                prepared,
+                rollback_if=lambda outcome: (
+                    outcome.outcome in {"rejected", "needs_review"}
+                ),
+                before_commit=before_commit,
+            )
+        except ServiceRequestError:
+            raise
+        except IdempotencyConflict as exc:
+            raise ServiceRequestError("idempotency_conflict", str(exc)) from exc
+        except (PermissionError, ValueError) as exc:
+            raise ServiceRequestError("invalid_params", str(exc)) from exc
+        results = tuple(self._write_result(outcome) for outcome in batch.outcomes)
+        if not batch.committed and not any(
+            result["outcome"] in {"rejected", "needs_review"} for result in results
+        ):
+            raise RuntimeError("write batch rolled back without a policy outcome")
+        return AtomicWriteBatchResult(results, committed=batch.committed)
 
     def _authorize(self, context: ClientContext) -> ConnectionContext:
         try:
             return self._policy.authorize_context(_protocol_context(context))
         except UnknownMemoryClient as exc:
-            raise ServiceRequestError("access_denied", "memory client is not authorized") from exc
+            raise ServiceRequestError(
+                "access_denied", "memory client is not authorized"
+            ) from exc
         except PermissionError as exc:
-            raise ServiceRequestError("access_denied", "no requested memory scope is authorized") from exc
+            raise ServiceRequestError(
+                "access_denied", "no requested memory scope is authorized"
+            ) from exc
         except ValueError as exc:
             raise ServiceRequestError("invalid_context", str(exc)) from exc
 
     def _write(
         self, context: ConnectionContext, params: Mapping[str, Any]
     ) -> dict[str, Any]:
-        required = {"idempotency_key", "content", "source_type"}
-        optional = {
-            "category", "tags", "trust_score", "source_authority", "source_uri",
-            "observation_content", "asserted_by", "observed_at", "scope",
-            "sensitivity", "correction_status", "evidence_excerpt", "relation",
-            "metadata", "supersede_fact_id", "state",
-        }
-        _check_keys(params, required, optional)
-        metadata = _json_object(params.get("metadata"), "metadata")
         try:
-            write = WriteRequest(
-                idempotency_key=_text(params["idempotency_key"], "idempotency_key"),
-                content=_text(params["content"], "content"),
-                source_type=_text(params["source_type"], "source_type"),
-                category=_text(params.get("category", "general"), "category"),
-                tags=(
-                    params.get("tags", "")
-                    if isinstance(params.get("tags", ""), str)
-                    else self._invalid("tags must be a string")
-                ),
-                trust_score=_number(params.get("trust_score"), "trust_score", 0.5),
-                source_authority=_number(
-                    params.get("source_authority"), "source_authority", 0.5
-                ),
-                source_uri=_optional_text(params.get("source_uri"), "source_uri"),
-                observation_content=_optional_text(
-                    params.get("observation_content"), "observation_content"
-                ),
-                asserted_by=_optional_text(params.get("asserted_by"), "asserted_by"),
-                # The performing agent is connection provenance, never caller input.
-                performed_by=context.agent_id,
-                observed_at=_optional_text(params.get("observed_at"), "observed_at"),
-                scope=_text(params.get("scope", "private"), "scope"),
-                sensitivity=_text(params.get("sensitivity", "normal"), "sensitivity"),
-                correction_status=_optional_text(
-                    params.get("correction_status"), "correction_status"
-                ),
-                evidence_excerpt=_optional_text(
-                    params.get("evidence_excerpt"), "evidence_excerpt"
-                ),
-                relation=_text(params.get("relation", "supports"), "relation"),
-                metadata_json=metadata,
-                supersede_fact_id=(
-                    None
-                    if params.get("supersede_fact_id") is None
-                    else _positive_int(params["supersede_fact_id"], "supersede_fact_id")
-                ),
-            )
-            candidate = self._state_candidate(write, params.get("state"))
+            write, candidate = self._prepare_write(context, params)
             outcome = self._writes.write(context, write, state_candidate=candidate)
         except ServiceRequestError:
             raise
@@ -429,6 +566,75 @@ class EnfoldService:
             raise ServiceRequestError("idempotency_conflict", str(exc)) from exc
         except (PermissionError, ValueError) as exc:
             raise ServiceRequestError("invalid_params", str(exc)) from exc
+        return self._write_result(outcome)
+
+    def _prepare_write(
+        self, context: ConnectionContext, params: Mapping[str, Any]
+    ) -> tuple[WriteRequest, StateCandidate | None]:
+        required = {"idempotency_key", "content", "source_type"}
+        optional = {
+            "category",
+            "tags",
+            "trust_score",
+            "source_authority",
+            "source_uri",
+            "observation_content",
+            "asserted_by",
+            "observed_at",
+            "scope",
+            "sensitivity",
+            "correction_status",
+            "evidence_excerpt",
+            "relation",
+            "metadata",
+            "supersede_fact_id",
+            "state",
+        }
+        _check_keys(params, required, optional)
+        metadata = _json_object(params.get("metadata"), "metadata")
+        write = WriteRequest(
+            idempotency_key=_text(params["idempotency_key"], "idempotency_key"),
+            content=_write_text(params["content"], "content"),
+            source_type=_text(params["source_type"], "source_type"),
+            category=_text(params.get("category", "general"), "category"),
+            tags=(
+                params.get("tags", "")
+                if isinstance(params.get("tags", ""), str)
+                else self._invalid("tags must be a string")
+            ),
+            trust_score=_number(params.get("trust_score"), "trust_score", 0.5),
+            source_authority=_number(
+                params.get("source_authority"), "source_authority", 0.5
+            ),
+            source_uri=_optional_text(params.get("source_uri"), "source_uri"),
+            observation_content=_optional_write_text(
+                params.get("observation_content"), "observation_content"
+            ),
+            asserted_by=_optional_text(params.get("asserted_by"), "asserted_by"),
+            # The performing agent is connection provenance, never caller input.
+            performed_by=context.agent_id,
+            observed_at=_optional_text(params.get("observed_at"), "observed_at"),
+            scope=_text(params.get("scope", "private"), "scope"),
+            sensitivity=_text(params.get("sensitivity", "normal"), "sensitivity"),
+            correction_status=_optional_text(
+                params.get("correction_status"), "correction_status"
+            ),
+            evidence_excerpt=_optional_text(
+                params.get("evidence_excerpt"), "evidence_excerpt"
+            ),
+            relation=_text(params.get("relation", "supports"), "relation"),
+            metadata_json=metadata,
+            supersede_fact_id=(
+                None
+                if params.get("supersede_fact_id") is None
+                else _positive_int(params["supersede_fact_id"], "supersede_fact_id")
+            ),
+        )
+        candidate = self._state_candidate(write, params.get("state"))
+        return write, candidate
+
+    @staticmethod
+    def _write_result(outcome: Any) -> dict[str, Any]:
         result = asdict(outcome)
         result["detail"] = json.loads(result.pop("detail_json"))
         return result
@@ -453,7 +659,9 @@ class EnfoldService:
             content=write.content,
             subject_key=_text(value["subject_key"], "state.subject_key"),
             predicate_key=_text(value["predicate_key"], "state.predicate_key"),
-            object_value=_optional_text(value.get("object_value"), "state.object_value"),
+            object_value=_optional_text(
+                value.get("object_value"), "state.object_value"
+            ),
             source_authority=write.source_authority,
             valid_from=_optional_text(value.get("valid_from"), "state.valid_from"),
             scope=write.scope,
@@ -582,7 +790,9 @@ class EnfoldService:
         except ValueError as exc:
             raise ServiceRequestError("invalid_params", str(exc)) from exc
         if scope not in context.access_scopes:
-            raise ServiceRequestError("access_denied", "extraction scope is not authorized")
+            raise ServiceRequestError(
+                "access_denied", "extraction scope is not authorized"
+            )
         if scope == "secret":
             return {
                 "outcome": "rejected",
@@ -592,6 +802,16 @@ class EnfoldService:
         transcript = _text(params["transcript"], "transcript")
         source = _text(params["source"], "source")
         metadata_json = _json_object(params.get("metadata"), "metadata")
+        metadata = json.loads(metadata_json)
+        if (
+            _extraction_payload_bytes(context, transcript, source, scope, metadata)
+            > MAX_EXTRACTION_PAYLOAD_BYTES
+        ):
+            raise ServiceRequestError(
+                "invalid_params",
+                "canonical extraction payload must not exceed "
+                f"{MAX_EXTRACTION_PAYLOAD_BYTES} UTF-8 bytes",
+            )
         screen_request = WriteRequest(
             idempotency_key="extraction-screen",
             content=transcript,
@@ -607,7 +827,7 @@ class EnfoldService:
             transcript,
             source=source,
             scope=scope,
-            metadata=json.loads(metadata_json),
+            metadata=metadata,
         )
         return {
             "outcome": "queued",
@@ -626,8 +846,14 @@ class EnfoldService:
         fact = self._historical_fact(fact_id, context.access_scopes)
         if fact is None:
             raise ServiceRequestError("not_found", "fact was not found")
-        placeholders = ",".join("?" for _ in context.access_scopes)
-        rows = self._conn.execute(
+        observation_visibility_sql, observation_visibility_params = (
+            build_visibility_predicate(
+                context.access_scopes,
+                scope_column="o.scope",
+                sensitivity_column="o.sensitivity",
+            )
+        )
+        cursor = self._conn.execute(
             f"""
             SELECT o.observation_id, o.client_id, o.session_id, o.source_type,
                    o.source_uri, o.project_root, o.repository, o.branch,
@@ -637,25 +863,76 @@ class EnfoldService:
                    p.evidence_excerpt, p.created_at
             FROM fact_provenance p
             JOIN observations o ON o.observation_id = p.observation_id
-            WHERE p.fact_id = ? AND o.scope IN ({placeholders})
+            WHERE p.fact_id = ? AND {observation_visibility_sql}
             ORDER BY p.created_at, o.observation_id
             LIMIT ?
             """,
-            (fact_id, *context.access_scopes, limit),
-        ).fetchall()
+            (fact_id, *observation_visibility_params, limit + 1),
+        )
         keys = (
-            "observation_id", "client_id", "session_id", "source_type",
-            "source_uri", "project_root", "repository", "branch", "commit_sha",
-            "content", "asserted_by", "performed_by", "observed_at", "recorded_at",
-            "scope", "sensitivity", "redacted_at", "metadata", "relation",
-            "evidence_excerpt", "provenance_created_at",
+            "observation_id",
+            "client_id",
+            "session_id",
+            "source_type",
+            "source_uri",
+            "project_root",
+            "repository",
+            "branch",
+            "commit_sha",
+            "content",
+            "asserted_by",
+            "performed_by",
+            "observed_at",
+            "recorded_at",
+            "scope",
+            "sensitivity",
+            "redacted_at",
+            "metadata",
+            "relation",
+            "evidence_excerpt",
+            "provenance_created_at",
         )
         evidence = []
-        for row in rows:
-            item = dict(zip(keys, row))
-            item["metadata"] = json.loads(item["metadata"])
-            evidence.append(item)
-        return {"fact": fact, "evidence": evidence}
+        content_truncated = _truncate_fact_content(
+            fact, self._output_bounds.max_fact_chars
+        )
+        response = {
+            "fact": fact,
+            "evidence": evidence,
+            "output_truncated": content_truncated,
+        }
+        used_bytes = _serialized_bytes(response)
+        if used_bytes > self._output_bounds.evidence_max_total_bytes:
+            cursor.close()
+            response["fact"] = {"fact_id": fact_id, "output_truncated": True}
+            response["output_truncated"] = True
+            return response
+        try:
+            for index, row in enumerate(cursor):
+                if index >= limit:
+                    response["output_truncated"] = True
+                    break
+                item = dict(zip(keys, row))
+                item["metadata"] = json.loads(item["metadata"])
+                item_truncated = _truncate_text_field(
+                    item, "content", self._output_bounds.max_fact_chars
+                )
+                item_truncated |= _truncate_text_field(
+                    item, "evidence_excerpt", self._output_bounds.max_fact_chars
+                )
+                item_bytes = _serialized_bytes(item) + (1 if evidence else 0)
+                if (
+                    used_bytes + item_bytes
+                    > self._output_bounds.evidence_max_total_bytes
+                ):
+                    response["output_truncated"] = True
+                    break
+                evidence.append(item)
+                used_bytes += item_bytes
+                response["output_truncated"] |= item_truncated
+        finally:
+            cursor.close()
+        return response
 
     def _history(
         self, context: ConnectionContext, params: Mapping[str, Any]
@@ -663,7 +940,9 @@ class EnfoldService:
         optional = {"fact_id", "subject_key", "predicate_key", "scope", "limit"}
         _check_keys(params, set(), optional)
         by_id = "fact_id" in params
-        by_slot = "subject_key" in params or "predicate_key" in params or "scope" in params
+        by_slot = (
+            "subject_key" in params or "predicate_key" in params or "scope" in params
+        )
         if by_id == by_slot:
             raise ServiceRequestError(
                 "invalid_params",
@@ -676,15 +955,25 @@ class EnfoldService:
             if anchor is None:
                 raise ServiceRequestError("not_found", "fact was not found")
             if anchor.get("subject_key") and anchor.get("predicate_key"):
-                scopes = (str(anchor["scope"]),)
+                scopes = tuple(
+                    dict.fromkeys(
+                        (
+                            str(anchor["scope"]),
+                            *(
+                                scope
+                                for scope in context.access_scopes
+                                if scope in {"sensitive", "secret"}
+                            ),
+                        )
+                    )
+                )
                 subject = str(anchor["subject_key"])
                 predicate = str(anchor["predicate_key"])
-                rows = self._slot_history(scopes, subject, predicate, limit)
+                rows = self._slot_history(scopes, subject, predicate, limit + 1)
             else:
-                rows = [
-                    row for row in fact_history(self._conn, fact_id)
-                    if row.get("scope") in context.access_scopes
-                ][:limit]
+                rows = self._fact_history(
+                    context.access_scopes, fact_id, limit + 1
+                )
         else:
             if "subject_key" not in params or "predicate_key" not in params:
                 raise ServiceRequestError(
@@ -695,30 +984,130 @@ class EnfoldService:
                 scopes,
                 _text(params["subject_key"], "subject_key"),
                 _text(params["predicate_key"], "predicate_key"),
-                limit,
+                limit + 1,
             )
-        return {"facts": rows}
+        facts: list[dict[str, Any]] = []
+        response = {
+            "facts": facts,
+            "output_truncated": False,
+        }
+        used_bytes = _serialized_bytes(response)
+        try:
+            for index, row in enumerate(rows):
+                if index >= limit:
+                    response["output_truncated"] = True
+                    break
+                fact = dict(row)
+                fact_truncated = _truncate_fact_content(
+                    fact, self._output_bounds.max_fact_chars
+                )
+                fact_bytes = _serialized_bytes(fact) + (1 if facts else 0)
+                if (
+                    used_bytes + fact_bytes
+                    > self._output_bounds.history_max_total_bytes
+                ):
+                    response["output_truncated"] = True
+                    break
+                facts.append(fact)
+                used_bytes += fact_bytes
+                response["output_truncated"] |= fact_truncated
+        finally:
+            rows.close()
+        return response
 
     def _conflicts(
         self, context: ConnectionContext, params: Mapping[str, Any]
     ) -> dict[str, Any]:
-        _check_keys(params, set(), {"scope", "unresolved_only"})
+        _check_keys(params, set(), {"scope", "unresolved_only", "limit"})
         scopes = self._requested_scopes(context, params.get("scope"))
         unresolved = _boolean(params.get("unresolved_only"), "unresolved_only", True)
-        conflicts: list[dict[str, Any]] = []
+        limit = _limit(params.get("limit"), default=100)
+        member_limit = min(limit, self._output_bounds.search_max_results)
+        records = []
         for scope in scopes:
-            for record in list_state_conflicts(
-                self._conn, scope, unresolved_only=unresolved
+            remaining = limit + 1 - len(records)
+            if remaining <= 0:
+                break
+            scoped = list_state_conflicts(
+                self._conn,
+                scope,
+                unresolved_only=unresolved,
+                limit=min(remaining, 200),
+                member_limit=member_limit,
+                visibility_scopes=scopes,
+            )
+            records.extend(scoped[:remaining])
+            if remaining > len(scoped) and len(scoped) == 200:
+                records.extend(
+                    list_state_conflicts(
+                        self._conn,
+                        scope,
+                        unresolved_only=unresolved,
+                        limit=1,
+                        offset=200,
+                        member_limit=member_limit,
+                        visibility_scopes=scopes,
+                    )
+                )
+        output_truncated = len(records) > limit or any(
+            record.members_truncated for record in records[:limit]
+        )
+        records = records[:limit]
+        member_ids = tuple(
+            dict.fromkeys(
+                fact_id for record in records for fact_id in record.member_fact_ids
+            )
+        )
+        members_by_id: dict[int, dict[str, Any]] = {}
+        if member_ids:
+            placeholders = ",".join("?" for _ in member_ids)
+            scope_placeholders = ",".join("?" for _ in scopes)
+            columns = ", ".join(_FACT_FIELDS)
+            rows = self._conn.execute(
+                f"SELECT {columns} FROM facts "
+                f"WHERE fact_id IN ({placeholders}) "
+                f"AND scope IN ({scope_placeholders})",
+                (*member_ids, *scopes),
+            ).fetchall()
+            members_by_id = {
+                int(row[0]): dict(zip(_FACT_FIELDS, row)) for row in rows
+            }
+        conflicts: list[dict[str, Any]] = []
+        response = {"conflicts": conflicts, "output_truncated": output_truncated}
+        for record in records:
+            item = asdict(record)
+            item["member_fact_ids"] = list(item["member_fact_ids"])
+            item["members"] = []
+            conflicts.append(item)
+            if (
+                _serialized_bytes(response)
+                > self._output_bounds.conflicts_max_total_bytes
             ):
-                item = asdict(record)
-                item["member_fact_ids"] = list(item["member_fact_ids"])
-                item["members"] = [
-                    fact
-                    for fact_id in item["member_fact_ids"]
-                    if (fact := self._historical_fact(fact_id, (scope,))) is not None
-                ]
-                conflicts.append(item)
-        return {"conflicts": conflicts}
+                conflicts.pop()
+                response["output_truncated"] = True
+                break
+            retained_ids = []
+            for fact_id in item["member_fact_ids"]:
+                member = members_by_id.get(fact_id)
+                if member is None:
+                    continue
+                member_truncated = _truncate_fact_content(
+                    member, self._output_bounds.max_fact_chars
+                )
+                retained_ids.append(fact_id)
+                item["members"].append(member)
+                if (
+                    _serialized_bytes(response)
+                    > self._output_bounds.conflicts_max_total_bytes
+                ):
+                    retained_ids.pop()
+                    item["members"].pop()
+                    item["members_truncated"] = True
+                    response["output_truncated"] = True
+                    break
+                response["output_truncated"] |= member_truncated
+            item["member_fact_ids"] = retained_ids
+        return response
 
     def _changes(
         self, context: ConnectionContext, params: Mapping[str, Any]
@@ -796,16 +1185,30 @@ class EnfoldService:
         )
         reason = _text(params["reason"], "reason")
         placeholders = ",".join("?" for _ in context.access_scopes)
+        resolution_visibility_sql, resolution_visibility_params = (
+            build_visibility_predicate(
+                context.access_scopes,
+                scope_column="f.scope",
+                sensitivity_column="f.sensitivity",
+            )
+        )
         resolved_at = datetime.now(timezone.utc).isoformat(timespec="microseconds")
         try:
             self._conn.execute("BEGIN IMMEDIATE")
             visible = self._conn.execute(
                 f"""
-                SELECT scope FROM fact_conflicts
-                WHERE conflict_id = ? AND scope IN ({placeholders})
-                  AND resolved_at IS NULL
+                SELECT c.scope FROM fact_conflicts c
+                JOIN facts f
+                  ON f.fact_id = ? AND f.scope = c.scope
+                WHERE c.conflict_id = ? AND c.scope IN ({placeholders})
+                  AND c.resolved_at IS NULL AND {resolution_visibility_sql}
                 """,
-                (conflict_id, *context.access_scopes),
+                (
+                    resolution_fact_id,
+                    conflict_id,
+                    *context.access_scopes,
+                    *resolution_visibility_params,
+                ),
             ).fetchone()
             if visible is None:
                 raise ServiceRequestError("not_found", "conflict was not found")
@@ -845,21 +1248,26 @@ class EnfoldService:
     @staticmethod
     def _safe_fact(row: Mapping[str, Any]) -> dict[str, Any]:
         score_fields = (
-            "score", "fts_score", "jaccard_score", "dense_score",
-            "trust_score_component", "memory_kind_score", "recency_score",
+            "score",
+            "fts_score",
+            "jaccard_score",
+            "dense_score",
+            "trust_score_component",
+            "memory_kind_score",
+            "recency_score",
         )
-        return {
-            key: row[key]
-            for key in (*_FACT_FIELDS, *score_fields)
-            if key in row
-        }
+        return {key: row[key] for key in (*_FACT_FIELDS, *score_fields) if key in row}
 
     def _authorized_attribution(
         self, fact_id: int, scopes: Sequence[str]
     ) -> dict[str, Any] | None:
         """Return latest visible provenance plus a visible-only evidence count."""
 
-        placeholders = ",".join("?" for _ in scopes)
+        visibility_sql, visibility_params = build_visibility_predicate(
+            scopes,
+            scope_column="o.scope",
+            sensitivity_column="o.sensitivity",
+        )
         row = self._conn.execute(
             f"""
             SELECT o.performed_by, s.agent_id, o.session_id, o.source_type,
@@ -869,11 +1277,11 @@ class EnfoldService:
             JOIN observations o ON o.observation_id = p.observation_id
             JOIN memory_sessions s
               ON s.client_id = o.client_id AND s.session_id = o.session_id
-            WHERE p.fact_id = ? AND o.scope IN ({placeholders})
+            WHERE p.fact_id = ? AND {visibility_sql}
             ORDER BY o.recorded_at DESC, o.observation_id DESC
             LIMIT 1
             """,
-            (fact_id, *scopes),
+            (fact_id, *visibility_params),
         ).fetchone()
         if row is None:
             return None
@@ -892,30 +1300,82 @@ class EnfoldService:
     def _historical_fact(
         self, fact_id: int, scopes: Sequence[str]
     ) -> dict[str, Any] | None:
-        placeholders = ",".join("?" for _ in scopes)
         columns = ", ".join(_FACT_FIELDS)
+        visibility_sql, visibility_params = build_visibility_predicate(scopes)
         row = self._conn.execute(
-            f"SELECT {columns} FROM facts WHERE fact_id = ? AND scope IN ({placeholders})",
-            (fact_id, *scopes),
+            f"SELECT {columns} FROM facts WHERE fact_id = ? AND {visibility_sql}",
+            (fact_id, *visibility_params),
         ).fetchone()
         return dict(zip(_FACT_FIELDS, row)) if row is not None else None
 
     def _slot_history(
         self, scopes: Sequence[str], subject: str, predicate: str, limit: int
-    ) -> list[dict[str, Any]]:
-        placeholders = ",".join("?" for _ in scopes)
+    ) -> sqlite3.Cursor:
         columns = ", ".join(_FACT_FIELDS)
-        rows = self._conn.execute(
+        visibility_sql, visibility_params = build_visibility_predicate(scopes)
+        return self._conn.execute(
             f"""
             SELECT {columns} FROM facts
-            WHERE scope IN ({placeholders})
+            WHERE {visibility_sql}
               AND subject_key = ? AND predicate_key = ?
             ORDER BY COALESCE(valid_from, created_at), fact_id
             LIMIT ?
             """,
-            (*scopes, subject, predicate, limit),
-        ).fetchall()
-        return [dict(zip(_FACT_FIELDS, row)) for row in rows]
+            (*visibility_params, subject, predicate, limit),
+        )
+
+    def _fact_history(
+        self, scopes: Sequence[str], fact_id: int, limit: int
+    ) -> sqlite3.Cursor:
+        columns = ", ".join(f"f.{name}" for name in _FACT_FIELDS)
+        anchor_sql, anchor_params = build_visibility_predicate(scopes)
+        previous_sql, previous_params = build_visibility_predicate(
+            scopes,
+            scope_column="previous.scope",
+            sensitivity_column="previous.sensitivity",
+        )
+        following_sql, following_params = build_visibility_predicate(
+            scopes,
+            scope_column="following.scope",
+            sensitivity_column="following.sensitivity",
+        )
+        result_sql, result_params = build_visibility_predicate(
+            scopes, scope_column="f.scope", sensitivity_column="f.sensitivity"
+        )
+        return self._conn.execute(
+            f"""
+            WITH RECURSIVE chain(fact_id, superseded_by) AS (
+                SELECT fact_id, superseded_by FROM facts
+                WHERE fact_id = ? AND {anchor_sql}
+                UNION
+                SELECT previous.fact_id, previous.superseded_by
+                FROM facts previous
+                JOIN chain current ON previous.superseded_by = current.fact_id
+                WHERE {previous_sql}
+                UNION
+                SELECT following.fact_id, following.superseded_by
+                FROM facts following
+                JOIN chain current ON following.fact_id = current.superseded_by
+                WHERE {following_sql}
+                LIMIT ?
+            )
+            SELECT {columns}
+            FROM chain
+            JOIN facts f ON f.fact_id = chain.fact_id
+            WHERE {result_sql}
+            ORDER BY COALESCE(f.created_at, ''), f.fact_id
+            LIMIT ?
+            """,
+            (
+                fact_id,
+                *anchor_params,
+                *previous_params,
+                *following_params,
+                limit,
+                *result_params,
+                limit,
+            ),
+        )
 
     @staticmethod
     def _requested_scopes(
@@ -928,5 +1388,7 @@ class EnfoldService:
         except ValueError as exc:
             raise ServiceRequestError("invalid_params", str(exc)) from exc
         if scope not in context.access_scopes:
-            raise ServiceRequestError("access_denied", "requested memory scope is not authorized")
+            raise ServiceRequestError(
+                "access_denied", "requested memory scope is not authorized"
+            )
         return (scope,)

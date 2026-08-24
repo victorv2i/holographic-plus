@@ -36,6 +36,19 @@ def _spy_encode_text(monkeypatch):
     return calls
 
 
+def _add_lifecycle_columns(store):
+    store._conn.executescript(
+        """
+        ALTER TABLE facts ADD COLUMN invalid_at TEXT;
+        ALTER TABLE facts ADD COLUMN superseded_by INTEGER;
+        ALTER TABLE facts ADD COLUMN conflict_group TEXT;
+        ALTER TABLE facts ADD COLUMN scope TEXT NOT NULL DEFAULT 'private';
+        ALTER TABLE facts ADD COLUMN sensitivity TEXT NOT NULL DEFAULT 'normal';
+        """
+    )
+    store._conn.commit()
+
+
 def test_query_encoded_exactly_once_per_search(hp, populated_store, monkeypatch):
     retriever = hp.retrieval_plus.PlusFactRetriever(
         store=populated_store, hrr_dim=64,
@@ -146,6 +159,187 @@ def test_fts_candidates_exclude_hrr_blob(hp, populated_store):
     for fact in candidates:
         assert "hrr_vector" not in fact
         assert "fts_rank" in fact
+
+
+def test_fts_candidates_filter_lifecycle_and_scope_before_limit(hp, populated_store):
+    _add_lifecycle_columns(populated_store)
+    rows = populated_store._conn.execute(
+        "SELECT fact_id, content FROM facts WHERE content LIKE '%projects%'"
+    ).fetchall()
+    ids = {row["content"]: int(row["fact_id"]) for row in rows}
+    eligible = ids["The user keeps projects under the home projects directory"]
+    populated_store._conn.execute(
+        "UPDATE facts SET invalid_at = '2026-01-01' WHERE fact_id = ?",
+        (ids["The user prefers pnpm for all node projects"],),
+    )
+    populated_store._conn.execute(
+        "UPDATE facts SET superseded_by = ? WHERE fact_id = ?",
+        (eligible, ids["The deploy target for web projects is vercel"]),
+    )
+    populated_store._conn.execute(
+        "UPDATE facts SET conflict_group = 'open' WHERE fact_id = ?",
+        (ids["Node version is managed with mise for projects"],),
+    )
+    populated_store._conn.execute(
+        "UPDATE facts SET scope = 'work' WHERE fact_id = ?",
+        (ids["The user likes dark themed dashboards for projects"],),
+    )
+    populated_store._conn.commit()
+    plus = hp.retrieval_plus.PlusFactRetriever(
+        store=populated_store,
+        hrr_dim=64,
+        allowed_scopes=("private",),
+    )
+
+    candidates = plus._fts_candidates("projects", None, 0.0, 1)
+    results = plus.search("projects", min_trust=0.0, limit=10)
+
+    assert [fact["fact_id"] for fact in candidates] == [eligible]
+    assert [fact["fact_id"] for fact in results] == [eligible]
+
+
+def test_conflicts_stay_excluded_when_lifecycle_filter_is_disabled(
+    hp, populated_store
+):
+    _add_lifecycle_columns(populated_store)
+    conflicted = populated_store._conn.execute(
+        "SELECT fact_id FROM facts WHERE content LIKE '%home projects%'"
+    ).fetchone()["fact_id"]
+    populated_store._conn.execute(
+        "UPDATE facts SET conflict_group = 'open' WHERE fact_id = ?",
+        (conflicted,),
+    )
+    populated_store._conn.commit()
+    plus = hp.retrieval_plus.PlusFactRetriever(
+        store=populated_store,
+        hrr_dim=64,
+        lifecycle_filter=False,
+    )
+
+    results = plus.search("home projects", min_trust=0.0, limit=10)
+
+    assert conflicted not in {fact["fact_id"] for fact in results}
+
+
+def test_sensitive_candidates_require_matching_capability(hp, populated_store):
+    _add_lifecycle_columns(populated_store)
+    sensitive = populated_store.add_fact("Sensitive projects launch note")
+    populated_store._conn.execute(
+        "UPDATE facts SET sensitivity = 'sensitive' WHERE fact_id = ?",
+        (sensitive,),
+    )
+    populated_store._conn.commit()
+
+    ordinary = hp.retrieval_plus.PlusFactRetriever(
+        store=populated_store,
+        hrr_dim=64,
+        allowed_scopes=("private",),
+    ).search("projects", min_trust=0.0, limit=20)
+    privileged = hp.retrieval_plus.PlusFactRetriever(
+        store=populated_store,
+        hrr_dim=64,
+        allowed_scopes=("private", "sensitive"),
+    ).search("projects", min_trust=0.0, limit=20)
+
+    assert sensitive not in {fact["fact_id"] for fact in ordinary}
+    assert sensitive in {fact["fact_id"] for fact in privileged}
+
+
+def test_explain_candidates_preserve_normal_filtered_window(hp, tmp_path):
+    store = fake_hermes.MemoryStore(db_path=tmp_path / "window.db", hrr_dim=64)
+    try:
+        _add_lifecycle_columns(store)
+        invalid_ids = []
+        for i in range(4):
+            fact_id = store.add_fact(f"Windowprobe retired candidate {i}")
+            invalid_ids.append(fact_id)
+            store._conn.execute(
+                "UPDATE facts SET invalid_at = '2026-01-01' WHERE fact_id = ?",
+                (fact_id,),
+            )
+        live_id = store.add_fact("Windowprobe live candidate")
+        store._conn.commit()
+        plus = hp.retrieval_plus.PlusFactRetriever(
+            store=store,
+            hrr_dim=64,
+            hrr_weight=0.0,
+        )
+
+        normal = plus.search("windowprobe", min_trust=0.0, limit=1)
+        explained = plus.search(
+            "windowprobe", min_trust=0.0, limit=1, explain=True
+        )
+
+        assert [fact["fact_id"] for fact in normal] == [live_id]
+        assert live_id in {fact["fact_id"] for fact in explained}
+        assert set(invalid_ids) & {fact["fact_id"] for fact in explained}
+    finally:
+        store.close()
+
+
+def test_entity_expansion_filters_lifecycle_and_scope(hp, tmp_path):
+    store = fake_hermes.MemoryStore(db_path=tmp_path / "entities.db", hrr_dim=64)
+    try:
+        _add_lifecycle_columns(store)
+        direct = store.add_fact("Orchid rollout is led by Alex Rivera")
+        eligible = store.add_fact("Alex Rivera owns the private roadmap")
+        invalid = store.add_fact("Alex Rivera owns an invalid roadmap")
+        superseded = store.add_fact("Alex Rivera owns an obsolete roadmap")
+        conflicted = store.add_fact("Alex Rivera owns a disputed roadmap")
+        work = store.add_fact("Alex Rivera owns the work roadmap")
+        store._conn.execute(
+            "UPDATE facts SET invalid_at = '2026-01-01' WHERE fact_id = ?",
+            (invalid,),
+        )
+        store._conn.execute(
+            "UPDATE facts SET superseded_by = ? WHERE fact_id = ?",
+            (eligible, superseded),
+        )
+        store._conn.execute(
+            "UPDATE facts SET conflict_group = 'open' WHERE fact_id = ?",
+            (conflicted,),
+        )
+        store._conn.execute(
+            "UPDATE facts SET scope = 'work' WHERE fact_id = ?",
+            (work,),
+        )
+        store._conn.commit()
+        plus = hp.retrieval_plus.PlusFactRetriever(
+            store=store,
+            hrr_dim=64,
+            entity_expansion=True,
+            allowed_scopes=("private",),
+        )
+
+        results = plus.search("Orchid", min_trust=0.0, limit=10)
+
+        assert [fact["fact_id"] for fact in results] == [direct, eligible]
+        assert results[1]["expanded_from_entity"] == "Alex Rivera"
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("malformed_blob", [b"x", b"\0" * 16])
+def test_malformed_hrr_vector_uses_neutral_score(
+    hp, populated_store, malformed_blob
+):
+    target = populated_store._conn.execute(
+        "SELECT fact_id FROM facts WHERE content LIKE '%home projects%'"
+    ).fetchone()["fact_id"]
+    populated_store._conn.execute(
+        "UPDATE facts SET hrr_vector = ? WHERE fact_id = ?",
+        (malformed_blob, target),
+    )
+    populated_store._conn.commit()
+    plus = hp.retrieval_plus.PlusFactRetriever(
+        store=populated_store,
+        hrr_dim=64,
+    )
+
+    results = plus.search("home projects", min_trust=0.0, limit=10, explain=True)
+
+    matched = next(fact for fact in results if fact["fact_id"] == target)
+    assert matched["_breakdown"]["hrr_score"] == 0.5
 
 
 def test_no_blob_loads_when_hrr_disabled(hp, populated_store, monkeypatch):

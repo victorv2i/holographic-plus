@@ -15,6 +15,7 @@ from pathlib import Path
 import sqlite3
 
 from .backup import (
+    _load_verification_extensions,
     backup_database,
     maintenance_database_lock,
     restore_database,
@@ -168,7 +169,7 @@ def create_legacy_fixture(path: str | Path, *, unknown_fact_object: bool = False
                 content, category, tags, trust_score, retrieval_count,
                 helpful_count, hrr_vector
             ) VALUES
-                ('Victor builds Enfold on the synthetic lab', 'project',
+                ('Avery builds Enfold on the synthetic lab', 'project',
                  'enfold,legacy', 0.9, 7, 2, X'01020304'),
                 ('Synthetic morning briefing uses model alpha', 'preference',
                  'briefing,model', 0.8, 3, 1, X'05060708'),
@@ -238,6 +239,12 @@ def database_fingerprint(path: str | Path) -> str:
     digest = hashlib.sha256()
     conn = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
     try:
+        # Fingerprinting is a verification operation too: an installed
+        # virtual-table module must be registered before SQLite can read that
+        # table's logical rows.  Reuse backup's fail-closed detection so a
+        # copied real store with a vec0 index is measured rather than rejected
+        # as an unreadable database.
+        _load_verification_extensions(conn)
         objects = conn.execute(
             """
             SELECT type, name, tbl_name, COALESCE(sql, '')
@@ -353,9 +360,9 @@ def run_rehearsal(directory: str | Path) -> RehearsalReport:
         if migrated_version != 1:
             raise RehearsalError("migration did not reach schema version 1")
         context = ConnectionContext(
-            client_id="rehearsal-codex",
-            surface="codex",
-            agent_id="synthetic-codex",
+            client_id="rehearsal-terminal",
+            surface="terminal",
+            agent_id="synthetic-terminal",
             session_id="synthetic-rehearsal",
             project_root=str(root),
             repository="synthetic/enfold",
@@ -506,8 +513,8 @@ def rehearse_snapshot(
             migrated_version = migrate(conn)
             context = ConnectionContext(
                 client_id="snapshot-rehearsal",
-                surface="codex",
-                agent_id="codex-rehearsal",
+                surface="terminal",
+                agent_id="terminal-rehearsal",
                 session_id="snapshot-rehearsal",
                 access_scopes=("private",),
             )

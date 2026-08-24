@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+umask 077
+
+readonly SOURCE="${ENFOLD_BACKUP_SOURCE:-$HOME/.hermes/memory_store.db}"
+readonly DEST_DIR="${ENFOLD_BACKUP_DEST_DIR:-$HOME/.hermes/backups/enfold-live}"
+readonly PYTHON="${ENFOLD_BACKUP_PYTHON:-$HOME/.local/share/enfold-v1/venv/bin/python}"
+readonly RETENTION_DAYS="${ENFOLD_BACKUP_RETENTION_DAYS:-14}"
+
+case "$SOURCE:$DEST_DIR:$PYTHON" in
+  /*:/*:/*) ;;
+  *)
+    printf 'backup source, destination, and Python must be absolute paths\n' >&2
+    exit 2
+    ;;
+esac
+if [[ "$DEST_DIR" == "/" || ! "$RETENTION_DAYS" =~ ^[0-9]+$ ]]; then
+  printf 'backup destination or retention setting is unsafe\n' >&2
+  exit 2
+fi
+if [[ ! -f "$SOURCE" || ! -x "$PYTHON" ]]; then
+  printf 'backup source or Python runtime is unavailable\n' >&2
+  exit 2
+fi
+
+readonly GENERATIONS="$DEST_DIR/generations"
+mkdir -p -- "$GENERATIONS"
+touch -- "$DEST_DIR/.keep"
+
+timestamp="$(date -u '+%Y%m%dT%H%M%SZ')"
+pending="$(mktemp -d "$GENERATIONS/.pending-$timestamp.XXXXXX")"
+latest_pending=""
+
+cleanup() {
+  if [[ -n "$latest_pending" ]]; then
+    rm -f -- "$latest_pending"
+  fi
+  if [[ -n "$pending" && -d "$pending" ]]; then
+    rm -f -- \
+      "$pending/memory_store.sqlite" \
+      "$pending/memory_store.json" \
+      "$pending/SHA256SUMS"
+    rmdir -- "$pending"
+  fi
+}
+trap cleanup EXIT
+
+database="$pending/memory_store.sqlite"
+report="$pending/memory_store.json"
+"$PYTHON" -m enfold.ops backup "$SOURCE" "$database" >"$report"
+(
+  cd -- "$pending"
+  sha256sum memory_store.sqlite >SHA256SUMS
+  sha256sum -c SHA256SUMS >/dev/null
+)
+
+pending_name="$(basename -- "$pending")"
+generation_name="${pending_name#.pending-}"
+generation="$GENERATIONS/$generation_name"
+mv -- "$pending" "$generation"
+pending=""
+
+latest_pending="$DEST_DIR/.latest.$BASHPID"
+ln -s -- "generations/$generation_name" "$latest_pending"
+mv -Tf -- "$latest_pending" "$DEST_DIR/latest"
+latest_pending=""
+
+# Prune complete directory generations only after publishing and verifying a
+# replacement. Any missing, non-regular, symlinked, or unknown entry retains
+# the entire generation for review.
+while IFS= read -r -d '' expired; do
+  if [[ -f "$expired/memory_store.sqlite" \
+        && ! -L "$expired/memory_store.sqlite" \
+        && -f "$expired/memory_store.json" \
+        && ! -L "$expired/memory_store.json" \
+        && -f "$expired/SHA256SUMS" \
+        && ! -L "$expired/SHA256SUMS" ]]; then
+    entry_count="$(find "$expired" -mindepth 1 -maxdepth 1 -printf '.' | wc -c)"
+    if [[ "$entry_count" -eq 3 ]]; then
+      rm -f -- \
+        "$expired/memory_store.sqlite" \
+        "$expired/memory_store.json" \
+        "$expired/SHA256SUMS"
+      rmdir -- "$expired"
+    fi
+  fi
+done < <(
+  find "$GENERATIONS" -mindepth 1 -maxdepth 1 -type d \
+    ! -name '.*' -mtime "+$RETENTION_DAYS" -print0
+)
+
+# Retain compatibility with pre-generation backups until normal retention
+# expires them. Pruning is intentionally limited to known legacy names.
+find "$DEST_DIR" -maxdepth 1 -type f -mtime "+$RETENTION_DAYS" \
+  \( -name 'memory_store-*.sqlite' -o -name 'memory_store-*.json' \
+     -o -name 'memory_store-*.sha256' -o -name 'memory_store-*.sqlite-wal' \
+     -o -name 'memory_store-*.sqlite-shm' \) -delete
+
+printf 'verified Enfold backup: %s\n' "$generation/memory_store.sqlite"

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+import hashlib
 import os
 from pathlib import Path
 import socket
@@ -57,6 +59,7 @@ def _connect(
     capabilities=(CAPABILITY_HEALTH, CAPABILITY_WRITE, CAPABILITY_SEARCH),
     protocol=ProtocolVersion(),
     schema_version=1,
+    credential: str | None = None,
 ) -> tuple[socket.socket, HandshakeResponse]:
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     client.settimeout(2)
@@ -68,12 +71,58 @@ def _connect(
                 capabilities=capabilities,
                 protocol=protocol,
                 schema_version=schema_version,
+                credential=credential,
             )
         )
     )
     response = _receive(client)
     assert isinstance(response, HandshakeResponse)
     return client, response
+
+
+def test_client_credentials_bind_claimed_identity_even_for_same_uid(tmp_path):
+    path = tmp_path / "enfold.sock"
+    token = "correct-horse-battery-staple-with-enough-entropy"
+    digest = "sha256:" + hashlib.sha256(token.encode()).hexdigest()
+    daemon = UnixJsonDaemon(
+        _config(path, client_credentials={"privileged-install": digest}),
+        lambda context, request: {},
+    )
+    daemon.start()
+    try:
+        forged, refusal = _connect(
+            path,
+            context=_context(client_id="privileged-install"),
+            credential="attacker-controlled-token",
+        )
+        try:
+            assert refusal.accepted is False
+            assert refusal.error is not None
+            assert refusal.error.code == "invalid_client_credentials"
+        finally:
+            forged.close()
+
+        legitimate, accepted = _connect(
+            path,
+            context=_context(client_id="privileged-install"),
+            credential=token,
+        )
+        try:
+            assert accepted.accepted is True
+        finally:
+            legitimate.close()
+    finally:
+        daemon.shutdown()
+
+
+def test_client_credentials_reject_one_bearer_token_shared_by_multiple_ids(tmp_path):
+    digest = "sha256:" + hashlib.sha256(b"shared-token").hexdigest()
+
+    with pytest.raises(ValueError, match="unique per client"):
+        _config(
+            tmp_path / "enfold.sock",
+            client_credentials={"low-privilege": digest, "high-privilege": digest},
+        )
 
 
 def _request(path: Path, request: Request) -> Response:
@@ -97,6 +146,12 @@ def _config(path: Path, **changes) -> DaemonConfig:
     }
     values.update(changes)
     return DaemonConfig(**values)
+
+
+@pytest.mark.parametrize("timeout", [float("nan"), float("inf"), -float("inf")])
+def test_daemon_config_rejects_non_finite_timeouts(tmp_path, timeout):
+    with pytest.raises(ValueError, match="timeouts must be positive"):
+        _config(tmp_path / "enfold.sock", client_timeout=timeout)
 
 
 def test_handshake_negotiates_capabilities_and_health_uses_trusted_context(tmp_path):
@@ -294,7 +349,7 @@ def test_request_cannot_change_connection_version_or_schema(tmp_path):
         daemon.shutdown()
 
 
-def test_public_and_internal_handler_errors_are_typed(tmp_path):
+def test_public_and_internal_handler_errors_are_typed(tmp_path, caplog):
     path = tmp_path / "enfold.sock"
 
     def handler(context, request):
@@ -310,11 +365,54 @@ def test_public_and_internal_handler_errors_are_typed(tmp_path):
         )
         assert public.error.code == "not_allowed"
         assert public.error.message == "operation is not allowed"
-        internal = _request(path, Request("req-internal", "memory.write"))
+        with caplog.at_level(logging.ERROR, logger="enfold.daemon"):
+            internal = _request(path, Request("req-internal", "memory.write"))
         assert internal.error.code == "internal_error"
         assert "secret" not in internal.error.message
+        records = [
+            record for record in caplog.records
+            if record.name == "enfold.daemon" and record.levelno == logging.ERROR
+        ]
+        assert len(records) == 1
+        assert records[0].getMessage() == "request handler failed"
+        assert records[0].exc_info[0] is RuntimeError
     finally:
         daemon.shutdown()
+
+
+def test_internal_handler_error_is_logged_with_traceback_without_socket(caplog):
+    class RecordingClient:
+        def __init__(self):
+            self.frames = []
+
+        def sendall(self, frame):
+            self.frames.append(frame)
+
+    def handler(_context, _request):
+        raise RuntimeError("secret implementation detail")
+
+    daemon = UnixJsonDaemon(_config(Path("/tmp/enfold-unused.sock")), handler)
+    client = RecordingClient()
+    keep_open, connection = daemon._handle_frame(
+        client,
+        encode_frame(Handshake(_context())),
+        None,
+    )
+    assert keep_open is True
+
+    with caplog.at_level(logging.ERROR, logger="enfold.daemon"):
+        daemon._handle_frame(
+            client,
+            encode_frame(Request("req-internal", "memory.write")),
+            connection,
+        )
+
+    response = decode_frame(client.frames[-1])
+    assert isinstance(response, Response)
+    assert response.error.code == "internal_error"
+    record = caplog.records[-1]
+    assert record.getMessage() == "request handler failed"
+    assert record.exc_info[0] is RuntimeError
 
 
 def test_transport_neutral_service_errors_are_serialized(tmp_path):

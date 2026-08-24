@@ -7,9 +7,10 @@ provide an explicit JSON configuration and an existing, schema-v1 store.
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import fcntl
 import importlib.metadata
+import ipaddress
 import json
 import hashlib
 import math
@@ -21,11 +22,21 @@ import sqlite3
 import stat
 import sys
 from typing import Any, Callable, Mapping, Sequence
+from urllib import parse as urlparse
 
+from .client import ClientConfig, EnfoldClient, EnfoldClientError
 from .daemon import DaemonConfig, UnixJsonDaemon
 from .extraction_enqueue import ExtractionEnqueuer, ExtractionQueueUnavailable
 from .extraction_processor import ExtractionProcessor
 from .extraction_worker import SupervisedExtractionWorker
+from .extractor_artifact import (
+    ExtractorArtifactAttestation,
+    ExtractorArtifactError,
+    attest_inference_recipe,
+    bundled_ollama_components,
+    is_bundled_ollama_command,
+    require_sha256_digest as require_extractor_digest,
+)
 from .host_extractor import HostExtractorConfig, SubprocessHostExtractor
 from .embedding_jobs import (
     EmbeddingJobProcessor, EmbeddingOutbox, EmbeddingSpec,
@@ -40,17 +51,24 @@ from .ollama_artifact import (
     LocalOllamaArtifactAttestor,
     require_sha256_digest,
 )
+from .ollama_extractor_child import DEFAULT_ENDPOINT as DEFAULT_EXTRACTION_ENDPOINT
 from .hybrid_retrieval import (
     HybridRetriever,
     RetrieverFactory,
     SQLiteVersionedEmbeddingBackend,
     SQLiteStoredEmbeddingWriter,
     StoredEmbeddingError,
+    VectorFallbackTelemetry,
     VersionedStoredEmbeddingAdapter,
     deterministic_retriever_factory,
 )
 from .policy import MemoryPolicy, validate_scope
-from .protocol import MAX_FRAME_SIZE, SUPPORTED_CAPABILITIES
+from .protocol import (
+    CAPABILITY_HEALTH,
+    MAX_FRAME_SIZE,
+    SUPPORTED_CAPABILITIES,
+    ClientContext,
+)
 from .read_pool import LRUQueryEmbedder, PerRequestReadHandler
 from .schema import SUPPORTED_SCHEMA_VERSION, SchemaError, require_compatible_schema
 from .service import EnfoldService
@@ -128,7 +146,20 @@ def _version() -> str:
     try:
         return importlib.metadata.version("enfold")
     except importlib.metadata.PackageNotFoundError:
-        return "0.7.0"
+        return "0.8.0"
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ServerConfigError(f"non-finite JSON number is not allowed: {value}")
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ServerConfigError(f"duplicate JSON object key: {key}")
+        result[key] = value
+    return result
 
 
 def _keys(value: Mapping[str, Any], allowed: set[str], where: str) -> None:
@@ -138,9 +169,15 @@ def _keys(value: Mapping[str, Any], allowed: set[str], where: str) -> None:
 
 
 def _positive_number(value: Any, name: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ServerConfigError(f"{name} must be a positive number")
-    return float(value)
+    try:
+        result = float(value)
+    except OverflowError as exc:
+        raise ServerConfigError(f"{name} must be a positive number") from exc
+    if not math.isfinite(result) or result <= 0:
+        raise ServerConfigError(f"{name} must be a positive number")
+    return result
 
 
 def _positive_int(value: Any, name: str) -> int:
@@ -175,6 +212,7 @@ class ServerConfig:
     backlog: int = 16
     cleanup_stale_socket: bool = False
     synchronous_full: bool = False
+    client_credentials: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -208,6 +246,8 @@ class ExtractionConfig:
 
     mode: str = "disabled"
     host: HostExtractorConfig | None = None
+    artifact: "ExtractionArtifactConfig | None" = None
+    artifact_recheck_seconds: float = 60.0
     poll_seconds: float = 1.0
     drain_limit: int = 4
     lease_seconds: float = 300.0
@@ -218,13 +258,23 @@ class ExtractionConfig:
     pending_stale_seconds: float = 900.0
 
 
+@dataclass(frozen=True, slots=True)
+class ExtractionArtifactConfig:
+    """Immutable pins for a bundled local Ollama extraction deployment."""
+
+    provider: str
+    model: str
+    model_digest: str
+    recipe_digest: str
+
+
 def _extraction_config(value: Any) -> ExtractionConfig:
     if value is None:
         return ExtractionConfig()
     if not isinstance(value, dict):
         raise ServerConfigError("extraction must be an object")
     allowed = {
-        "mode", "host", "poll_seconds", "drain_limit", "lease_seconds",
+        "mode", "host", "artifact", "artifact_recheck_seconds", "poll_seconds", "drain_limit", "lease_seconds",
         "heartbeat_seconds", "retry_delay_seconds", "max_attempts",
         "heartbeat_stale_seconds", "pending_stale_seconds",
     }
@@ -263,19 +313,67 @@ def _extraction_config(value: Any) -> ExtractionConfig:
     environment = host.get("environment", {})
     if not isinstance(environment, dict):
         raise ServerConfigError("extraction.host.environment must be an object")
+    artifact_value = value.get("artifact")
+    if not isinstance(artifact_value, dict):
+        raise ServerConfigError(
+            "daemon-supervised extraction requires immutable artifact pins"
+        )
+    _keys(
+        artifact_value,
+        {"provider", "model", "model_digest", "recipe_digest"},
+        "extraction.artifact",
+    )
+    missing_artifact = sorted(
+        {"provider", "model", "model_digest", "recipe_digest"}
+        - set(artifact_value)
+    )
+    if missing_artifact:
+        raise ServerConfigError(
+            f"missing extraction.artifact fields: {missing_artifact}"
+        )
+    if artifact_value["provider"] != "ollama":
+        raise ServerConfigError(
+            "daemon-supervised extraction artifact provider must be 'ollama'"
+        )
+    model = artifact_value["model"]
+    if not isinstance(model, str) or not model.strip():
+        raise ServerConfigError("extraction.artifact.model must be non-empty")
+    try:
+        artifact = ExtractionArtifactConfig(
+            provider="ollama",
+            model=model.strip(),
+            model_digest=require_extractor_digest(
+                artifact_value["model_digest"],
+                name="extraction.artifact.model_digest",
+            ),
+            recipe_digest=require_extractor_digest(
+                artifact_value["recipe_digest"],
+                name="extraction.artifact.recipe_digest",
+            ),
+        )
+    except ExtractorArtifactError as exc:
+        raise ServerConfigError(str(exc)) from exc
 
     def number(name: str, default: float, *, allow_zero: bool = False) -> float:
         item = value.get(name, default)
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            qualifier = "non-negative" if allow_zero else "positive"
+            raise ServerConfigError(f"extraction.{name} must be {qualifier} and finite")
+        try:
+            normalized = float(item)
+        except OverflowError as exc:
+            qualifier = "non-negative" if allow_zero else "positive"
+            raise ServerConfigError(
+                f"extraction.{name} must be {qualifier} and finite"
+            ) from exc
         if (
-            isinstance(item, bool)
-            or not isinstance(item, (int, float))
-            or not math.isfinite(float(item))
-            or float(item) < (0 if allow_zero else 0.0)
-            or (not allow_zero and float(item) == 0)
+            not math.isfinite(normalized)
+            or normalized < (0 if allow_zero else 0.0)
+            or (not allow_zero and normalized == 0)
         ):
             qualifier = "non-negative" if allow_zero else "positive"
             raise ServerConfigError(f"extraction.{name} must be {qualifier} and finite")
-        return float(item)
+        return normalized
 
     def integer(name: str, default: int) -> int:
         item = value.get(name, default)
@@ -327,6 +425,8 @@ def _extraction_config(value: Any) -> ExtractionConfig:
     return ExtractionConfig(
         mode=mode,
         host=host_config,
+        artifact=artifact,
+        artifact_recheck_seconds=number("artifact_recheck_seconds", 60.0),
         poll_seconds=number("poll_seconds", 1.0),
         drain_limit=integer("drain_limit", 4),
         lease_seconds=lease_seconds,
@@ -439,9 +539,15 @@ def _retrieval_config(value: Any) -> RetrievalConfig:
         integer = name in {"drain_limit", "lease_seconds", "max_attempts"}
         if isinstance(item, bool) or not isinstance(item, int if integer else (int, float)):
             raise ServerConfigError(f"retrieval.processor.{name} has an invalid type")
-        if float(item) <= 0 or not math.isfinite(float(item)):
+        try:
+            normalized = float(item)
+        except OverflowError as exc:
+            raise ServerConfigError(
+                f"retrieval.processor.{name} must be positive and finite"
+            ) from exc
+        if normalized <= 0 or not math.isfinite(normalized):
             raise ServerConfigError(f"retrieval.processor.{name} must be positive and finite")
-        normalized_processor[name] = int(item) if integer else float(item)
+        normalized_processor[name] = int(item) if integer else normalized
     try:
         model_fingerprint = require_sha256_digest(
             model_fingerprint, name="retrieval.model_fingerprint"
@@ -530,18 +636,40 @@ def load_config(path: str | Path, *, allow_live: bool = False) -> ServerConfig:
     if not config_path.is_absolute():
         raise ServerConfigError("config path must be absolute")
     _guard_live_path(config_path, allow_live=allow_live)
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
-        info = config_path.lstat()
+        descriptor = os.open(config_path, flags)
     except FileNotFoundError as exc:
         raise ServerConfigError("config file does not exist") from exc
-    if not stat.S_ISREG(info.st_mode) or config_path.is_symlink():
-        raise ServerConfigError("config path must be a regular, non-symlink file")
-    if info.st_uid != os.getuid() or info.st_mode & 0o022:
-        raise ServerConfigError("config file must be owned by this user and not group/world writable")
+    except OSError as exc:
+        raise ServerConfigError(
+            "config path must be a regular, non-symlink file"
+        ) from exc
     try:
-        raw = json.loads(config_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise ServerConfigError(
+                "config path must be a regular, non-symlink file"
+            )
+        if info.st_uid != os.getuid() or info.st_mode & 0o022:
+            raise ServerConfigError(
+                "config file must be owned by this user and not group/world writable"
+            )
+        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+            descriptor = -1
+            raw = json.load(
+                handle,
+                parse_constant=_reject_json_constant,
+                object_pairs_hook=_unique_json_object,
+            )
+    except ServerConfigError:
+        raise
+    except (OSError, UnicodeError, ValueError) as exc:
         raise ServerConfigError(f"cannot read config JSON: {exc}") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
     if not isinstance(raw, dict):
         raise ServerConfigError("config must be a JSON object")
     allowed = {
@@ -550,6 +678,7 @@ def load_config(path: str | Path, *, allow_live: bool = False) -> ServerConfig:
         "cleanup_stale_socket",
         "correction_authorities", "conflict_resolution_authorities",
         "retrieval", "extraction", "synchronous_full", "browse_scopes",
+        "client_credentials",
     }
     _keys(raw, allowed, "config")
     missing = sorted(
@@ -569,9 +698,34 @@ def load_config(path: str | Path, *, allow_live: bool = False) -> ServerConfig:
     for client_id, scopes in grants_raw.items():
         if not isinstance(client_id, str) or not client_id.strip():
             raise ServerConfigError("grant client ids must be non-empty strings")
+        normalized_client_id = client_id.strip()
+        if normalized_client_id in grants:
+            raise ServerConfigError(
+                "grant client ids must be unique after whitespace normalization"
+            )
         if not isinstance(scopes, list) or not all(isinstance(x, str) for x in scopes):
             raise ServerConfigError(f"grant {client_id!r} must be an array of scopes")
-        grants[client_id] = tuple(scopes)
+        grants[normalized_client_id] = tuple(scopes)
+    credentials_raw = raw.get("client_credentials")
+    client_credentials: dict[str, str] = {}
+    if credentials_raw is not None:
+        if not isinstance(credentials_raw, dict) or not credentials_raw:
+            raise ServerConfigError("client_credentials must be a non-empty object")
+        if set(credentials_raw) != set(grants):
+            raise ServerConfigError(
+                "client_credentials must contain exactly every granted client id"
+            )
+        for client_id, digest in credentials_raw.items():
+            try:
+                client_credentials[client_id] = require_sha256_digest(
+                    digest, name=f"client_credentials.{client_id}"
+                )
+            except ArtifactAttestationError as exc:
+                raise ServerConfigError(str(exc)) from exc
+        if len(set(client_credentials.values())) != len(client_credentials):
+            raise ServerConfigError(
+                "client credentials must be unique per client"
+            )
     def authorities(name: str) -> tuple[str, ...]:
         value = raw.get(name, [])
         if not isinstance(value, list) or not all(
@@ -633,19 +787,35 @@ def load_config(path: str | Path, *, allow_live: bool = False) -> ServerConfig:
         backlog=_positive_int(raw.get("backlog", 16), "backlog"),
         cleanup_stale_socket=cleanup,
         synchronous_full=synchronous_full,
+        client_credentials=client_credentials,
     )
 
 
 def _guard_live_path(path: Path, *, allow_live: bool) -> None:
-    home_live = Path.home() / ".hermes"
+    home_live = (Path.home() / ".hermes").resolve()
     try:
-        path.absolute().relative_to(home_live.absolute())
+        path.resolve().relative_to(home_live)
     except ValueError:
         return
+    except (OSError, RuntimeError) as exc:
+        raise ServerConfigError(f"cannot safely resolve path: {path}") from exc
     if not allow_live:
         raise ServerConfigError(
             f"refusing .hermes path without explicit --allow-live: {path}"
         )
+
+
+def _validate_private_directory(path: Path, label: str) -> None:
+    try:
+        info = path.lstat()
+    except FileNotFoundError as exc:
+        raise ServerConfigError(f"{label} does not exist") from exc
+    if not stat.S_ISDIR(info.st_mode) or path.is_symlink():
+        raise ServerConfigError(f"{label} must be a non-symlink directory")
+    if info.st_uid != os.getuid():
+        raise ServerConfigError(f"{label} must be owned by this user")
+    if info.st_mode & 0o022:
+        raise ServerConfigError(f"{label} must not be group/world writable")
 
 
 def _validate_runtime_paths(config: ServerConfig) -> None:
@@ -655,17 +825,12 @@ def _validate_runtime_paths(config: ServerConfig) -> None:
         raise ServerConfigError("database does not exist; the server never creates it") from exc
     if not stat.S_ISREG(db_info.st_mode) or config.database_path.is_symlink():
         raise ServerConfigError("database must be a regular, non-symlink file")
-    parent = config.socket_path.parent
-    try:
-        parent_info = parent.lstat()
-    except FileNotFoundError as exc:
-        raise ServerConfigError("socket parent directory does not exist") from exc
-    if not stat.S_ISDIR(parent_info.st_mode) or parent.is_symlink():
-        raise ServerConfigError("socket parent must be a non-symlink directory")
-    if parent_info.st_uid != os.getuid():
-        raise ServerConfigError("socket parent must be owned by this user")
-    if parent_info.st_mode & 0o022:
-        raise ServerConfigError("socket parent must not be group/world writable")
+    if db_info.st_uid != os.getuid():
+        raise ServerConfigError("database must be owned by this user")
+    if db_info.st_mode & 0o022:
+        raise ServerConfigError("database must not be group/world writable")
+    _validate_private_directory(config.socket_path.parent, "socket parent")
+    _validate_private_directory(config.database_path.parent, "database parent")
 
 
 def _open_existing_v1(
@@ -709,14 +874,19 @@ def _open_existing_v1(
 
 
 def _retriever_factory(
-    config: RetrievalConfig, conn: sqlite3.Connection, query_embedder: Any = None
+    config: RetrievalConfig,
+    conn: sqlite3.Connection,
+    query_embedder: Any = None,
+    vector_fallback_telemetry: VectorFallbackTelemetry | None = None,
 ) -> RetrieverFactory:
     """Build the explicitly selected retrieval stack without probing a model."""
 
     if config.mode == "ci":
         # Parsing already required the conspicuous non-production opt-in.
         return deterministic_retriever_factory(
-            dimensions=config.dimensions, vector_backend=config.vector_backend
+            dimensions=config.dimensions,
+            vector_backend=config.vector_backend,
+            vector_fallback_telemetry=vector_fallback_telemetry,
         )
 
     if query_embedder is not None:
@@ -769,6 +939,7 @@ def _retriever_factory(
             selected,
             allowed_scopes=scopes,
             vector_backend=config.vector_backend,
+            vector_fallback_telemetry=vector_fallback_telemetry,
         )
 
     return build
@@ -828,6 +999,128 @@ def _artifact_state(attestation: ArtifactAttestation | None) -> dict[str, str]:
     )
 
 
+def _command_option(
+    argv: Sequence[str], name: str, *, default: str | None = None
+) -> str | None:
+    """Read one long option without accepting ambiguous duplicate values."""
+
+    values: list[str] = []
+    prefix = f"{name}="
+    for index, item in enumerate(argv):
+        if item.startswith(prefix):
+            values.append(item[len(prefix):])
+        elif item == name:
+            if index + 1 >= len(argv):
+                raise ExtractorArtifactError(f"{name} has no value")
+            values.append(argv[index + 1])
+    if len(values) > 1 or any(not value for value in values):
+        raise ExtractorArtifactError(f"{name} must have exactly one value")
+    return values[0] if values else default
+
+
+def _attest_extraction_artifact(
+    config: ExtractionConfig,
+    attestor: ArtifactAttestor | None = None,
+) -> ExtractorArtifactAttestation | None:
+    """Fail closed before startup when supervised extraction is not exact."""
+
+    if config.mode != "daemon-supervised":
+        return None
+    host = config.host
+    artifact = config.artifact
+    try:
+        if host is None or artifact is None:
+            raise ExtractorArtifactError("immutable extraction pins are unavailable")
+        if artifact.provider != "ollama" or not is_bundled_ollama_command(host.argv):
+            raise ExtractorArtifactError(
+                "only the bundled local Ollama child can be deployment-attested"
+            )
+        if host.environment:
+            raise ExtractorArtifactError(
+                "attested Ollama extraction does not accept environment overrides"
+            )
+        model = _command_option(host.argv, "--model")
+        model_identity = _command_option(host.argv, "--model-identity")
+        prompt_identity = _command_option(
+            host.argv, "--prompt-identity", default=host.prompt_identity
+        )
+        endpoint = _command_option(
+            host.argv, "--endpoint", default=DEFAULT_EXTRACTION_ENDPOINT
+        )
+        if (
+            model != artifact.model
+            or model_identity != host.model_identity
+            or prompt_identity != host.prompt_identity
+        ):
+            raise ExtractorArtifactError(
+                "extractor command identities do not match immutable configuration"
+            )
+        parsed_endpoint = urlparse.urlsplit(str(endpoint))
+        try:
+            endpoint_is_loopback = ipaddress.ip_address(
+                str(parsed_endpoint.hostname)
+            ).is_loopback
+        except ValueError:
+            endpoint_is_loopback = False
+        if (
+            parsed_endpoint.scheme != "http"
+            or parsed_endpoint.hostname is None
+            or not endpoint_is_loopback
+            or parsed_endpoint.username is not None
+            or parsed_endpoint.password is not None
+            or parsed_endpoint.query
+            or parsed_endpoint.fragment
+            or parsed_endpoint.path.rstrip("/") != "/api/chat"
+        ):
+            raise ExtractorArtifactError("extractor endpoint is not attestable")
+        base_url = urlparse.urlunsplit(
+            (
+                parsed_endpoint.scheme,
+                parsed_endpoint.netloc,
+                "",
+                "",
+                "",
+            )
+        )
+        active_attestor = attestor or LocalOllamaArtifactAttestor(base_url=base_url)
+        model_attestation = active_attestor.attest(
+            model=artifact.model, expected_digest=artifact.model_digest
+        )
+        if (
+            not isinstance(model_attestation, ArtifactAttestation)
+            or model_attestation.provider != "ollama"
+        ):
+            raise ExtractorArtifactError("model artifact attestation is invalid")
+        components = bundled_ollama_components(host.argv[0])
+        recipe = host.inference_recipe(
+            model_artifact_digest=artifact.model_digest,
+            **components,
+        )
+        return attest_inference_recipe(
+            recipe, expected_digest=artifact.recipe_digest
+        )
+    except (ArtifactAttestationError, ExtractorArtifactError) as exc:
+        raise ServerConfigError(
+            "automatic extraction artifact attestation failed"
+        ) from exc
+    except Exception as exc:
+        raise ServerConfigError(
+            "automatic extraction artifact attestation failed"
+        ) from exc
+
+
+def _extraction_artifact_state(
+    attestation: ExtractorArtifactAttestation | None,
+    *,
+    required: bool = False,
+) -> dict[str, object]:
+    if attestation is None:
+        if required:
+            return {"provider": "ollama", "status": "unverified"}
+        return {"status": "not_required"}
+    return {"provider": "ollama", **attestation.safe_state()}
+
+
 class ServerApplication:
     """Own the database connection, service, and Unix daemon as one unit."""
 
@@ -837,9 +1130,11 @@ class ServerApplication:
         *,
         document_embedder: Any = None,
         artifact_attestor: ArtifactAttestor | None = None,
+        extraction_artifact_attestor: ArtifactAttestor | None = None,
         extraction_extractor_factory: Callable[[HostExtractorConfig], Any] = (
             SubprocessHostExtractor
         ),
+        extraction_evidence_verifier: Any = None,
     ):
         self.config = config
         # Verify a mutable configured tag before opening the database, acquiring
@@ -847,12 +1142,17 @@ class ServerApplication:
         self.artifact_attestation = _attest_artifact(
             config.retrieval, artifact_attestor
         )
+        self.extraction_artifact_attestation = _attest_extraction_artifact(
+            config.extraction, extraction_artifact_attestor
+        )
+        _validate_runtime_paths(config)
         self.ownership = DatabaseOwnership(config.database_path)
         self.ownership.acquire()
         try:
             self.connection = _open_existing_v1(config)
             self.extraction_connection = None
             self.extraction_worker = None
+            self.vector_fallback_telemetry = VectorFallbackTelemetry()
             try:
                 extraction_enqueuer = ExtractionEnqueuer(self.connection)
             except ExtractionQueueUnavailable:
@@ -869,7 +1169,11 @@ class ServerApplication:
             query_embedder = None
             document_query_embedder = None
             if config.retrieval.mode == "stored":
-                probe_factory = _retriever_factory(config.retrieval, self.connection)
+                probe_factory = _retriever_factory(
+                    config.retrieval,
+                    self.connection,
+                    vector_fallback_telemetry=self.vector_fallback_telemetry,
+                )
                 document_query_embedder = probe_factory(
                     self.connection, ("private",)
                 )._embedder.backend._query_embedder
@@ -886,7 +1190,10 @@ class ServerApplication:
                     )
                 write_query_embedder = embed_write_content
             retriever_factory = _retriever_factory(
-                config.retrieval, self.connection, query_embedder
+                config.retrieval,
+                self.connection,
+                query_embedder,
+                self.vector_fallback_telemetry,
             )
             self.embedding_connection = None
             self.embedding_worker = None
@@ -941,7 +1248,10 @@ class ServerApplication:
                     read_connection,
                     policy,
                     retriever_factory=_retriever_factory(
-                        config.retrieval, read_connection, query_embedder
+                        config.retrieval,
+                        read_connection,
+                        query_embedder,
+                        self.vector_fallback_telemetry,
                     ),
                     extraction_enqueuer=None,
                     extraction_processing_mode=config.extraction.mode,
@@ -952,7 +1262,9 @@ class ServerApplication:
                     raise ServerConfigError("automatic extraction queue is unavailable")
                 self.extraction_connection = _open_existing_v1(config)
                 extraction_retriever_factory = _retriever_factory(
-                    config.retrieval, self.extraction_connection
+                    config.retrieval,
+                    self.extraction_connection,
+                    vector_fallback_telemetry=self.vector_fallback_telemetry,
                 )
                 extraction_outbox = _outbox(
                     config.retrieval, self.extraction_connection
@@ -978,11 +1290,22 @@ class ServerApplication:
                         lease_seconds=config.extraction.lease_seconds,
                         heartbeat_seconds=config.extraction.heartbeat_seconds,
                         retry_delay_seconds=config.extraction.retry_delay_seconds,
+                        evidence_verifier=extraction_evidence_verifier,
                     )
+                    def reattest_extraction_artifact() -> None:
+                        attestation = _attest_extraction_artifact(
+                            config.extraction, extraction_artifact_attestor
+                        )
+                        self.extraction_artifact_attestation = attestation
+
                     self.extraction_worker = SupervisedExtractionWorker(
                         processor,
                         poll_seconds=config.extraction.poll_seconds,
                         drain_limit=config.extraction.drain_limit,
+                        prerequisite_check=reattest_extraction_artifact,
+                        prerequisite_check_interval_seconds=(
+                            config.extraction.artifact_recheck_seconds
+                        ),
                     )
                 except Exception as exc:
                     raise ServerConfigError(
@@ -1011,13 +1334,18 @@ class ServerApplication:
                     ),
                 }
 
-            def service_health(_context: Any) -> dict[str, Any]:
+            def service_health(context: ClientContext) -> dict[str, Any]:
+                self.service._authorize(context)
                 embedding_state = embedding_health()
                 if self.extraction_worker is None:
                     extraction_state: dict[str, Any] = {"status": "disabled"}
                 else:
                     worker_state = self.extraction_worker.health(
                         stale_after=config.extraction.heartbeat_stale_seconds
+                    )
+                    processor_state = processor.health
+                    evidence_verifier_state = dict(
+                        processor_state["evidence_verifier"]
                     )
                     rows = self.connection.execute(
                         "SELECT status, count(*) FROM extract_queue GROUP BY status"
@@ -1037,31 +1365,54 @@ class ServerApplication:
                         or worker_state["last_error"] is not None
                         or counts.get("dead", 0)
                         or pending_stale
+                        or not evidence_verifier_state["configured"]
                     )
                     extraction_state = {
                         "status": "degraded" if degraded else "ready",
                         "worker": worker_state,
+                        "evidence_verifier": evidence_verifier_state,
                         "queue": {
                             "pending": counts.get("pending", 0),
                             "processing": counts.get("processing", 0),
                             "dead": counts.get("dead", 0),
+                            "acknowledged": counts.get("acknowledged", 0),
                             "oldest_active_age_seconds": oldest,
                             "pending_stale": pending_stale,
                         },
                     }
+                artifact_state = _artifact_state(self.artifact_attestation)
+                extraction_artifact_state = _extraction_artifact_state(
+                    self.extraction_artifact_attestation,
+                    required=config.extraction.mode == "daemon-supervised",
+                )
+                attestation_degraded = bool(
+                    artifact_state["status"] not in {"verified", "not_required"}
+                    or extraction_artifact_state["status"]
+                    not in {"verified", "not_required"}
+                )
+                retrieval_state = self.service.retrieval_metadata
+                retrieval_degraded = bool(
+                    retrieval_state.get("vector_fallback_active")
+                )
                 return {
                     "status": (
                         "degraded" if (
                             embedding_state.get("degraded")
                             or extraction_state["status"] == "degraded"
+                            or attestation_degraded
+                            or retrieval_degraded
                         ) else "ok"
                     ),
                     "storage": "sqlite",
                     "database": "ready",
-                    "retrieval": self.service.retrieval_metadata,
-                    "artifact_attestation": _artifact_state(
-                        self.artifact_attestation
+                    "identity_authentication": (
+                        "client-credential"
+                        if config.client_credentials
+                        else "trusted-local-uid"
                     ),
+                    "retrieval": retrieval_state,
+                    "artifact_attestation": artifact_state,
+                    "extraction_artifact_attestation": extraction_artifact_state,
                     "embedding_outbox": embedding_state,
                     "automatic_llm_extraction": extraction_state,
                     "extraction_enqueue": (
@@ -1080,6 +1431,7 @@ class ServerApplication:
                     shutdown_timeout=config.shutdown_timeout,
                     backlog=config.backlog,
                     cleanup_stale_socket=config.cleanup_stale_socket,
+                    client_credentials=config.client_credentials,
                 ),
                 request_handler,
                 health_hook=service_health,
@@ -1097,6 +1449,7 @@ class ServerApplication:
             self.ownership.release()
             raise
         self._closed = False
+        self._close_degraded = False
 
     def serve_forever(self) -> None:
         if self.embedding_worker is not None:
@@ -1106,20 +1459,58 @@ class ServerApplication:
         self.daemon.serve_forever()
 
     def close(self) -> None:
+        """Stop all threads and release shared state only after they have exited.
+
+        A confirmed-live worker or request-handler thread leaves database
+        connections and writer ownership intact, marks this close as degraded,
+        and raises so process supervision can restart the process safely.
+        """
+
         if self._closed:
             return
-        self.daemon.shutdown()
-        if self.extraction_worker is not None:
-            self.extraction_worker.stop(self.config.shutdown_timeout)
-        if self.embedding_worker is not None:
-            self.embedding_worker.stop(self.config.shutdown_timeout)
+        errors: list[BaseException] = []
+        try:
+            self.daemon.shutdown()
+        except BaseException as exc:
+            errors.append(exc)
+        workers = tuple(
+            worker for worker in (
+                self.extraction_worker, self.embedding_worker
+            ) if worker is not None
+        )
+        for worker in workers:
+            try:
+                worker.stop(self.config.shutdown_timeout)
+            except BaseException as exc:
+                errors.append(exc)
+        live_threads = self.daemon.has_live_threads() or any(
+            bool(
+                (thread := getattr(worker, "_thread", None))
+                and thread.is_alive()
+            )
+            for worker in workers
+        )
+        if live_threads:
+            self._close_degraded = True
+            if not errors:
+                errors.append(RuntimeError("server threads did not stop cleanly"))
+            raise BaseExceptionGroup("server cleanup failed", errors)
+
+        cleanup: list[Callable[[], None]] = []
         if self.extraction_connection is not None:
-            self.extraction_connection.close()
+            cleanup.append(self.extraction_connection.close)
         if self.embedding_connection is not None:
-            self.embedding_connection.close()
-        self.connection.close()
-        self.ownership.release()
+            cleanup.append(self.embedding_connection.close)
+        cleanup.extend((self.connection.close, self.ownership.release))
+        for action in cleanup:
+            try:
+                action()
+            except BaseException as exc:
+                errors.append(exc)
         self._closed = True
+        self._close_degraded = False
+        if errors:
+            raise BaseExceptionGroup("server cleanup failed", errors)
 
     def __enter__(self) -> "ServerApplication":
         return self
@@ -1133,10 +1524,14 @@ def inspect_config(
     *,
     probe_socket: bool = False,
     artifact_attestor: ArtifactAttestor | None = None,
+    extraction_artifact_attestor: ArtifactAttestor | None = None,
 ) -> dict[str, Any]:
     """Validate the store and report non-sensitive readiness information."""
 
     artifact_attestation = _attest_artifact(config.retrieval, artifact_attestor)
+    extraction_artifact_attestation = _attest_extraction_artifact(
+        config.extraction, extraction_artifact_attestor
+    )
     conn = _open_existing_v1(config, read_only=True)
     try:
         embedding_outbox = _outbox(config.retrieval, conn)
@@ -1174,8 +1569,13 @@ def inspect_config(
         and config.retrieval.mode == "stored"
         and socket_state == "accepting"
     )
+    socket_unhealthy = bool(
+        probe_socket and socket_state == "stale-or-unreachable"
+    )
     activation_blocked = (
-        not bool(outbox_health["activation_safe"]) or live_worker_unverified
+        not bool(outbox_health["activation_safe"])
+        or live_worker_unverified
+        or socket_unhealthy
     )
     return {
         "status": "blocked" if activation_blocked else "ready",
@@ -1186,6 +1586,9 @@ def inspect_config(
         "grant_count": len(config.grants),
         "retrieval": retrieval_metadata,
         "artifact_attestation": _artifact_state(artifact_attestation),
+        "extraction_artifact_attestation": _extraction_artifact_state(
+            extraction_artifact_attestation
+        ),
         "embedding_outbox": outbox_health,
         "embedding_worker": {
             "state": (
@@ -1202,10 +1605,14 @@ def inspect_config(
             )
         },
         "activation_blocker": (
-            "CLI socket probing cannot attest the live embedding worker; "
-            "query protocol health"
-            if live_worker_unverified
-            else "embedding outbox is unsafe" if activation_blocked else None
+            "configured socket is stale or unreachable"
+            if socket_unhealthy
+            else (
+                "CLI socket probing cannot attest the live embedding worker; "
+                "query protocol health"
+                if live_worker_unverified
+                else "embedding outbox is unsafe" if activation_blocked else None
+            )
         ),
     }
 
@@ -1221,6 +1628,16 @@ def _parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("check", help="validate configuration and schema without binding")
     sub.add_parser("status", help="validate and probe the configured socket")
+    health = sub.add_parser("health", help="query authenticated live protocol health")
+    health.add_argument("--client-id", default="healthcheck-install")
+    health.add_argument("--surface", default="operator-health")
+    health.add_argument("--agent-id", default="operator-health")
+    health.add_argument("--access-scope", action="append")
+    health.add_argument(
+        "--readiness",
+        action="store_true",
+        help="succeed when the daemon responds authentically, even if degraded",
+    )
     sub.add_parser("run", help="run the foreground daemon")
     return parser
 
@@ -1235,6 +1652,34 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             print(json.dumps(report, sort_keys=True))
             return 0 if report["status"] == "ready" else 2
+        if args.command == "health":
+            context = ClientContext(
+                client_id=args.client_id,
+                surface=args.surface,
+                agent_id=args.agent_id,
+                session_id="operator-health",
+                access_scopes=tuple(args.access_scope or ("public",)),
+            )
+            try:
+                report = EnfoldClient(ClientConfig(
+                    socket_path=config.socket_path,
+                    context=context,
+                    capabilities=(CAPABILITY_HEALTH,),
+                    credential=os.environ.get("ENFOLD_CLIENT_CREDENTIAL"),
+                )).request("health")
+            except EnfoldClientError:
+                print(json.dumps({
+                    "error": "enfold_client_error",
+                    "ok": False,
+                    "problems": ["daemon_unavailable_or_protocol_error"],
+                    "status": "unavailable",
+                }, sort_keys=True))
+                return 1
+            print(json.dumps(report, sort_keys=True))
+            reachable = report.get("status") in {"ok", "degraded"}
+            return 0 if report.get("status") == "ok" or (
+                args.readiness and reachable
+            ) else 1
         application = ServerApplication(config)
     except (ServerConfigError, SchemaError, sqlite3.Error) as exc:
         print(f"enfold-server: {exc}", file=sys.stderr)

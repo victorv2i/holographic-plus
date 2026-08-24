@@ -29,6 +29,7 @@ def _fact(
     subject: str | None = None,
     predicate: str | None = None,
     tags: str = "",
+    sensitivity: str = "normal",
 ) -> int:
     fact_id = insert_fact(
         conn,
@@ -38,6 +39,7 @@ def _fact(
         subject_key=subject,
         predicate_key=predicate,
         tags=tags,
+        sensitivity=sensitivity,
     )
     conn.execute(
         "UPDATE facts SET created_at = ?, updated_at = ? WHERE fact_id = ?",
@@ -50,15 +52,15 @@ def test_changes_uses_half_open_window_and_reports_supersession(tmp_path):
     conn = _store(tmp_path)
     first = _fact(
         conn,
-        "Victor uses laptop A",
+        "Morgan uses laptop A",
         created_at="2026-07-10T00:00:00Z",
-        subject="Victor",
+        subject="Morgan",
     )
     replacement = _fact(
         conn,
-        "Victor uses laptop B",
+        "Morgan uses laptop B",
         created_at="2026-07-11T00:00:00Z",
-        subject="Victor",
+        subject="Morgan",
     )
     conn.execute(
         "UPDATE facts SET invalid_at = ?, superseded_by = ? WHERE fact_id = ?",
@@ -111,27 +113,71 @@ def test_changes_empty_results_and_scope_isolation(tmp_path):
     conn.close()
 
 
+def test_projections_require_matching_sensitivity_capability(tmp_path):
+    conn = _store(tmp_path)
+    normal = _fact(
+        conn,
+        "Morgan normal roadmap",
+        created_at="2026-07-11T10:00:00Z",
+        subject="Morgan",
+        tags="Roadmap",
+    )
+    sensitive = _fact(
+        conn,
+        "Morgan sensitive roadmap",
+        created_at="2026-07-11T11:00:00Z",
+        subject="Morgan",
+        tags="Roadmap",
+        sensitivity="sensitive",
+    )
+    conn.commit()
+
+    ordinary_changes = changes(
+        conn,
+        "2026-07-11T00:00:00Z",
+        "2026-07-12T00:00:00Z",
+        "private",
+    )
+    assert [item["fact"]["fact_id"] for item in ordinary_changes["changes"]] == [
+        normal
+    ]
+    assert [
+        event["fact"]["fact_id"]
+        for event in timeline(conn, "Morgan", "private")["events"]
+    ] == [normal]
+    assert entity_dossier(conn, "Morgan", "private")["current_facts"][0][
+        "fact_id"
+    ] == normal
+
+    privileged = entity_dossier(conn, "Morgan", ("private", "sensitive"))
+    assert {fact["fact_id"] for fact in privileged["current_facts"]} == {
+        normal,
+        sensitive,
+    }
+    conn.close()
+
+
 def test_changes_reports_conflict_resolution_for_winner_and_loser(tmp_path):
     conn = _store(tmp_path)
     winner = _fact(
         conn,
-        "Victor uses Enfold",
+        "Morgan uses Enfold",
         created_at="2026-07-10T00:00:00Z",
-        subject="Victor",
+        subject="Morgan",
         predicate="memory_service",
     )
     conflict = open_state_conflict(
         conn,
-        "Victor",
+        "Morgan",
         "memory_service",
         (winner,),
         detected_at="2026-07-11T00:00:00Z",
     )
     loser = _fact(
         conn,
-        "Victor uses another service",
+        "Morgan uses another service",
         created_at="2026-07-11T00:00:00Z",
-        subject="Victor",
+        subject="Morgan",
         predicate="memory_service",
     )
     conn.execute(
@@ -146,8 +192,8 @@ def test_changes_reports_conflict_resolution_for_winner_and_loser(tmp_path):
         conn,
         conflict.conflict_id,
         winner,
-        resolved_by="wonny",
-        reason="Victor confirmed Enfold",
+        resolved_by="morgan",
+        reason="Morgan confirmed Enfold",
         resolved_at="2026-07-12T00:00:00Z",
     )
     conn.commit()
@@ -170,15 +216,15 @@ def test_timeline_is_chronological_and_excludes_unsettled_conflicts(tmp_path):
     conn = _store(tmp_path)
     old = _fact(
         conn,
-        "Victor prefers tea",
+        "Morgan prefers tea",
         created_at="2026-07-10T09:00:00Z",
-        subject="Victor",
+        subject="Morgan",
     )
     new = _fact(
         conn,
-        "Victor prefers coffee",
+        "Morgan prefers coffee",
         created_at="2026-07-11T09:00:00Z",
-        subject="Victor",
+        subject="Morgan",
         predicate="preferred_drink",
     )
     conn.execute(
@@ -187,16 +233,16 @@ def test_timeline_is_chronological_and_excludes_unsettled_conflicts(tmp_path):
     )
     conflict = open_state_conflict(
         conn,
-        "Victor",
+        "Morgan",
         "preferred_drink",
         (new,),
         detected_at="2026-07-12T09:00:00Z",
     )
     disputed = _fact(
         conn,
-        "Victor prefers soda",
+        "Morgan prefers soda",
         created_at="2026-07-12T09:00:00Z",
-        subject="Victor",
+        subject="Morgan",
         predicate="preferred_drink",
     )
     conn.execute(
@@ -209,7 +255,7 @@ def test_timeline_is_chronological_and_excludes_unsettled_conflicts(tmp_path):
     )
     conn.commit()
 
-    result = timeline(conn, "Victor", "private", limit=20)
+    result = timeline(conn, "Morgan", "private", limit=20)
 
     assert [event["changed_at"] for event in result["events"]] == sorted(
         event["changed_at"] for event in result["events"]
@@ -223,13 +269,13 @@ def test_timeline_limit_keeps_most_recent_events_in_chronological_order(tmp_path
     for day in (10, 11, 12):
         _fact(
             conn,
-            f"Victor event {day}",
+            f"Morgan event {day}",
             created_at=f"2026-07-{day}T00:00:00Z",
-            subject="Victor",
+            subject="Morgan",
         )
     conn.commit()
 
-    result = timeline(conn, "Victor", "private", limit=2)
+    result = timeline(conn, "Morgan", "private", limit=2)
 
     assert [event["changed_at"] for event in result["events"]] == [
         "2026-07-11T00:00:00Z",
@@ -243,16 +289,16 @@ def test_entities_rank_subjects_and_tags_from_current_facts(tmp_path):
     conn = _store(tmp_path)
     _fact(
         conn,
-        "Victor owns Enfold",
+        "Morgan owns Enfold",
         created_at="2026-07-10T00:00:00Z",
-        subject="Victor",
+        subject="Morgan",
         tags="Enfold, memory",
     )
     _fact(
         conn,
-        "Victor works on Sol",
+        "Morgan works on Sol",
         created_at="2026-07-11T00:00:00Z",
-        subject="Victor",
+        subject="Morgan",
         tags="Sol, Enfold",
     )
     _fact(
@@ -260,7 +306,7 @@ def test_entities_rank_subjects_and_tags_from_current_facts(tmp_path):
         "Hidden work fact",
         created_at="2026-07-11T00:00:00Z",
         scope="work",
-        subject="Victor",
+        subject="Morgan",
         tags="Enfold",
     )
     conn.commit()
@@ -269,7 +315,7 @@ def test_entities_rank_subjects_and_tags_from_current_facts(tmp_path):
 
     assert [(item["name"], item["fact_count"]) for item in result["entities"]] == [
         ("Enfold", 2),
-        ("Victor", 2),
+        ("Morgan", 2),
     ]
     conn.close()
 
@@ -301,14 +347,14 @@ def test_timeline_and_dossier_scan_only_newest_history(tmp_path, monkeypatch):
     for index in range(5):
         ids.append(_fact(
             conn,
-            f"Victor event {index}",
+            f"Morgan event {index}",
             created_at=f"2026-07-{10 + index}T00:00:00Z",
-            subject="Victor",
+            subject="Morgan",
         ))
     conn.commit()
 
-    timeline_result = timeline(conn, "Victor", "private", limit=10)
-    dossier_result = entity_dossier(conn, "Victor", "private", limit=10)
+    timeline_result = timeline(conn, "Morgan", "private", limit=10)
+    dossier_result = entity_dossier(conn, "Morgan", "private", limit=10)
 
     assert [event["fact"]["fact_id"] for event in timeline_result["events"]] == ids[-3:]
     assert {fact["fact_id"] for fact in dossier_result["current_facts"]} == set(ids[-3:])
@@ -322,24 +368,24 @@ def test_entity_dossier_combines_current_changes_and_open_conflicts(tmp_path):
     conn = _store(tmp_path)
     current = _fact(
         conn,
-        "Victor uses Enfold",
+        "Morgan uses Enfold",
         created_at="2026-07-10T00:00:00Z",
-        subject="Victor",
+        subject="Morgan",
         predicate="memory_service",
         tags="Enfold",
     )
     conflict = open_state_conflict(
         conn,
-        "Victor",
+        "Morgan",
         "memory_service",
         (current,),
         detected_at="2026-07-11T00:00:00Z",
     )
     challenger = _fact(
         conn,
-        "Victor uses another memory service",
+        "Morgan uses another memory service",
         created_at="2026-07-11T00:00:00Z",
-        subject="Victor",
+        subject="Morgan",
         predicate="memory_service",
     )
     conn.execute(
@@ -352,14 +398,40 @@ def test_entity_dossier_combines_current_changes_and_open_conflicts(tmp_path):
     )
     conn.commit()
 
-    result = entity_dossier(conn, "Victor", "private")
+    result = entity_dossier(conn, "Morgan", "private")
 
-    assert result["entity"] == "Victor"
+    assert result["entity"] == "Morgan"
     assert result["current_facts"] == []
     assert [item["conflict_id"] for item in result["open_conflicts"]] == [
         conflict.conflict_id
     ]
     assert result["recent_changes"] == []
+    conn.close()
+
+
+def test_entity_dossier_hides_sensitive_conflicts_without_capability(tmp_path):
+    conn = _store(tmp_path)
+    sensitive = _fact(
+        conn,
+        "Morgan sensitive release codename",
+        created_at="2026-07-10T00:00:00Z",
+        subject="Morgan",
+        predicate="release_codename",
+        sensitivity="sensitive",
+    )
+    conflict = open_state_conflict(
+        conn,
+        "Morgan",
+        "release_codename",
+        (sensitive,),
+        detected_at="2026-07-11T00:00:00Z",
+    )
+    conn.commit()
+
+    assert entity_dossier(conn, "Morgan", "private")["open_conflicts"] == []
+    privileged = entity_dossier(conn, "Morgan", ("private", "sensitive"))
+    assert privileged["open_conflicts"][0]["conflict_id"] == conflict.conflict_id
+    assert privileged["open_conflicts"][0]["members"][0]["fact_id"] == sensitive
     conn.close()
 
 
@@ -391,21 +463,122 @@ def test_entity_dossier_uses_exact_derived_entity_names(tmp_path):
     conn.close()
 
 
+def test_entity_dossier_limits_conflicts_and_loads_members_in_one_query(tmp_path):
+    conn = _store(tmp_path)
+    for index in range(4):
+        fact_id = _fact(
+            conn,
+            f"Alice conflict value {index}",
+            created_at=f"2026-07-0{index + 1}T00:00:00Z",
+            subject="Alice",
+            predicate=f"setting_{index}",
+        )
+        open_state_conflict(
+            conn,
+            "Alice",
+            f"setting_{index}",
+            (fact_id,),
+            detected_at=f"2026-07-0{index + 1}T01:00:00Z",
+        )
+    expected = []
+    for index in range(4):
+        fact_id = _fact(
+            conn,
+            f"Morgan conflict value {index}",
+            created_at=f"2026-07-{10 + index}T00:00:00Z",
+            subject="Morgan",
+            predicate=f"setting_{index}",
+        )
+        conflict = open_state_conflict(
+            conn,
+            "Morgan",
+            f"setting_{index}",
+            (fact_id,),
+            detected_at=f"2026-07-{10 + index}T01:00:00Z",
+        )
+        expected.append(conflict.conflict_id)
+    conn.commit()
+    statements = []
+    conn.set_trace_callback(statements.append)
+
+    result = entity_dossier(conn, "Morgan", "private", limit=2)
+
+    conn.set_trace_callback(None)
+    assert [item["conflict_id"] for item in result["open_conflicts"]] == expected[:2]
+    assert result["truncated"] is True
+    conflict_member_reads = [
+        statement
+        for statement in statements
+        if "fact_conflict_members" in statement and "matching_conflicts" in statement
+    ]
+    assert len(conflict_member_reads) == 1
+    assert "_enfold_matches_entity(c.subject_key, NULL, 'Morgan')" in (
+        conflict_member_reads[0]
+    )
+    assert "LIMIT 3" in conflict_member_reads[0]
+    assert not any(
+        "FROM facts f WHERE f.fact_id IN" in statement for statement in statements
+    )
+    conn.close()
+
+
+def test_entity_dossier_caps_members_per_conflict_and_marks_truncation(tmp_path):
+    conn = _store(tmp_path)
+    first = _fact(
+        conn,
+        "Morgan conflict value 0",
+        created_at="2026-07-10T00:00:00Z",
+        subject="Morgan",
+        predicate="setting",
+    )
+    conflict = open_state_conflict(
+        conn,
+        "Morgan",
+        "setting",
+        (first,),
+        detected_at="2026-07-10T01:00:00Z",
+    )
+    for index in range(1, 5):
+        fact_id = _fact(
+            conn,
+            f"Morgan conflict value {index}",
+            created_at=f"2026-07-{10 + index}T00:00:00Z",
+            subject="Morgan",
+            predicate="setting",
+        )
+        conn.execute(
+            "UPDATE facts SET conflict_group = ? WHERE fact_id = ?",
+            (conflict.conflict_id, fact_id),
+        )
+        conn.execute(
+            "INSERT INTO fact_conflict_members(conflict_id, fact_id) VALUES (?, ?)",
+            (conflict.conflict_id, fact_id),
+        )
+    conn.commit()
+
+    result = entity_dossier(conn, "Morgan", "private", limit=2)
+
+    assert len(result["open_conflicts"][0]["members"]) == 2
+    assert result["open_conflicts"][0]["members_truncated"] is True
+    assert result["truncated"] is True
+    conn.close()
+
+
 def test_service_dispatches_projection_reads_with_authorized_scopes(tmp_path):
     conn = _store(tmp_path)
     _fact(
         conn,
-        "Victor uses Enfold",
+        "Morgan uses Enfold",
         created_at="2026-07-11T00:00:00Z",
-        subject="Victor",
+        subject="Morgan",
         tags="Enfold",
     )
     _fact(
         conn,
-        "Work-only Victor note",
+        "Work-only Morgan note",
         created_at="2026-07-11T00:00:00Z",
         scope="work",
-        subject="Victor",
+        subject="Morgan",
     )
     conn.commit()
     service = EnfoldService(conn, MemoryPolicy({"client-b": ("private",)}))
@@ -427,9 +600,9 @@ def test_service_dispatches_projection_reads_with_authorized_scopes(tmp_path):
         context, Request("entities", "memory.entities", {"min_facts": 1})
     )["entities"][0]["name"] == "Enfold"
     assert service.handle(
-        context, Request("timeline", "memory.timeline", {"subject_or_query": "Victor"})
+        context, Request("timeline", "memory.timeline", {"subject_or_query": "Morgan"})
     )["events"][0]["fact"]["scope"] == "private"
     assert service.handle(
-        context, Request("entity", "memory.entity", {"name": "Victor"})
+        context, Request("entity", "memory.entity", {"name": "Morgan"})
     )["current_facts"][0]["scope"] == "private"
     conn.close()

@@ -1,4 +1,6 @@
-from enfold.llm_extract import _parse_response
+import pytest
+
+from enfold.llm_extract import ExtractionParseError, _parse_response
 
 
 def test_parse_valid_array():
@@ -14,11 +16,11 @@ def test_parse_strips_markdown_fences():
     assert len(_parse_response(raw)) == 1
 
 
-def test_parse_empty_and_garbage_are_safe():
+def test_parse_distinguishes_valid_empty_from_malformed_output():
     assert _parse_response("[]") == []
-    assert _parse_response("not json at all") == []
-    assert _parse_response('{"not": "a list"}') == []
-    assert _parse_response("") == []
+    for raw in ("not json at all", '{"not": "a list"}', "", '[{"content":'):
+        with pytest.raises(ExtractionParseError):
+            _parse_response(raw)
 
 
 def test_parse_validates_category_and_min_length():

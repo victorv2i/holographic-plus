@@ -52,6 +52,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import logging
+import re
 import sqlite3
 import sys
 import time
@@ -105,7 +106,7 @@ except ImportError as exc:  # pragma: no cover - exercised only without the dep
     ) from exc
 
 
-VALID_SOURCES = ("claude-code", "codex", "other")
+SOURCE_ID_RE = re.compile(r"^[a-z][a-z0-9._-]{0,63}$")
 MAX_CONTENT_CHARS = 16_000
 MAX_QUERY_CHARS = 16_000
 MAX_TAGS_CHARS = 2_000
@@ -143,11 +144,11 @@ def _require_source(args: Dict[str, Any]) -> Optional[str]:
     """Validate the required `source` tag; returns an error string or None."""
     source = args.get("source")
     if not source:
-        return "missing required argument: source (one of claude-code, codex, other)"
+        return "missing required argument: source"
     if not isinstance(source, str):
         return "invalid source: must be a string"
-    if source not in VALID_SOURCES:
-        return f"invalid source {source!r}; must be one of {VALID_SOURCES}"
+    if SOURCE_ID_RE.fullmatch(source) is None:
+        return "invalid source: must be a lowercase source identifier"
     return None
 
 
@@ -205,6 +206,60 @@ def _tag_source(tags: str, source: str) -> str:
     return ",".join(existing)
 
 
+class _DeferredTransactionConnection:
+    """Delegate SQLite work while leaving transaction ownership to the caller."""
+
+    def __init__(self, conn: sqlite3.Connection):
+        self._conn = conn
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._conn, name)
+
+    def commit(self) -> None:
+        pass
+
+    def rollback(self) -> None:
+        pass
+
+
+class _SupersedeFailed(Exception):
+    pass
+
+
+class _InvalidReplacementFact(Exception):
+    pass
+
+
+def _atomic_store_write(provider, fn: Callable[[], _T]) -> _T:
+    """Run legacy store operations inside one caller-owned transaction."""
+    store = getattr(provider, "_store", None)
+    conn = getattr(store, "_conn", None)
+    if conn is None:
+        raise RuntimeError("provider store has no writable connection")
+    lock = getattr(store, "_lock", None)
+
+    def _write() -> _T:
+        if conn.in_transaction:
+            raise RuntimeError("provider store connection already has a transaction")
+        conn.execute("BEGIN IMMEDIATE")
+        store._conn = _DeferredTransactionConnection(conn)
+        try:
+            result = fn()
+            conn.commit()
+            return result
+        except BaseException:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        finally:
+            store._conn = conn
+
+    if lock is not None:
+        with lock:
+            return _write()
+    return _write()
+
+
 def _active_fact_exists(provider, fact_id: int) -> bool:
     store = getattr(provider, "_store", None)
     conn = getattr(store, "_conn", None)
@@ -217,37 +272,52 @@ def _active_fact_exists(provider, fact_id: int) -> bool:
     return row is not None
 
 
-def _supersede_with_rowcount(provider, old_fact_id: int, new_fact_id: int) -> bool:
+def _replacement_fact_is_distinct_and_active(
+    provider, old_fact_id: int, new_fact_id: int
+) -> bool:
+    if old_fact_id == new_fact_id:
+        return False
     store = getattr(provider, "_store", None)
     conn = getattr(store, "_conn", None)
     if conn is None:
         return False
-    lock = getattr(store, "_lock", None)
+    row = conn.execute(
+        "SELECT invalid_at, superseded_by FROM facts WHERE fact_id = ?",
+        (new_fact_id,),
+    ).fetchone()
+    return (
+        row is not None
+        and row["invalid_at"] is None
+        and row["superseded_by"] is None
+    )
 
-    def _update() -> bool:
-        cur = conn.execute(
-            """
-            UPDATE facts
-               SET invalid_at = CURRENT_TIMESTAMP,
-                   superseded_by = ?
-             WHERE fact_id = ? AND invalid_at IS NULL
-            """,
-            (new_fact_id, old_fact_id),
-        )
-        conn.commit()
-        if int(cur.rowcount) != 1:
-            return False
-        try:
-            reflection = importlib.import_module("enfold.reflection")
-            reflection.invalidate_insights_citing(conn, old_fact_id)
-        except Exception as exc:
-            logger.debug("enfold MCP: insight invalidation failed: %s", exc)
-        return True
 
-    if lock is not None:
-        with lock:
-            return _update()
-    return _update()
+def _supersede_with_rowcount(provider, old_fact_id: int, new_fact_id: int) -> bool:
+    if not _replacement_fact_is_distinct_and_active(
+        provider, old_fact_id, new_fact_id
+    ):
+        raise _InvalidReplacementFact
+    store = getattr(provider, "_store", None)
+    conn = getattr(store, "_conn", None)
+    if conn is None:
+        return False
+    cur = conn.execute(
+        """
+        UPDATE facts
+           SET invalid_at = CURRENT_TIMESTAMP,
+               superseded_by = ?
+         WHERE fact_id = ? AND invalid_at IS NULL
+        """,
+        (new_fact_id, old_fact_id),
+    )
+    if int(cur.rowcount) != 1:
+        return False
+    try:
+        reflection = importlib.import_module("enfold.reflection")
+        reflection.invalidate_insights_citing(conn, old_fact_id)
+    except Exception as exc:
+        logger.debug("enfold MCP: insight invalidation failed: %s", exc)
+    return True
 
 
 def build_server(provider, read_only: bool = False) -> "FastMCP":
@@ -312,7 +382,7 @@ def build_server(provider, read_only: bool = False) -> "FastMCP":
         changed number/id/state word) supersedes the prior fact rather than
         leaving both live.
 
-        source must be one of: claude-code, codex, other.
+        source must be a lowercase source identifier.
         """
         args = {"content": content, "category": category, "source": source}
         error = _require_source(args)
@@ -337,11 +407,52 @@ def build_server(provider, read_only: bool = False) -> "FastMCP":
                 }
 
             update_target = provider._find_update_target(content, category=category)
-            fact_id = provider._store.add_fact(content, category=category, tags=tagged)
-            provider._embed_cb(fact_id, content)
+            old_fact_id = (
+                int(update_target["fact_id"]) if update_target is not None else None
+            )
 
-            if update_target is not None:
-                provider._supersede_fact(int(update_target["fact_id"]), int(fact_id))
+            def _insert() -> tuple[int, bool]:
+                row = provider._store._conn.execute(
+                    "SELECT COALESCE(MAX(fact_id), 0) AS max_fact_id FROM facts"
+                ).fetchone()
+                previous_max_fact_id = int(row["max_fact_id"])
+                fact_id = provider._store.add_fact(
+                    content, category=category, tags=tagged
+                )
+                if old_fact_id is not None:
+                    if not _replacement_fact_is_distinct_and_active(
+                        provider, old_fact_id, int(fact_id)
+                    ):
+                        raise _InvalidReplacementFact
+                    if not provider._supersede_fact(old_fact_id, int(fact_id)):
+                        raise _SupersedeFailed
+                return int(fact_id), int(fact_id) > previous_max_fact_id
+
+            try:
+                fact_id, inserted = _atomic_store_write(provider, _insert)
+            except _InvalidReplacementFact:
+                return {
+                    "status": "failed",
+                    "superseded": old_fact_id,
+                    "error": (
+                        "supersede failed: replacement fact is not distinct and active"
+                    ),
+                }
+            except _SupersedeFailed:
+                return {
+                    "status": "failed",
+                    "superseded": old_fact_id,
+                    "error": "supersede failed: existing fact was not updated",
+                }
+            if not inserted:
+                if old_fact_id is not None:
+                    return {
+                        "fact_id": fact_id,
+                        "status": "superseded_with_existing",
+                        "superseded": old_fact_id,
+                    }
+                return {"fact_id": fact_id, "status": "deduplicated"}
+            provider._embed_cb(fact_id, content)
 
             return {"fact_id": fact_id, "status": "added"}
 
@@ -359,9 +470,9 @@ def build_server(provider, read_only: bool = False) -> "FastMCP":
         """Explicitly supersede old_fact_id with a new fact (invalidate-not-delete).
 
         Unlike memory_add's implicit value-update detection, this always
-        inserts new_content as a new fact and marks old_fact_id invalid,
-        regardless of how similar the wording is. source must be one of:
-        claude-code, codex, other.
+        marks old_fact_id invalid, regardless of how similar the wording is.
+        An exact existing fact is reused instead of inserted again. The source
+        must be one of the server's supported source identifiers.
         """
         args = {"content": new_content, "source": source}
         error = _require_source(args)
@@ -382,17 +493,42 @@ def build_server(provider, read_only: bool = False) -> "FastMCP":
         def _do_supersede() -> Dict[str, Any]:
             if not _active_fact_exists(provider, safe_old_fact_id):
                 return {"error": "invalid old_fact_id: active fact not found"}
-            new_fact_id = provider._store.add_fact(new_content, category=category, tags=tagged)
-            provider._embed_cb(new_fact_id, new_content)
-            if not _supersede_with_rowcount(provider, safe_old_fact_id, int(new_fact_id)):
+
+            def _insert() -> tuple[int, bool]:
+                row = provider._store._conn.execute(
+                    "SELECT COALESCE(MAX(fact_id), 0) AS max_fact_id FROM facts"
+                ).fetchone()
+                previous_max_fact_id = int(row["max_fact_id"])
+                new_fact_id = provider._store.add_fact(
+                    new_content, category=category, tags=tagged
+                )
+                if not _supersede_with_rowcount(
+                    provider, safe_old_fact_id, int(new_fact_id)
+                ):
+                    raise _SupersedeFailed
+                return int(new_fact_id), int(new_fact_id) > previous_max_fact_id
+
+            try:
+                new_fact_id, inserted = _atomic_store_write(provider, _insert)
+            except _InvalidReplacementFact:
                 return {
-                    "fact_id": new_fact_id,
+                    "status": "failed",
+                    "error": (
+                        "supersede failed: replacement fact is not distinct and active"
+                    ),
+                }
+            except _SupersedeFailed:
+                return {
                     "status": "failed",
                     "error": "supersede failed: old fact was not updated",
                 }
+            if inserted:
+                provider._embed_cb(new_fact_id, new_content)
             return {
                 "fact_id": new_fact_id,
-                "status": "superseded",
+                "status": (
+                    "superseded" if inserted else "superseded_with_existing"
+                ),
                 "superseded": safe_old_fact_id,
             }
 

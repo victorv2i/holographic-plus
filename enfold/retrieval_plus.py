@@ -21,8 +21,9 @@ pay the blob read, and the candidate dicts never carry blobs around.
 
 from __future__ import annotations
 
+import logging
 import re
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence
 
 from plugins.memory.holographic import holographic as hrr
 from plugins.memory.holographic.retrieval import FactRetriever
@@ -45,6 +46,7 @@ _FTS_STOPWORDS = frozenset(
     about can could would should may might must shall into over under out up
     """.split()
 )
+logger = logging.getLogger(__name__)
 
 
 class PlusFactRetriever(FactRetriever):
@@ -57,6 +59,8 @@ class PlusFactRetriever(FactRetriever):
         entity_boost_weight: float = 0.0,
         entity_expansion: bool = False,
         entity_hub_degree_limit: int = 25,
+        allowed_scopes: Optional[Sequence[str]] = ("private",),
+        lifecycle_filter: bool = True,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -71,6 +75,61 @@ class PlusFactRetriever(FactRetriever):
         # user's own name) and is excluded from expansion so it doesn't flood
         # results with unrelated facts.
         self.entity_hub_degree_limit = entity_hub_degree_limit
+        self.allowed_scopes = (
+            None if allowed_scopes is None
+            else tuple(dict.fromkeys(str(scope) for scope in allowed_scopes))
+        )
+        # When false (the provider's temporal_filter opt-out), temporal
+        # lifecycle predicates are skipped. Unresolved conflicts and scope
+        # predicates always apply to ordinary retrieval.
+        self.lifecycle_filter = lifecycle_filter
+
+    def _eligibility_predicates(
+        self,
+        alias: str = "f",
+        include_lifecycle: bool = True,
+        include_conflicts: bool = False,
+    ) -> tuple[List[str], list]:
+        """Return lifecycle and scope predicates supported by this store."""
+        conn = self.store._conn
+        columns = {
+            str(row[1])
+            for row in conn.execute("PRAGMA table_info(facts)").fetchall()
+        }
+        clauses = []
+        if "conflict_group" in columns and not include_conflicts:
+            clauses.append(f"{alias}.conflict_group IS NULL")
+        if include_lifecycle and self.lifecycle_filter:
+            clauses.extend(
+                f"{alias}.{name} IS NULL"
+                for name in ("invalid_at", "superseded_by")
+                if name in columns
+            )
+        params: list = []
+        if "scope" in columns:
+            if self.allowed_scopes is not None:
+                if self.allowed_scopes:
+                    placeholders = ",".join("?" for _ in self.allowed_scopes)
+                    clauses.append(f"{alias}.scope IN ({placeholders})")
+                    params.extend(self.allowed_scopes)
+                else:
+                    clauses.append("0")
+        elif self.allowed_scopes is not None and "private" not in self.allowed_scopes:
+            # An unscoped legacy table is private-only.
+            clauses.append("0")
+        if "sensitivity" in columns and self.allowed_scopes is not None:
+            sensitivities = tuple(
+                value
+                for value in ("sensitive", "secret")
+                if value in self.allowed_scopes
+            )
+            predicates = [f"COALESCE({alias}.sensitivity, 'normal') = 'normal'"]
+            if sensitivities:
+                placeholders = ",".join("?" for _ in sensitivities)
+                predicates.append(f"{alias}.sensitivity IN ({placeholders})")
+                params.extend(sensitivities)
+            clauses.append(f"({' OR '.join(predicates)})")
+        return clauses, params
 
     def search(
         self,
@@ -93,7 +152,25 @@ class PlusFactRetriever(FactRetriever):
         pass as the score itself so a diagnostic view can never drift from
         real ranking.
         """
-        candidates = self._fts_candidates(query, category, min_trust, limit * 3)
+        candidate_limit = limit * 3
+        candidates = self._fts_candidates(
+            query, category, min_trust, candidate_limit
+        )
+        if explain:
+            diagnostic_candidates = self._fts_candidates(
+                query,
+                category,
+                min_trust,
+                candidate_limit,
+                include_lifecycle=False,
+                include_conflicts=True,
+            )
+            seen_ids = {fact["fact_id"] for fact in candidates}
+            candidates.extend(
+                fact
+                for fact in diagnostic_candidates
+                if fact["fact_id"] not in seen_ids
+            )
         if not candidates:
             return []
 
@@ -153,6 +230,8 @@ class PlusFactRetriever(FactRetriever):
 
             fact["score"] = score
             if explain:
+                if fact.get("conflict_group") is not None:
+                    fact["_exclusion_reason"] = "conflict"
                 fact["_breakdown"] = {
                     "fts_score": fts_score,
                     "jaccard_score": jaccard,
@@ -165,7 +244,7 @@ class PlusFactRetriever(FactRetriever):
             scored.append(fact)
 
         scored.sort(key=lambda x: x["score"], reverse=True)
-        direct = scored[:limit]
+        direct = scored if explain else scored[:limit]
 
         if not self.entity_expansion or not direct:
             # Candidates never carried hrr_vector, so no blob stripping needed.
@@ -276,7 +355,11 @@ class PlusFactRetriever(FactRetriever):
         conn = self.store._conn
         placeholders = ",".join("?" * len(expandable))
         params: list = list(expandable)
-        where_clauses = [f"LOWER(e.name) IN ({placeholders})", "f.trust_score >= ?"]
+        where_clauses = [f"LOWER(e.name) IN ({placeholders})"]
+        eligibility, eligibility_params = self._eligibility_predicates()
+        where_clauses.extend(eligibility)
+        params.extend(eligibility_params)
+        where_clauses.append("f.trust_score >= ?")
         params.append(min_trust)
         if category:
             where_clauses.append("f.category = ?")
@@ -334,7 +417,27 @@ class PlusFactRetriever(FactRetriever):
             ).fetchall()
         except Exception:
             return {}
-        return {int(r["fact_id"]): r["hrr_vector"] for r in rows}
+        vectors: Dict[int, bytes] = {}
+        for row in rows:
+            fact_id = int(row["fact_id"])
+            blob = row["hrr_vector"]
+            try:
+                if not isinstance(blob, (bytes, bytearray, memoryview)):
+                    raise ValueError("HRR value is not a blob")
+                phases = hrr.bytes_to_phases(blob)
+                if len(phases) != self.hrr_dim:
+                    raise ValueError(
+                        f"expected {self.hrr_dim} dimensions, got {len(phases)}"
+                    )
+            except Exception as exc:
+                logger.debug(
+                    "enfold: skipping malformed HRR vector for fact %s: %s",
+                    fact_id,
+                    exc,
+                )
+                continue
+            vectors[fact_id] = bytes(blob)
+        return vectors
 
     @staticmethod
     def _fts_match_query(query: str) -> str:
@@ -372,6 +475,8 @@ class PlusFactRetriever(FactRetriever):
         category: Optional[str],
         min_trust: float,
         limit: int,
+        include_lifecycle: bool = True,
+        include_conflicts: bool = False,
     ) -> List[dict]:
         """Parent's FTS5 candidate fetch with explicit columns.
 
@@ -390,6 +495,13 @@ class PlusFactRetriever(FactRetriever):
         params: list = [match_query]
         where_clauses = ["facts_fts MATCH ?"]
 
+        eligibility, eligibility_params = self._eligibility_predicates(
+            include_lifecycle=include_lifecycle,
+            include_conflicts=include_conflicts,
+        )
+        where_clauses.extend(eligibility)
+        params.extend(eligibility_params)
+
         if category:
             where_clauses.append("f.category = ?")
             params.append(category)
@@ -399,9 +511,18 @@ class PlusFactRetriever(FactRetriever):
 
         where_sql = " AND ".join(where_clauses)
 
+        columns = {
+            str(row[1])
+            for row in conn.execute("PRAGMA table_info(facts)").fetchall()
+        }
+        conflict_select = (
+            "f.conflict_group" if "conflict_group" in columns
+            else "NULL AS conflict_group"
+        )
         sql = f"""
             SELECT f.fact_id, f.content, f.category, f.tags, f.trust_score,
                    f.retrieval_count, f.helpful_count, f.created_at, f.updated_at,
+                   {conflict_select},
                    facts_fts.rank AS fts_rank_raw
             FROM facts_fts
             JOIN facts f ON f.fact_id = facts_fts.rowid

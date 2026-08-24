@@ -32,10 +32,23 @@ python -m enfold.ops rebuild-vector-index /absolute/path/to/memory.db \
 
 ## Run
 
-Create a user-owned JSON configuration with explicit database, socket,
-retrieval, and client grants. `ci` retrieval is deterministic plumbing only,
-not a semantic embedding model. See [server deployment](docs/SERVER_DEPLOYMENT.md)
-for the full configuration contract.
+For a fresh local development instance, initialize a secure default without
+needing source-tree paths:
+
+```bash
+enfold init --client-id workstation-1
+```
+
+It creates owner-only XDG configuration and data directories, a schema-current
+SQLite store, and a minimal local configuration. The default deterministic
+`ci` retrieval is non-production and automatic extraction remains disabled.
+See [first local instance](docs/BOOTSTRAP.md) for the exact paths, safety
+guarantees, and release-wheel verification.
+
+For an existing or production deployment, create a user-owned JSON configuration
+with explicit database, socket, retrieval, and client grants. See
+[server deployment](docs/SERVER_DEPLOYMENT.md) for the full configuration
+contract.
 
 ```bash
 enfold-server --config /absolute/path/to/server.json check
@@ -62,17 +75,26 @@ score = 0.90 × (0.35 × FTS + 0.25 × Jaccard + 0.40 × cosine)
 ```
 
 The kind prior is state `1.00`, insight `0.75`, untyped `0.50`, and event
-`0.25`. Recency uses an exponential 365-day half-life. These values and the
-confidence gates are `RankingConfig` defaults in `enfold/hybrid_retrieval.py`:
-`score_floor: 0.12` rejects weak candidates and `ambiguity_margin: 0.005`
-abstains when the top two results are too close. A named anchor in the query
-also requires that anchor in a candidate.
+`0.25`. FTS blends reciprocal BM25 rank (`0.25`) with distinct query-token
+coverage (`0.75`), preventing repeated terms in a short fact from outranking a
+longer fact that covers the complete question. Recency uses an exponential
+365-day half-life. These values and the confidence gates are `RankingConfig`
+defaults in `enfold/hybrid_retrieval.py`: `score_floor: 0.12` rejects weak
+candidates and `ambiguity_margin: 0.005` abstains when the top two results are
+too close. A named anchor in the query also requires that anchor in a candidate;
+standard month abbreviations and open/closed compound spellings are normalized
+without dropping the anchor requirement.
 
 `memory_context` produces a bounded, cited Markdown block. It estimates tokens
 as Unicode characters divided by four, truncates individual facts to fit, omits
 unsafe or duplicate state slots, and can use maximal marginal relevance (MMR)
 to choose diverse context. MMR uses dense similarity when present and token
-overlap otherwise.
+overlap otherwise. Prompt-ready rendering treats memory as reference claims,
+not control instructions. Only facts explicitly marked `human_confirmed` or
+`human_corrected` cross this boundary. Unreviewed, instruction-shaped, or
+role-marker content is omitted from Markdown and returned only as a redacted
+fact receipt; use `memory_search` when an operator intentionally needs to
+inspect arbitrary stored text.
 
 ## Writes and typed state
 
@@ -83,8 +105,10 @@ surviving fact while superseding the other. This is not a claim that every
 similar sentence is rejected.
 
 Extraction accepts typed proposals with `state`, `preference`, `commitment`, or
-`event` labels when confidence is at least `0.8`. Only `state` is routed into a
-structured `(scope, subject_key, predicate_key)` state slot. A changed state can
+`event` labels when confidence is at least `0.8`. Every accepted type retains
+its kind, subject/predicate/object fields, confidence, and validity time as
+first-class queryable data. Only `state` is routed into a structured
+`(scope, subject_key, predicate_key)` state slot. A changed state can
 supersede the prior slot value; competing current state is recorded as a
 conflict. The other labels remain attributed facts with their extracted type in
 metadata.

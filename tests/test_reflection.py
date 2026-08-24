@@ -259,6 +259,71 @@ def test_select_clusters_excludes_insight_facts_as_sources(tmp_path):
     assert not any(insight in cl for cl in clusters)
 
 
+def test_select_clusters_excludes_conflicted_and_superseded_sources(tmp_path):
+    conn = _conn(tmp_path)
+    conn.execute("ALTER TABLE facts ADD COLUMN conflict_group TEXT")
+    active_a = _add_fact(conn, "Alex Rivera moved to Springfield in March.")
+    active_b = _add_fact(conn, "Alex Rivera started a new job at Skylark.")
+    conflicted = _add_fact(conn, "Alex Rivera did not move to Springfield.")
+    superseded = _add_fact(conn, "Alex Rivera planned to stay at the old job.")
+    for fact_id in (active_a, active_b, conflicted, superseded):
+        _link_entity(conn, fact_id, "Alex Rivera")
+    conn.execute(
+        "UPDATE facts SET conflict_group = 'open-conflict' WHERE fact_id = ?",
+        (conflicted,),
+    )
+    conn.execute(
+        "UPDATE facts SET superseded_by = ? WHERE fact_id = ?",
+        (active_b, superseded),
+    )
+    conn.commit()
+
+    clusters = select_clusters(conn, max_clusters=3)
+
+    assert [set(cluster) for cluster in clusters] == [{active_a, active_b}]
+
+
+def test_cosine_clustering_never_multiplies_population_by_its_transpose(tmp_path):
+    class GuardedMatrix(np.ndarray):
+        def __matmul__(self, other):
+            assert not (self.ndim == 2 and getattr(other, "ndim", 0) == 2)
+            return super().__matmul__(other)
+
+    conn = _conn(tmp_path)
+    fact_ids = [
+        _add_fact(conn, f"Cosine candidate {index}.") for index in range(4)
+    ]
+    for fact_id in fact_ids:
+        _embed(conn, fact_id, [1.0, 0.0, 0.0])
+    matrix = np.asarray(
+        [
+            [1.0, 0.0, 0.0],
+            [0.8, 0.6, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.8, 0.6],
+        ],
+        dtype=np.float32,
+    ).view(GuardedMatrix)
+    embed_store = types.SimpleNamespace(
+        _conn=conn,
+        _embedding_matrix=lambda *args, **kwargs: (
+            np.asarray(fact_ids, dtype=np.int64),
+            matrix,
+        ),
+    )
+
+    clusters = select_clusters(
+        conn,
+        max_clusters=1,
+        embed_store=embed_store,
+        embedding_identity="fake:test:document:none:v1",
+        cosine_low=0.7,
+        cosine_high=0.9,
+    )
+
+    assert clusters == [[fact_ids[0], fact_ids[1]]]
+
+
 # ---------------------------------------------------------------------------
 # Grounding gate: citations required, no invented facts
 # ---------------------------------------------------------------------------
@@ -286,6 +351,15 @@ def test_parse_reflection_rejects_missing_citations():
         "source_fact_ids": [],
     })
     assert _parse_reflection_response(raw, valid_ids={1, 2}) is None
+
+
+def test_parse_reflection_rejects_fewer_than_two_distinct_citations():
+    for source_ids in ([1], [1, 1]):
+        raw = json.dumps({
+            "insight": "Alex Rivera relocated for the Skylark role.",
+            "source_fact_ids": source_ids,
+        })
+        assert _parse_reflection_response(raw, valid_ids={1, 2}) is None
 
 
 def test_parse_reflection_rejects_citations_outside_the_cluster():
@@ -522,6 +596,49 @@ def test_run_reflection_revalidates_cited_sources_before_insert(tmp_path, monkey
     assert count == 0
     assert inserted == []
     assert "skipped insight with stale source facts" in caplog.text
+
+
+def test_run_reflection_revalidates_sources_after_dedup(tmp_path, monkeypatch):
+    import enfold.reflection as reflection
+
+    conn = _conn(tmp_path)
+    a = _add_fact(conn, "Alex Rivera moved to Springfield in March.")
+    b = _add_fact(conn, "Alex Rivera started a new job at Skylark.")
+    _link_entity(conn, a, "Alex Rivera")
+    _link_entity(conn, b, "Alex Rivera")
+    inserted = []
+
+    monkeypatch.setattr(
+        reflection,
+        "reflect_on_cluster",
+        lambda facts, **kwargs: {
+            "insight": "Alex Rivera relocation timing is tied to the Skylark role.",
+            "source_fact_ids": [a, b],
+        },
+    )
+
+    def dedup_and_stale_source(content, category):
+        conn.execute(
+            "UPDATE facts SET superseded_by = ? WHERE fact_id = ?",
+            (b, a),
+        )
+        conn.commit()
+        return None
+
+    count = run_reflection(
+        conn,
+        now=time.time(),
+        enabled=True,
+        interval_hours=24,
+        max_clusters=3,
+        provider="testprov",
+        model="testmodel",
+        dedup_check=dedup_and_stale_source,
+        insert_fact=lambda content, category, tags: inserted.append(content) or 999,
+    )
+
+    assert count == 0
+    assert inserted == []
 
 
 # ---------------------------------------------------------------------------

@@ -196,6 +196,7 @@ def parse_config(
     cwd: Path | None = None,
     environ: Mapping[str, str] | None = None,
 ) -> ClientConfig:
+    env = os.environ if environ is None else environ
     parser = _parser()
     args = parser.parse_args(argv)
     scopes = tuple(args.access_scopes)
@@ -220,6 +221,7 @@ def parse_config(
             capabilities=MEMORY_CAPABILITIES,
             connect_timeout=args.connect_timeout,
             request_timeout=args.request_timeout,
+            credential=env.get("ENFOLD_CLIENT_CREDENTIAL"),
         )
     except (TypeError, ValueError) as exc:
         parser.error(str(exc))

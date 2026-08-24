@@ -76,10 +76,16 @@ def test_privacy_erasure_scrubs_known_materialized_content_copies():
         "UPDATE embedding_jobs SET status = 'processing', lease_token = 'secret-lease', "
         "lease_owner = 'worker', lease_expires_at = '2099-01-01T00:00:00Z'"
     )
+    proposal = json.dumps({"content": secret_text})
     conn.execute(
-        "INSERT INTO extract_queue(id, payload, status, payload_hash, last_error) "
-        "VALUES (1, ?, 'pending', 'old', NULL)",
-        (f'transcript says: {secret_text}',),
+        "INSERT INTO extract_queue(id, payload, status, payload_hash, last_error, "
+        "proposal_json, proposal_hash) "
+        "VALUES (1, ?, 'pending', 'old', NULL, ?, ?)",
+        (
+            f'transcript says: {secret_text}',
+            proposal,
+            hashlib.sha256(proposal.encode()).hexdigest(),
+        ),
     )
     insight_id = conn.execute(
         "INSERT INTO facts(content, category, tags) VALUES (?, 'insight', ?)",
@@ -91,7 +97,7 @@ def test_privacy_erasure_scrubs_known_materialized_content_copies():
     report = erase_fact(
         conn,
         fact_id,
-        requested_by="victor",
+        requested_by="avery",
         reason="privacy request",
     )
 
@@ -127,6 +133,11 @@ def test_privacy_erasure_scrubs_known_materialized_content_copies():
     assert "privacy_erased" in conn.execute(
         "SELECT payload FROM extract_queue"
     ).fetchone()[0]
+    assert tuple(
+        conn.execute(
+            "SELECT proposal_json, proposal_hash FROM extract_queue"
+        ).fetchone()
+    ) == (None, None)
     assert conn.execute(
         "SELECT invalid_at FROM facts WHERE fact_id = ?", (insight_id,)
     ).fetchone()[0] is not None
@@ -159,7 +170,7 @@ def test_erasing_one_conflict_member_releases_the_remaining_truth():
     assert second["outcome"] == "conflict"
 
     report = erase_fact(
-        conn, second["fact_id"], requested_by="victor", reason="remove bad source"
+        conn, second["fact_id"], requested_by="avery", reason="remove bad source"
     )
 
     assert report.resolved_conflicts == 1
@@ -174,11 +185,11 @@ def test_erasing_one_conflict_member_releases_the_remaining_truth():
 def test_erasure_requires_idle_schema_v1_and_preserves_missing_fact_behavior():
     conn = sqlite3.connect(":memory:")
     with pytest.raises(ErasureError, match="schema v1"):
-        erase_fact(conn, 1, requested_by="victor", reason="privacy")
+        erase_fact(conn, 1, requested_by="avery", reason="privacy")
 
     conn, _service, _context = _store()
     with pytest.raises(ErasureError, match="not found"):
-        erase_fact(conn, 999, requested_by="victor", reason="privacy")
+        erase_fact(conn, 999, requested_by="avery", reason="privacy")
 
 
 def test_erasure_follows_extraction_link_when_queue_text_is_a_paraphrase():
@@ -187,9 +198,9 @@ def test_erasure_follows_extraction_link_when_queue_text_is_a_paraphrase():
         service,
         context,
         "erase-linked",
-        "Victor's exact private preference",
+        "Avery's exact private preference",
         state={
-            "subject_key": "person:victor-private",
+            "subject_key": "person:avery-private",
             "predicate_key": "private_preference",
             "object_value": "exact private preference",
         },
@@ -210,11 +221,11 @@ def test_erasure_follows_extraction_link_when_queue_text_is_a_paraphrase():
     )
     conn.execute(
         "UPDATE memory_write_log SET detail_json = ? WHERE fact_id = ?",
-        ('{"subject_key":"person:victor-private"}', fact_id),
+        ('{"subject_key":"person:avery-private"}', fact_id),
     )
     conn.commit()
 
-    report = erase_fact(conn, fact_id, requested_by="victor", reason="privacy")
+    report = erase_fact(conn, fact_id, requested_by="avery", reason="privacy")
 
     assert report.affected_queue_rows == 1
     assert "privacy_erased" in conn.execute(
@@ -227,3 +238,36 @@ def test_erasure_follows_extraction_link_when_queue_text_is_a_paraphrase():
     assert conn.execute(
         "SELECT detail_json FROM memory_write_log WHERE fact_id = ?", (fact_id,)
     ).fetchone()[0] == '{"privacy_erased":true}'
+
+
+def test_erasure_finds_unlinked_fact_content_in_queue_proposal():
+    conn, service, context = _store()
+    secret_text = "Avery keeps the recovery phrase in the blue envelope"
+    written = _write(service, context, "erase-proposal", secret_text)
+    proposal = json.dumps({"content": secret_text})
+    payload = '{"transcript":"The document is stored safely."}'
+    conn.execute(
+        "INSERT INTO extract_queue(id, payload, payload_hash, proposal_json, "
+        "proposal_hash) VALUES (78, ?, ?, ?, ?)",
+        (
+            payload,
+            hashlib.sha256(payload.encode()).hexdigest(),
+            proposal,
+            hashlib.sha256(proposal.encode()).hexdigest(),
+        ),
+    )
+    conn.commit()
+
+    report = erase_fact(
+        conn, written["fact_id"], requested_by="avery", reason="privacy"
+    )
+
+    assert report.affected_queue_rows == 1
+    assert "privacy_erased" in conn.execute(
+        "SELECT payload FROM extract_queue WHERE id = 78"
+    ).fetchone()[0]
+    assert tuple(
+        conn.execute(
+            "SELECT proposal_json, proposal_hash FROM extract_queue WHERE id = 78"
+        ).fetchone()
+    ) == (None, None)

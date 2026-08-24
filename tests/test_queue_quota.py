@@ -19,8 +19,8 @@ FACTS_JSON = json.dumps([
      "category": "tool", "tags": "pnpm,node"},
     {"content": "Alex deploys web apps to vercel.",
      "category": "tool", "tags": "deploy,vercel"},
-    {"content": "CourseKit is an active project.",
-     "category": "project", "tags": "coursekit"},
+    {"content": "Project Atlas is active.",
+     "category": "project", "tags": "atlas"},
 ])
 
 # Shape of the live failure that dead-lettered two rows: plan-limit 429 with

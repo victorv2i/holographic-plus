@@ -56,6 +56,7 @@ Usage: change config.yaml::
 
 from __future__ import annotations
 
+import json
 import logging
 import random
 import re
@@ -64,6 +65,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
+from difflib import SequenceMatcher
 from typing import Any, Dict, List, Optional
 
 from .embeddings import FastEmbedder, OllamaEmbedder
@@ -138,6 +140,11 @@ _STOPWORDS = frozenset(
 def _content_tokens(text: str) -> set:
     """Significant (non-function) words."""
     return _norm_tokens(text) - _STOPWORDS
+
+
+def _content_token_sequence(text: str) -> tuple:
+    """Significant words in their original order."""
+    return tuple(t for t in _norm_token_sequence(text) if t not in _STOPWORDS)
 
 
 _STATE_WORD_GROUPS = (
@@ -223,6 +230,63 @@ def _is_near_duplicate(content: str, other: str, threshold: float) -> bool:
 
 
 _RESTATEMENT_JACCARD = 0.7
+_SEMANTIC_RELATION_WORDS = frozenset(
+    "prefer prefers preferred like likes liked love loves loved enjoy enjoys enjoyed "
+    "use uses used choose chooses chose drink drinks drank consume consumes consumed "
+    "reach reaches select selects want wants favor favors favour favours".split()
+)
+
+
+def _has_implausible_replacement(a: tuple, b: tuple) -> bool:
+    for operation, a_start, a_end, b_start, b_end in SequenceMatcher(
+        a=a, b=b
+    ).get_opcodes():
+        if operation != "replace":
+            continue
+        left_content = [t for t in a[a_start:a_end] if t not in _STOPWORDS]
+        right_content = [t for t in b[b_start:b_end] if t not in _STOPWORDS]
+        if not left_content or not right_content:
+            continue
+        if len(left_content) != len(right_content):
+            left_relations = set(left_content) & _SEMANTIC_RELATION_WORDS
+            right_relations = set(right_content) & _SEMANTIC_RELATION_WORDS
+            if not left_relations or not right_relations:
+                return True
+            if (
+                set(left_content) - _SEMANTIC_RELATION_WORDS
+                and set(right_content) - _SEMANTIC_RELATION_WORDS
+            ):
+                return True
+            continue
+        for left, right in zip(left_content, right_content):
+            if not {left, right} <= _SEMANTIC_RELATION_WORDS:
+                return True
+    return False
+
+
+def _has_nonnumeric_value_substitution(content: str, other: str) -> bool:
+    """Detect a changed content word such as tea -> coffee or added honey."""
+    a = _norm_token_sequence(content)
+    b = _norm_token_sequence(other)
+    a_content = _content_token_sequence(content)
+    b_content = _content_token_sequence(other)
+    if set(a_content) == set(b_content) and a_content != b_content:
+        return True
+    # One-sided content-token additions or removals mean elaboration or loss
+    # of information: "tea" -> "tea with honey" must be kept as an update.
+    # Symmetric rewrites need a plausible relation-word substitution before
+    # the aligned replacement-block check below can accept them.
+    a_set, b_set = set(a), set(b)
+    added = [t for t in b if t not in a_set and t not in _STOPWORDS]
+    removed = [t for t in a if t not in b_set and t not in _STOPWORDS]
+    if bool(added) != bool(removed):
+        return True
+    if added and removed and not (
+        set(added) & _SEMANTIC_RELATION_WORDS
+        and set(removed) & _SEMANTIC_RELATION_WORDS
+    ):
+        return True
+    return _has_implausible_replacement(a, b) and _has_implausible_replacement(b, a)
 
 
 def _is_semantic_duplicate(
@@ -250,6 +314,8 @@ def _is_semantic_duplicate(
         return False
     if _has_negation_mismatch(content, other, require_context=False):
         return False
+    if _has_nonnumeric_value_substitution(content, other):
+        return False
     if _content_tokens(content) != _content_tokens(other):
         if _jaccard(_norm_tokens(content), _norm_tokens(other)) >= _RESTATEMENT_JACCARD:
             return False
@@ -267,6 +333,7 @@ def _is_superseded(content: str) -> bool:
 
 
 from .embed_store import EmbedStore  # noqa: E402
+from .backup import sqlite_file_uri  # noqa: E402
 from .extract_queue import ExtractQueue, is_quota_error, quota_retry_delay  # noqa: E402
 from .llm_extract import _format_conversation, extract_facts_from_transcript, insert_facts  # noqa: E402
 from .reflection import ensure_reflection_schema, invalidate_insights_citing, run_reflection  # noqa: E402
@@ -584,7 +651,7 @@ class EnfoldProvider(HolographicMemoryProvider):
         db_path = str(self._config.get("db_path", ""))
         if db_path:
             try:
-                probe = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+                probe = sqlite3.connect(sqlite_file_uri(db_path, mode="ro"), uri=True)
             except sqlite3.OperationalError as exc:
                 if "unable to open" not in str(exc).lower():
                     raise
@@ -657,14 +724,26 @@ class EnfoldProvider(HolographicMemoryProvider):
             entity_boost_weight=float(self._config.get("entity_boost_weight", 0.0)),
             entity_expansion=_cfg_bool(self._config.get("entity_expansion"), False),
             entity_hub_degree_limit=int(self._config.get("entity_hub_degree_limit", 25)),
+            lifecycle_filter=self._temporal_filter,
         )
 
         # ---- Embedding layer
         self._embedder = self._create_embedder()
+        if getattr(self._store, "_lock", None) is None:
+            # One shared lock per connection: background embed-pool writes and
+            # cooperative callers (e.g. the MCP write proxy) must serialize on
+            # the same lock, or a mid-savepoint transaction becomes observable.
+            self._store._lock = threading.RLock()
+        elif not isinstance(self._store._lock, type(threading.RLock())):
+            # Nested acquisition (reflection -> embed writes, MCP proxy -> store
+            # helpers) requires reentrancy; a plain Lock would self-deadlock.
+            raise TypeError(
+                "enfold requires the parent store lock to be a threading.RLock"
+            )
         self._embed_store = EmbedStore(
             conn=self._store._conn,
             embedding_identity=self._embedding_identity("document"),
-            lock=getattr(self._store, "_lock", None),
+            lock=self._store._lock,
         )
         self._embed_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="hp-embed")
         self._embedder_available = self._embedder.is_available()
@@ -984,16 +1063,25 @@ class EnfoldProvider(HolographicMemoryProvider):
             if row is None:
                 break
             try:
-                facts = extract_facts_from_transcript(
-                    row["payload"],
-                    store,
-                    provider=self._extract_provider,
-                    model=self._extract_model,
-                    effort=self._extract_effort,
-                    search_fn=lambda topic, limit: self.search(
-                        topic, min_trust=self._min_trust, limit=limit, bump=False
-                    ),
-                )
+                if row.get("proposal_json") is not None:
+                    facts = json.loads(row["proposal_json"])
+                    if not isinstance(facts, list):
+                        raise ValueError("stored extraction proposal is not a list")
+                else:
+                    facts = extract_facts_from_transcript(
+                        row["payload"],
+                        store,
+                        provider=self._extract_provider,
+                        model=self._extract_model,
+                        effort=self._extract_effort,
+                        search_fn=lambda topic, limit: self.search(
+                            topic, min_trust=self._min_trust, limit=limit, bump=False
+                        ),
+                    )
+                    if not queue.save_proposals(
+                        row["id"], facts, row["lease_owner"]
+                    ):
+                        raise RuntimeError("extraction queue lease was lost")
                 if not self._generation_current(generation, "extraction insert"):
                     break
                 inserted = 0
@@ -1339,7 +1427,9 @@ class EnfoldProvider(HolographicMemoryProvider):
         excluded: Dict[int, Dict[str, Any]] = {}
         kept = []
         for r in holo_results:
-            if _is_superseded(r.get("content", "")):
+            if r.pop("_exclusion_reason", None) == "conflict":
+                excluded[r["fact_id"]] = {"reason": "conflict", "content": r.get("content")}
+            elif _is_superseded(r.get("content", "")):
                 excluded[r["fact_id"]] = {"reason": "superseded", "content": r.get("content")}
             else:
                 kept.append(r)
@@ -1408,6 +1498,15 @@ class EnfoldProvider(HolographicMemoryProvider):
             max_extra = limit * 2
             category_clause = " AND category = ?" if category else ""
             with self._store._lock:
+                fact_columns = {
+                    row[1]
+                    for row in self._store._conn.execute("PRAGMA table_info(facts)")
+                }
+                conflict_select = (
+                    "conflict_group"
+                    if "conflict_group" in fact_columns
+                    else "NULL AS conflict_group"
+                )
                 for fid, _sim in emb_pairs:
                     if len(extra_facts) >= max_extra:
                         break
@@ -1420,7 +1519,7 @@ class EnfoldProvider(HolographicMemoryProvider):
                         f"""
                         SELECT fact_id, content, category, tags, trust_score,
                                retrieval_count, helpful_count, created_at, updated_at,
-                               invalid_at
+                               invalid_at, {conflict_select}
                         FROM facts
                         WHERE fact_id = ?
                           AND trust_score >= ?{category_clause}
@@ -1430,6 +1529,9 @@ class EnfoldProvider(HolographicMemoryProvider):
                     if row is None:
                         continue
                     d = dict(row)
+                    if d.pop("conflict_group", None) is not None:
+                        excluded[d["fact_id"]] = {"reason": "conflict", "content": d.get("content")}
+                        continue
                     if _is_superseded(d.get("content", "")):
                         excluded[d["fact_id"]] = {"reason": "superseded", "content": d.get("content")}
                         continue
@@ -1698,18 +1800,74 @@ class EnfoldProvider(HolographicMemoryProvider):
                 })
             update_target = self._find_update_target(content, category=category)
 
-        result_json = super()._handle_fact_store(args)
-
-        if action == "add" and update_target is not None:
+        store = self._store
+        conn = getattr(store, "_conn", None)
+        lock = getattr(store, "_lock", nullcontext())
+        with lock:
+            transaction_started = False
+            if conn is not None and not conn.in_transaction:
+                conn.execute("BEGIN IMMEDIATE")
+                transaction_started = True
+            result_json = super()._handle_fact_store(args)
             try:
                 result = _json.loads(result_json)
             except Exception:
                 result = {}
-            new_fact_id = result.get("fact_id")
-            if new_fact_id and result.get("status") == "added":
-                self._supersede_fact(int(update_target["fact_id"]), int(new_fact_id))
 
-        return result_json
+            new_fact_id = result.get("fact_id")
+            if (
+                action == "add"
+                and update_target is not None
+                and new_fact_id
+                and result.get("status") == "added"
+            ):
+                try:
+                    updated = self._supersede_fact(
+                        int(update_target["fact_id"]), int(new_fact_id)
+                    )
+                    if not updated:
+                        raise RuntimeError("supersede target is no longer active")
+                except Exception as exc:
+                    rolled_back = bool(
+                        transaction_started and conn is not None and conn.in_transaction
+                    )
+                    if rolled_back:
+                        conn.rollback()
+                    compensated = False
+                    if not rolled_back and conn is not None:
+                        old_row = conn.execute(
+                            "SELECT invalid_at FROM facts WHERE fact_id = ?",
+                            (int(update_target["fact_id"]),),
+                        ).fetchone()
+                        new_row = conn.execute(
+                            "SELECT invalid_at FROM facts WHERE fact_id = ?",
+                            (int(new_fact_id),),
+                        ).fetchone()
+                        if (
+                            old_row is not None
+                            and old_row["invalid_at"] is None
+                            and new_row is not None
+                            and new_row["invalid_at"] is None
+                        ):
+                            cur = conn.execute(
+                                "UPDATE facts SET invalid_at = CURRENT_TIMESTAMP "
+                                "WHERE fact_id = ? AND invalid_at IS NULL",
+                                (int(new_fact_id),),
+                            )
+                            conn.commit()
+                            compensated = int(cur.rowcount) == 1
+                    result["status"] = "supersede_failed"
+                    result["error"] = str(exc)
+                    result["rolled_back"] = rolled_back
+                    result["compensated"] = compensated
+                    return _json.dumps(result)
+
+            if transaction_started and conn is not None and conn.in_transaction:
+                if result.get("error"):
+                    conn.rollback()
+                else:
+                    conn.commit()
+            return result_json
 
     def _find_near_duplicate(
         self, content: str, category: Optional[str] = None
@@ -1775,8 +1933,8 @@ class EnfoldProvider(HolographicMemoryProvider):
     def _supersede_fact(self, old_fact_id: int, new_fact_id: int) -> bool:
         """Structurally supersede *old_fact_id* with *new_fact_id* (invalidate-not-delete).
 
-        Never fails the caller's insert: any error here is logged and
-        swallowed, leaving both rows live rather than losing the new fact.
+        Errors propagate so callers can roll back or report a failed
+        supersession instead of claiming a clean add.
         """
         if not self._store or old_fact_id == new_fact_id:
             return False
@@ -1793,11 +1951,11 @@ class EnfoldProvider(HolographicMemoryProvider):
                     )
                 return updated
         except Exception as exc:
-            logger.debug(
+            logger.warning(
                 "enfold: supersede(%s -> %s) failed: %s",
                 old_fact_id, new_fact_id, exc,
             )
-            return False
+            raise
 
     def fact_history(self, fact_id: int) -> List[Dict[str, Any]]:
         """Return the full supersession chain containing *fact_id*, oldest first.
@@ -1830,6 +1988,12 @@ class EnfoldProvider(HolographicMemoryProvider):
         if not self._extract_provider or not self._extract_model:
             return 0
         embed_store = self._embed_store if store is self._store else None
+        db_path = self._write_lock_db_path(store)
+        insert_guard = (
+            (lambda: cross_process_write_lock(db_path))
+            if db_path is not None
+            else nullcontext
+        )
         return run_reflection(
             store._conn,
             now=now,
@@ -1851,7 +2015,9 @@ class EnfoldProvider(HolographicMemoryProvider):
                 tags,
                 generation=generation,
                 store=store,
+                _write_lock_held=True,
             ),
+            insert_guard=insert_guard,
             lock=getattr(store, "_lock", None),
         )
 
@@ -1862,6 +2028,7 @@ class EnfoldProvider(HolographicMemoryProvider):
         tags: str,
         generation: Optional[int] = None,
         store=None,
+        _write_lock_held: bool = False,
     ) -> int:
         """Insert one accepted insight through the normal fact-add path.
 
@@ -1876,7 +2043,7 @@ class EnfoldProvider(HolographicMemoryProvider):
         if not self._generation_current(generation, "reflection insert"):
             return 0
         db_path = self._write_lock_db_path(store)
-        lock_ctx = (
+        lock_ctx = nullcontext() if _write_lock_held else (
             cross_process_write_lock(db_path)
             if db_path is not None
             else nullcontext()

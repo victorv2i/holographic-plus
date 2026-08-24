@@ -24,6 +24,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 import threading
+from contextlib import contextmanager
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -79,6 +80,7 @@ class EmbedStore:
         self._cache_matrix: Optional[np.ndarray] = None
         self._cache_dim: Optional[int] = None
         self._cache_identity: Optional[str] = None
+        self._cache_data_version: Optional[int] = None
         self._init_table()
         self._vector_index = SQLiteVecIndex.open_configured(conn, warn=False)
 
@@ -88,17 +90,37 @@ class EmbedStore:
         self._cache_matrix = None
         self._cache_dim = None
         self._cache_identity = None
+        self._cache_data_version = None
+
+    @contextmanager
+    def _mutation(self):
+        """Keep canonical and derived writes atomic within any transaction."""
+        savepoint = "enfold_embed_store_mutation"
+        try:
+            self._conn.execute(f"SAVEPOINT {savepoint}")
+            try:
+                yield
+            except BaseException:
+                self._conn.execute(f"ROLLBACK TO {savepoint}")
+                self._conn.execute(f"RELEASE {savepoint}")
+                raise
+            else:
+                self._conn.execute(f"RELEASE {savepoint}")
+        finally:
+            self._invalidate_cache()
 
     # ------------------------------------------------------------------
     # Init
     # ------------------------------------------------------------------
 
     def _init_table(self) -> None:
+        owns_transaction = not self._conn.in_transaction
         self._conn.execute(_CREATE_TABLE)
         self._ensure_schema_v2()
         self._conn.execute(_CREATE_INDEX)
         self._conn.execute(_CREATE_IDENTITY_DIM_INDEX)
-        self._conn.commit()
+        if owns_transaction:
+            self._conn.commit()
 
     def _ensure_schema_v2(self) -> None:
         """Migrate legacy one-vector-per-fact tables to identity-scoped rows.
@@ -164,12 +186,17 @@ class EmbedStore:
     def upsert(self, fact_id: int, vec: np.ndarray, embedding_identity: Optional[str] = None) -> None:
         """Store or replace the embedding for *fact_id*."""
         with self._lock:
-            blob = embedding_to_bytes(vec)
-            dim = len(vec)
-            identity = embedding_identity if embedding_identity is not None else self._embedding_identity
-            if not identity:
-                identity = "legacy:unknown:document:none:v1"
-            try:
+            with self._mutation():
+                vector = np.asarray(vec, dtype=np.float32)
+                if vector.ndim != 1 or vector.size == 0:
+                    raise ValueError("embedding vector must be a non-empty 1-D array")
+                if not np.all(np.isfinite(vector)):
+                    raise ValueError("embedding vector must contain only finite values")
+                blob = embedding_to_bytes(vector)
+                dim = len(vector)
+                identity = embedding_identity if embedding_identity is not None else self._embedding_identity
+                if not identity:
+                    identity = "legacy:unknown:document:none:v1"
                 self._conn.execute(
                     """
                     INSERT INTO fact_embeddings (fact_id, embedding, dim, embedding_identity)
@@ -188,28 +215,16 @@ class EmbedStore:
                     and dim == self._vector_index.dimensions
                 ):
                     self._vector_index.upsert_in_transaction(fact_id, blob)
-                self._conn.commit()
-            except BaseException:
-                if self._conn.in_transaction:
-                    self._conn.rollback()
-                raise
-            self._invalidate_cache()
 
     def delete(self, fact_id: int) -> None:
         """Remove embedding for *fact_id* (no-op if not present)."""
         with self._lock:
-            try:
+            with self._mutation():
                 self._conn.execute(
                     "DELETE FROM fact_embeddings WHERE fact_id = ?", (fact_id,)
                 )
                 if self._vector_index is not None:
                     self._vector_index.delete_in_transaction(fact_id)
-                self._conn.commit()
-            except BaseException:
-                if self._conn.in_transaction:
-                    self._conn.rollback()
-                raise
-            self._invalidate_cache()
 
     def prune_identities(self, keep) -> int:
         """Delete every stored vector whose identity is not in *keep*.
@@ -225,7 +240,7 @@ class EmbedStore:
             raise ValueError("prune_identities requires a non-empty keep set")
         with self._lock:
             placeholders = ",".join("?" * len(keep_list))
-            try:
+            with self._mutation():
                 cur = self._conn.execute(
                     f"DELETE FROM fact_embeddings "
                     f"WHERE embedding_identity NOT IN ({placeholders})",
@@ -236,14 +251,7 @@ class EmbedStore:
                     and self._vector_index.identity not in keep_list
                 ):
                     self._vector_index.clear_in_transaction()
-                self._conn.commit()
-            except BaseException:
-                if self._conn.in_transaction:
-                    self._conn.rollback()
-                raise
             deleted = int(cur.rowcount)
-            if deleted:
-                self._invalidate_cache()
         return deleted
 
     def identity_counts(self) -> dict:
@@ -306,11 +314,15 @@ class EmbedStore:
         """Return cached (fact_ids, normalised_matrix) for embeddings matching dim/identity."""
         identity = self._identity_for_storage(embedding_identity)
         with self._lock:
+            data_version = int(
+                self._conn.execute("PRAGMA data_version").fetchone()[0]
+            )
             if (
                 self._cache_ids is not None
                 and self._cache_matrix is not None
                 and self._cache_dim == dim
                 and self._cache_identity == identity
+                and self._cache_data_version == data_version
             ):
                 return self._cache_ids, self._cache_matrix
 
@@ -321,6 +333,7 @@ class EmbedStore:
                         SELECT fact_id, embedding FROM fact_embeddings
                         WHERE dim = ?
                           AND (embedding_identity = ? OR embedding_identity IS NULL)
+                        ORDER BY fact_id DESC
                         """,
                         (dim, identity),
                     ).fetchall()
@@ -329,23 +342,47 @@ class EmbedStore:
                         """
                         SELECT fact_id, embedding FROM fact_embeddings
                         WHERE dim = ? AND embedding_identity = ?
+                        ORDER BY fact_id DESC
                         """,
                         (dim, identity),
                     ).fetchall()
             else:
                 rows = self._conn.execute(
-                    "SELECT fact_id, embedding FROM fact_embeddings WHERE dim = ?",
+                    "SELECT fact_id, embedding FROM fact_embeddings "
+                    "WHERE dim = ? ORDER BY fact_id DESC",
                     (dim,),
                 ).fetchall()
-            if not rows:
+            valid_rows = []
+            for fact_id, blob in rows:
+                try:
+                    vector = bytes_to_embedding(blob)
+                except (TypeError, ValueError):
+                    logger.debug(
+                        "Skipping embedding for fact %s: malformed blob for dim %s",
+                        fact_id,
+                        dim,
+                    )
+                    continue
+                if len(vector) != dim:
+                    logger.debug(
+                        "Skipping embedding for fact %s: blob length %s disagrees with dim %s",
+                        fact_id,
+                        len(vector),
+                        dim,
+                    )
+                    continue
+                valid_rows.append((fact_id, vector))
+
+            if not valid_rows:
                 self._cache_ids = np.array([], dtype=np.int64)
                 self._cache_matrix = np.empty((0, dim), dtype=np.float32)
                 self._cache_dim = dim
                 self._cache_identity = identity
+                self._cache_data_version = data_version
                 return self._cache_ids, self._cache_matrix
 
-            fact_ids = np.array([int(r[0]) for r in rows], dtype=np.int64)
-            matrix = np.stack([bytes_to_embedding(r[1]) for r in rows]).astype(np.float32, copy=False)
+            fact_ids = np.array([int(r[0]) for r in valid_rows], dtype=np.int64)
+            matrix = np.stack([r[1] for r in valid_rows]).astype(np.float32, copy=False)
 
             row_norms = np.linalg.norm(matrix, axis=1, keepdims=True)
             row_norms = np.where(row_norms < 1e-9, 1.0, row_norms)
@@ -355,6 +392,7 @@ class EmbedStore:
             self._cache_matrix = matrix_normed
             self._cache_dim = dim
             self._cache_identity = identity
+            self._cache_data_version = data_version
             return self._cache_ids, self._cache_matrix
 
     def score_all(

@@ -70,6 +70,67 @@ def test_explain_search_marks_superseded_fact_with_reason(make_provider):
     assert new["excluded"] is None
 
 
+def test_retriever_explain_marks_conflict_candidate(make_provider):
+    provider = make_provider()
+    provider._store._conn.execute("ALTER TABLE facts ADD COLUMN conflict_group TEXT")
+    fact_id = provider._store.add_fact(
+        "The disputed Orchid status is green.", category="project"
+    )
+    provider._store._conn.execute(
+        "UPDATE facts SET conflict_group = 'orchid-status' WHERE fact_id = ?",
+        (fact_id,),
+    )
+    provider._store._conn.commit()
+
+    ordinary = provider._retriever.search(
+        "Orchid status", min_trust=0.0, limit=10
+    )
+    diagnostic = provider._retriever.search(
+        "Orchid status", min_trust=0.0, limit=10, explain=True
+    )
+
+    assert fact_id not in {row["fact_id"] for row in ordinary}
+    conflicted = next(row for row in diagnostic if row["fact_id"] == fact_id)
+    assert conflicted["_exclusion_reason"] == "conflict"
+
+
+def test_dense_search_excludes_conflict_once_with_reason(make_provider):
+    provider = make_provider(embedding_weight=1.0)
+    provider._store._conn.execute("ALTER TABLE facts ADD COLUMN conflict_group TEXT")
+    query = "Orchid status"
+    vector = np.asarray([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    provider._fake_embedder.table[query] = vector
+    fact_id = provider._store.add_fact(
+        "The disputed Orchid status is green.", category="project"
+    )
+    provider._embed_store.upsert(
+        fact_id,
+        vector,
+        embedding_identity=provider._embedding_identity("document"),
+    )
+    provider._store._conn.execute(
+        "UPDATE facts SET conflict_group = 'orchid-status' WHERE fact_id = ?",
+        (fact_id,),
+    )
+    provider._store._conn.commit()
+
+    assert fact_id not in {
+        row["fact_id"]
+        for row in provider._retriever.search(query, min_trust=0.0, limit=10)
+    }
+    assert fact_id not in {
+        row["fact_id"]
+        for row in provider.search(query, min_trust=0.0, limit=10, bump=False)
+    }
+
+    explained = provider.search(
+        query, min_trust=0.0, limit=10, bump=False, explain=True
+    )
+    conflict_rows = [row for row in explained if row["fact_id"] == fact_id]
+    assert len(conflict_rows) == 1
+    assert conflict_rows[0]["excluded"] == "conflict"
+
+
 def test_explain_search_respects_limit_on_included_results(make_provider):
     provider = make_provider()
     for i in range(5):

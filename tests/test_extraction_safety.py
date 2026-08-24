@@ -6,9 +6,15 @@ import time
 import pytest
 
 from enfold.extraction_enqueue import ExtractionEnqueuer
-from enfold.extraction_processor import ExtractedMemory, ExtractionProcessor
-from enfold.policy import MemoryPolicy
-from enfold.provenance import ConnectionContext
+from enfold.extraction_processor import (
+    EvidenceVerification,
+    ExtractedMemory,
+    ExtractionProcessor,
+)
+from enfold.extraction_spans import transcript_spans
+from enfold.llm_extract import ExtractionParseError, _parse_response
+from enfold.policy import MemoryPolicy, default_credential_screen
+from enfold.provenance import ConnectionContext, WriteRequest
 from enfold.schema import MigrationError, migrate
 from enfold.service import EnfoldService
 
@@ -20,7 +26,7 @@ def _setup(tmp_path):
     context = ConnectionContext(
         client_id="hermes-install",
         surface="hermes",
-        agent_id="wonny",
+        agent_id="avery",
         session_id="safety-session",
         access_scopes=("private", "work"),
     )
@@ -28,7 +34,7 @@ def _setup(tmp_path):
         conn, MemoryPolicy({"hermes-install": ("private", "work")})
     )
     ExtractionEnqueuer(conn).enqueue_after_commit(
-        context, "Victor uses durable shared memory.", source="session_end"
+        context, "Avery uses durable shared memory.", source="session_end"
     )
     return conn, context, service
 
@@ -39,12 +45,27 @@ class ChangingExtractor:
     def __init__(self):
         self.calls = 0
 
-    def extract(self, _envelope):
+    def extract(self, envelope):
         self.calls += 1
+        span_id = transcript_spans(envelope.transcript)[0].span_id
         return (
-            ExtractedMemory(f"First proposal from model call {self.calls}."),
-            ExtractedMemory(f"Second proposal from model call {self.calls}."),
+            ExtractedMemory(
+                f"First proposal from model call {self.calls}.",
+                evidence_excerpt="Avery uses durable shared memory.",
+                metadata={"evidence_span_id": span_id},
+            ),
+            ExtractedMemory(
+                f"Second proposal from model call {self.calls}.",
+                evidence_excerpt="Avery uses durable shared memory.",
+                metadata={"evidence_span_id": span_id},
+            ),
         )
+
+
+class VerifiedTestEvidence:
+    def verify(self, _proposal, *, evidence_excerpt, envelope):
+        assert evidence_excerpt in envelope.transcript
+        return EvidenceVerification("verified", "test-evidence-v1")
 
 
 def test_partial_write_replays_persisted_snapshot_without_recalling_model(tmp_path):
@@ -61,7 +82,11 @@ def test_partial_write_replays_persisted_snapshot_without_recalling_model(tmp_pa
             return service.handle(client_context, request)
 
     partial = ExtractionProcessor(
-        conn, FailSecondWrite(), extractor, retry_delay_seconds=0
+        conn,
+        FailSecondWrite(),
+        extractor,
+        retry_delay_seconds=0,
+        evidence_verifier=VerifiedTestEvidence(),
     ).process_one()
     assert partial.outcome == "retry"
     assert extractor.calls == 1
@@ -70,7 +95,13 @@ def test_partial_write_replays_persisted_snapshot_without_recalling_model(tmp_pa
     ).fetchone()
     assert snapshot[0] and snapshot[1]
 
-    resumed = ExtractionProcessor(conn, service, extractor, retry_delay_seconds=0).process_one()
+    resumed = ExtractionProcessor(
+        conn,
+        service,
+        extractor,
+        retry_delay_seconds=0,
+        evidence_verifier=VerifiedTestEvidence(),
+    ).process_one()
     assert resumed.outcome == "completed"
     assert extractor.calls == 1
     assert [row[0] for row in conn.execute("SELECT content FROM facts ORDER BY fact_id")] == [
@@ -86,9 +117,19 @@ def test_heartbeat_renews_active_lease_during_slow_extraction(tmp_path):
     class SlowExtractor:
         identity = "slow-extractor:v1"
 
-        def extract(self, _envelope):
+        def extract(self, envelope):
             time.sleep(0.06)
-            return (ExtractedMemory("A fact after a long extraction."),)
+            return (
+                ExtractedMemory(
+                    "A fact after a long extraction.",
+                    evidence_excerpt="Avery uses durable shared memory.",
+                    metadata={
+                        "evidence_span_id": transcript_spans(
+                            envelope.transcript
+                        )[0].span_id,
+                    },
+                ),
+            )
 
     worker = ExtractionProcessor(
         conn,
@@ -96,6 +137,7 @@ def test_heartbeat_renews_active_lease_during_slow_extraction(tmp_path):
         SlowExtractor(),
         lease_seconds=1,
         heartbeat_seconds=0.01,
+        evidence_verifier=VerifiedTestEvidence(),
     )
     renewals = []
     renew = worker._renew
@@ -143,7 +185,11 @@ def test_stale_worker_cannot_renew_a_reclaimed_fence(tmp_path):
 
 def test_automatic_proposals_cannot_escalate_scope(tmp_path):
     conn, _context, service = _setup(tmp_path)
-    proposal = ExtractedMemory("A scoped proposal.", scope="work")
+    proposal = ExtractedMemory(
+        "A scoped proposal.",
+        scope="work",
+        evidence_excerpt="Avery uses durable shared memory.",
+    )
 
     class UnsafeExtractor:
         identity = "unsafe-extractor:v1"
@@ -167,16 +213,27 @@ def test_automatic_trust_and_authority_are_server_fixed(tmp_path):
     class ElevatingExtractor:
         identity = "elevating-extractor:v1"
 
-        def extract(self, _envelope):
+        def extract(self, envelope):
             return (
                 ExtractedMemory(
                     "Model tried to self-elevate authority.",
                     trust_score=1.0,
                     source_authority=1.0,
+                    evidence_excerpt="Avery uses durable shared memory.",
+                    metadata={
+                        "evidence_span_id": transcript_spans(
+                            envelope.transcript
+                        )[0].span_id,
+                    },
                 ),
             )
 
-    result = ExtractionProcessor(conn, service, ElevatingExtractor()).process_one()
+    result = ExtractionProcessor(
+        conn,
+        service,
+        ElevatingExtractor(),
+        evidence_verifier=VerifiedTestEvidence(),
+    ).process_one()
     assert result.outcome == "completed"
     row = conn.execute("SELECT trust_score, source_authority FROM facts").fetchone()
     assert tuple(row) == (0.5, 0.5)
@@ -185,7 +242,7 @@ def test_automatic_trust_and_authority_are_server_fixed(tmp_path):
 
 def test_model_exception_text_is_never_persisted(tmp_path):
     conn, _context, service = _setup(tmp_path)
-    secret = "sk-super-secret-model-error"
+    secret = "sk-" + "super-secret-model-error"
 
     class FailingExtractor:
         identity = "failing-extractor:v1"
@@ -200,6 +257,37 @@ def test_model_exception_text_is_never_persisted(tmp_path):
     assert stored == "extractor_failed"
     assert secret not in stored
     conn.close()
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        "-----BEGIN ENCRYPTED PRIVATE KEY-----",
+        "-----BEGIN DSA PRIVATE KEY-----",
+    ],
+)
+def test_standard_pem_private_key_headers_are_screened(header):
+    request = WriteRequest(
+        idempotency_key="pem-screen",
+        content=f"Stored key: {header}",
+        source_type="automatic_extraction",
+    )
+
+    assert default_credential_screen(request) is not None
+
+
+def test_parse_error_never_contains_raw_model_output():
+    secret = "api_key = abcdefghijklmnopqrstuv"
+    raw = f"model transcript fragment with {secret} and no array"
+
+    with pytest.raises(ExtractionParseError) as captured:
+        _parse_response(raw)
+
+    message = str(captured.value)
+    assert "length=" in message
+    assert "parse_error_pos=" in message
+    assert secret not in message
+    assert raw[:20] not in message
 
 
 def test_explicit_migration_adds_snapshot_columns_to_a_pre_snapshot_v1_store(tmp_path):

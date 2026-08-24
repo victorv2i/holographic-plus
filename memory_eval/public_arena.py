@@ -18,6 +18,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+try:
+    from enfold.hybrid_retrieval import named_anchor_tokens as _core_named_anchor_tokens
+except ImportError:  # pragma: no cover - exercised only in minimal installations
+    _core_named_anchor_tokens = None
+
 from .cases import load_cases, write_json_report
 from .runner import EvalCase, EvalResult, SearchProvider, run_retrieval_cases, summarize_results
 
@@ -330,22 +335,34 @@ def _fts5_query(text: str) -> str:
     return " OR ".join(f'"{token.replace(chr(34), chr(34) * 2)}"' for token in tokens)
 
 
-def _proper_anchor_tokens(text: str) -> set[str]:
+def _proper_anchor_tokens(text: str) -> frozenset[str]:
     """Extract explicit named anchors used for conservative abstention."""
 
+    if _core_named_anchor_tokens is not None:
+        return _core_named_anchor_tokens(text)
     words = re.findall(r"[A-Za-z][A-Za-z0-9_-]*", text)
-    if not words:
-        return set()
-    sentence_openers = {
-        "A", "An", "Does", "How", "Is", "The", "What", "When", "Where",
-        "Which", "Who", "Why",
-    }
-    return {
-        word.lower()
-        for index, word in enumerate(words)
-        if word[0].isupper()
-        and not (index == 0 and word in sentence_openers)
-    }
+    sentence_openers = frozenset({
+        "A", "An", "Are", "Can", "Could", "Did", "Do", "Does", "Find",
+        "Give", "How", "I", "Is", "Kindly", "May", "Me", "My", "Our",
+        "Please", "Should", "Show", "Tell", "The", "Us", "Was", "Were",
+        "What", "When", "Where", "Which", "Who", "Whom", "Whose", "Why",
+        "Will", "Would", "You", "Your",
+    })
+    leading_request_verbs = frozenset({"Find", "Give", "Show", "Tell"})
+    anchors = []
+    for index, word in enumerate(words):
+        if not word[0].isupper():
+            continue
+        if index == 0 and word in sentence_openers:
+            continue
+        if not anchors and word in leading_request_verbs:
+            continue
+        anchors.extend(re.findall(r"[a-z0-9]+", word.lower()))
+    return frozenset(anchors)
+
+
+def _anchor_match_tokens(text: str) -> frozenset[str]:
+    return frozenset(re.findall(r"[a-z0-9]+", text.lower()))
 
 
 class EnfoldCoreFtsCurrentProvider:
@@ -486,7 +503,9 @@ class EnfoldCoreFtsCurrentProvider:
             rows = [
                 row
                 for row in rows
-                if anchors <= _tokens(f"{row['content']} {row.get('tags', '')}")
+                if anchors <= _anchor_match_tokens(
+                    f"{row['content']} {row.get('tags', '')}"
+                )
             ]
         for row in rows:
             rank = float(row["fts_rank"])

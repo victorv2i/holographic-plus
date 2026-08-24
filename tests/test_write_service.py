@@ -10,6 +10,7 @@ from enfold.provenance import (
     ensure_provenance_schema,
 )
 from enfold.policy import MemoryPolicy
+from enfold.cluster_merge import NearDuplicateCandidate
 from enfold.write_service import (
     ClientIdentityConflict,
     FactWriteResult,
@@ -109,10 +110,66 @@ def test_write_atomically_records_identity_observation_fact_and_provenance():
         "client-a",
         "Client A implemented Enfold provenance.",
     )
-    assert conn.execute(
-        "SELECT fact_id, relation FROM fact_provenance"
-    ).fetchone() == (result.fact_id, "supports")
+    assert conn.execute("SELECT fact_id, relation FROM fact_provenance").fetchone() == (
+        result.fact_id,
+        "supports",
+    )
     assert conn.execute("SELECT count(*) FROM memory_write_log").fetchone()[0] == 1
+
+
+def test_write_batch_rolls_back_every_durable_side_effect_on_late_failure():
+    conn = _connection()
+    calls = 0
+
+    def fail_second(connection, request, observation_id):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("late batch failure")
+        return _writer(connection, request, observation_id)
+
+    service = _service(conn, fail_second)
+    writes = (
+        (_request(idempotency_key="batch-1", content="First batch fact."), None),
+        (_request(idempotency_key="batch-2", content="Second batch fact."), None),
+    )
+
+    with pytest.raises(RuntimeError, match="late batch failure"):
+        service.write_batch(_context(), writes)
+
+    assert conn.in_transaction is False
+    for table in (
+        "memory_clients",
+        "memory_sessions",
+        "observations",
+        "facts",
+        "fact_provenance",
+        "memory_write_log",
+    ):
+        assert conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0] == 0
+
+
+def test_write_batch_replays_as_one_committed_idempotent_unit():
+    conn = _connection()
+    service = _service(conn)
+    writes = (
+        (_request(idempotency_key="batch-1", content="First batch fact."), None),
+        (_request(idempotency_key="batch-2", content="Second batch fact."), None),
+    )
+
+    first = service.write_batch(_context(), writes)
+    replay = service.write_batch(_context(), writes)
+
+    assert first.committed is True
+    assert replay.committed is True
+    assert [outcome.replayed for outcome in first.outcomes] == [False, False]
+    assert [outcome.replayed for outcome in replay.outcomes] == [True, True]
+    assert [outcome.write_id for outcome in replay.outcomes] == [
+        outcome.write_id for outcome in first.outcomes
+    ]
+    assert conn.execute("SELECT count(*) FROM facts").fetchone()[0] == 2
+    assert conn.execute("SELECT count(*) FROM observations").fetchone()[0] == 2
+    assert conn.execute("SELECT count(*) FROM memory_write_log").fetchone()[0] == 2
 
 
 def test_same_client_idempotency_key_replays_without_calling_writer_again():
@@ -133,6 +190,47 @@ def test_same_client_idempotency_key_replays_without_calling_writer_again():
     assert replay.write_id == first.write_id
     assert replay.fact_id == first.fact_id
     assert conn.execute("SELECT count(*) FROM facts").fetchone()[0] == 1
+
+
+@pytest.mark.parametrize(
+    "context_change",
+    [
+        {"agent_id": "delegate"},
+        {"parent_agent_id": "root-agent"},
+        {"project_root": "/other/project"},
+        {"repository": "other-repository"},
+        {"capabilities": ("memory.search",)},
+        {"access_scopes": ("work",)},
+    ],
+)
+def test_idempotent_replay_validates_immutable_session_context(context_change):
+    conn = _connection()
+    service = _service(conn)
+    first = service.write(_context(), _request())
+
+    with pytest.raises(SessionContextConflict, match="different connection context"):
+        service.write(_context(**context_change), _request())
+
+    assert conn.execute("SELECT count(*) FROM facts").fetchone()[0] == 1
+    assert conn.execute("SELECT count(*) FROM memory_write_log").fetchone()[0] == 1
+    assert first.replayed is False
+
+
+def test_idempotent_replay_allows_branch_and_commit_to_advance():
+    conn = _connection()
+    service = _service(conn)
+    first = service.write(_context(branch="main", commit_sha="aaa"), _request())
+
+    replay = service.write(
+        _context(branch="feature", commit_sha="bbb"),
+        _request(),
+    )
+
+    assert replay.replayed is True
+    assert replay.write_id == first.write_id
+    assert conn.execute(
+        "SELECT branch, commit_sha FROM memory_sessions"
+    ).fetchone() == ("feature", "bbb")
 
 
 def test_existing_fact_result_attaches_new_evidence_without_reinserting():
@@ -195,13 +293,19 @@ def test_observation_evidence_can_differ_from_normalized_fact_claim():
         ),
     )
 
-    assert conn.execute(
-        "SELECT content FROM observations WHERE observation_id = ?",
-        (outcome.observation_id,),
-    ).fetchone()[0] == "pytest: 483 passed in 8.5 seconds"
-    assert conn.execute(
-        "SELECT content FROM facts WHERE fact_id = ?", (outcome.fact_id,)
-    ).fetchone()[0] == "The build passed."
+    assert (
+        conn.execute(
+            "SELECT content FROM observations WHERE observation_id = ?",
+            (outcome.observation_id,),
+        ).fetchone()[0]
+        == "pytest: 483 passed in 8.5 seconds"
+    )
+    assert (
+        conn.execute(
+            "SELECT content FROM facts WHERE fact_id = ?", (outcome.fact_id,)
+        ).fetchone()[0]
+        == "The build passed."
+    )
 
 
 def test_same_evidence_at_a_new_commit_is_a_distinct_observation():
@@ -237,7 +341,9 @@ def test_idempotency_is_per_client_and_changed_payload_conflicts():
     with pytest.raises(IdempotencyConflict):
         service.write(_context(), _request(content="A different fact"))
 
-    other = _context(client_id="client-b-install-1", surface="client-b", agent_id="client-b")
+    other = _context(
+        client_id="client-b-install-1", surface="client-b", agent_id="client-b"
+    )
     outcome = service.write(other, _request(content="Client B recorded this fact"))
     assert outcome.fact_id != 1
 
@@ -255,7 +361,7 @@ def test_stable_client_identity_cannot_be_rebound():
 def test_one_client_install_can_host_multiple_agents_in_distinct_sessions():
     conn = _connection()
     service = _service(conn)
-    service.write(_context(agent_id="wonny", session_id="main"), _request())
+    service.write(_context(agent_id="avery", session_id="main"), _request())
     service.write(
         _context(agent_id="delegate-1", session_id="delegate"),
         _request(idempotency_key="write-456", content="Delegate observation"),
@@ -263,7 +369,7 @@ def test_one_client_install_can_host_multiple_agents_in_distinct_sessions():
 
     assert conn.execute(
         "SELECT session_id, agent_id FROM memory_sessions ORDER BY session_id"
-    ).fetchall() == [("delegate", "delegate-1"), ("main", "wonny")]
+    ).fetchall() == [("delegate", "delegate-1"), ("main", "avery")]
 
 
 def test_session_branch_and_commit_can_advance_with_observation_provenance():
@@ -335,9 +441,7 @@ def test_writer_failure_rolls_back_entire_envelope():
     conn = _connection()
 
     def failing_writer(conn, request, observation_id):
-        conn.execute(
-            "INSERT INTO facts (content) VALUES (?)", (request.content,)
-        )
+        conn.execute("INSERT INTO facts (content) VALUES (?)", (request.content,))
         raise RuntimeError("fact writer failed")
 
     with pytest.raises(RuntimeError, match="fact writer failed"):
@@ -501,7 +605,7 @@ def test_human_correction_is_not_silently_superseded_by_automation():
     old_id = conn.execute(
         """INSERT INTO facts (
                content, source_authority, correction_status
-           ) VALUES ('Victor corrected this', 1.0, 'human_corrected')"""
+           ) VALUES ('Avery corrected this', 1.0, 'human_corrected')"""
     ).lastrowid
     conn.commit()
 
@@ -539,3 +643,66 @@ def test_higher_authority_target_requires_review_instead_of_overwrite():
     assert conn.execute(
         "SELECT invalid_at, superseded_by FROM facts WHERE fact_id = ?", (old_id,)
     ).fetchone() == (None, None)
+
+
+def test_near_dedup_preserves_a_human_corrected_candidate():
+    conn = _connection()
+    corrected_id = conn.execute(
+        """INSERT INTO facts (
+               content, trust_score, source_authority, correction_status
+           ) VALUES ('Avery uses Enfold locally.', 0.1, 0.1, 'human_corrected')"""
+    ).lastrowid
+    inserted_id = conn.execute(
+        """INSERT INTO facts (content, trust_score, source_authority)
+           VALUES ('Avery uses Enfold on this machine.', 0.9, 1.0)"""
+    ).lastrowid
+    conn.commit()
+
+    result, _enqueue = _service(conn)._merge_near_duplicate(
+        FactWriteResult(inserted_id),
+        NearDuplicateCandidate(corrected_id, 0.1, "2026-01-01T00:00:00Z", 0.99),
+        _request(content="Avery uses Enfold on this machine.", trust_score=0.9),
+        "2026-01-02T00:00:00Z",
+    )
+
+    assert result.fact_id == corrected_id
+    assert conn.execute(
+        "SELECT invalid_at, superseded_by FROM facts WHERE fact_id = ?", (corrected_id,)
+    ).fetchone() == (None, None)
+    assert conn.execute(
+        "SELECT superseded_by FROM facts WHERE fact_id = ?", (inserted_id,)
+    ).fetchone()[0] == corrected_id
+    conn.rollback()
+
+
+def test_near_dedup_preserves_a_higher_authority_candidate():
+    conn = _connection()
+    trusted_id = conn.execute(
+        """INSERT INTO facts (content, trust_score, source_authority)
+           VALUES ('Avery uses Enfold locally.', 0.1, 0.9)"""
+    ).lastrowid
+    inserted_id = conn.execute(
+        """INSERT INTO facts (content, trust_score, source_authority)
+           VALUES ('Avery uses Enfold on this machine.', 0.9, 0.4)"""
+    ).lastrowid
+    conn.commit()
+
+    result, _enqueue = _service(conn)._merge_near_duplicate(
+        FactWriteResult(inserted_id),
+        NearDuplicateCandidate(trusted_id, 0.1, "2026-01-01T00:00:00Z", 0.99),
+        _request(
+            content="Avery uses Enfold on this machine.",
+            trust_score=0.9,
+            source_authority=0.4,
+        ),
+        "2026-01-02T00:00:00Z",
+    )
+
+    assert result.fact_id == trusted_id
+    assert conn.execute(
+        "SELECT invalid_at, superseded_by FROM facts WHERE fact_id = ?", (trusted_id,)
+    ).fetchone() == (None, None)
+    assert conn.execute(
+        "SELECT superseded_by FROM facts WHERE fact_id = ?", (inserted_id,)
+    ).fetchone()[0] == trusted_id
+    conn.rollback()

@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly SERVER="${ENFOLD_HEALTH_SERVER:-$HOME/.local/share/enfold-v1/venv/bin/enfold-server}"
+readonly CONFIG="${ENFOLD_HEALTH_CONFIG:-$HOME/.config/enfold/server.json}"
+
+export PYTHONNOUSERSITE=1
+exec "$SERVER" \
+  --config "$CONFIG" \
+  --allow-live \
+  health \
+  --client-id healthcheck-install \
+  --surface operator-health \
+  --agent-id operator-health \
+  --access-scope public

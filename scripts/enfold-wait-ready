@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly SERVER="${ENFOLD_HEALTH_SERVER:-$HOME/.local/share/enfold-v1/venv/bin/enfold-server}"
+readonly CONFIG="${ENFOLD_HEALTH_CONFIG:-$HOME/.config/enfold/server.json}"
+readonly TIMEOUT_SECONDS="${ENFOLD_READY_TIMEOUT_SECONDS:-75}"
+readonly INTERVAL_SECONDS="${ENFOLD_READY_INTERVAL_SECONDS:-1}"
+
+if [[ ! "$TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] \
+  || [[ ! "$INTERVAL_SECONDS" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  printf 'readiness timeout and interval must be non-negative numbers\n' >&2
+  exit 2
+fi
+
+export PYTHONNOUSERSITE=1
+deadline="$((SECONDS + TIMEOUT_SECONDS))"
+while (( SECONDS <= deadline )); do
+  if "$SERVER" \
+    --config "$CONFIG" \
+    --allow-live \
+    health \
+    --client-id healthcheck-install \
+    --surface operator-health \
+    --agent-id operator-health \
+    --access-scope public \
+    --readiness \
+    >/dev/null
+  then
+    exit 0
+  fi
+  sleep "$INTERVAL_SECONDS"
+done
+
+printf 'Enfold did not become protocol-ready within %s seconds\n' \
+  "$TIMEOUT_SECONDS" >&2
+exit 1

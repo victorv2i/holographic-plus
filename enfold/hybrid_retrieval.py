@@ -12,6 +12,7 @@ import logging
 import math
 import re
 import sqlite3
+import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -19,17 +20,131 @@ from typing import Any, Protocol
 
 import numpy as np
 
-from .core_store import active_facts, search_fts
+from .core_store import build_visibility_predicate
 from .embeddings import bytes_to_embedding, embedding_to_bytes
 from .sqlite_vec_index import SQLiteVecIndex
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
-_WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]*")
-_SENTENCE_OPENERS = frozenset({
-    "A", "An", "Does", "How", "Is", "The", "What", "When", "Where",
-    "Which", "Who", "Why",
-})
+_WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]*|\d+")
+_MONTH_ALIASES = {
+    "jan": "january",
+    "feb": "february",
+    "mar": "march",
+    "apr": "april",
+    "jun": "june",
+    "jul": "july",
+    "aug": "august",
+    "sep": "september",
+    "sept": "september",
+    "oct": "october",
+    "nov": "november",
+    "dec": "december",
+}
+_SENTENCE_OPENERS = frozenset(
+    {
+        "A",
+        "An",
+        "Are",
+        "Can",
+        "Could",
+        "Did",
+        "Do",
+        "Does",
+        "Find",
+        "Give",
+        "How",
+        "I",
+        "Is",
+        "Kindly",
+        "May",
+        "Me",
+        "My",
+        "Our",
+        "Please",
+        "Should",
+        "Show",
+        "Tell",
+        "The",
+        "Us",
+        "Was",
+        "Were",
+        "What",
+        "When",
+        "Where",
+        "Which",
+        "Who",
+        "Whom",
+        "Whose",
+        "Why",
+        "Will",
+        "Would",
+        "You",
+        "Your",
+    }
+)
+_LEADING_REQUEST_VERBS = frozenset({"Find", "Give", "Show", "Tell"})
+_CANDIDATE_COLUMNS = (
+    "fact_id",
+    "content",
+    "category",
+    "tags",
+    "trust_score",
+    "retrieval_count",
+    "helpful_count",
+    "created_at",
+    "updated_at",
+    "valid_from",
+    "invalid_at",
+    "superseded_by",
+    "memory_kind",
+    "subject_key",
+    "predicate_key",
+    "object_value",
+    "object_entity_id",
+    "confidence",
+    "source_authority",
+    "scope",
+    "sensitivity",
+    "correction_status",
+    "schema_version",
+    "conflict_group",
+)
 LOGGER = logging.getLogger(__name__)
+
+
+class VectorFallbackTelemetry:
+    """Process-local, non-sensitive sqlite-vec fallback telemetry."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._count = 0
+        self._recovery_count = 0
+        self._active = False
+        self._last_reason: str | None = None
+
+    def record(self, reason: str) -> None:
+        with self._lock:
+            self._count += 1
+            self._active = True
+            self._last_reason = reason
+
+    def recover(self) -> None:
+        """Clear a transient active fallback after sqlite-vec is usable again."""
+
+        with self._lock:
+            if self._active:
+                self._active = False
+                self._recovery_count += 1
+                self._last_reason = None
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "vector_fallback_active": self._active,
+                "vector_fallback_count": self._count,
+                "vector_fallback_recovery_count": self._recovery_count,
+                "vector_last_fallback_reason": self._last_reason,
+            }
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +162,7 @@ class RankingConfig:
     fts_weight: float = 0.35
     jaccard_weight: float = 0.25
     dense_weight: float = 0.40
+    fts_query_coverage_weight: float = 0.75
     trust_weight: float = 0.05
     memory_kind_weight: float = 0.02
     recency_weight: float = 0.03
@@ -67,18 +183,28 @@ class RankingConfig:
             self.untyped_kind_score,
             self.event_kind_score,
         )
-        numeric_values = (*relevance, *priors, *kind_scores)
+        numeric_values = (
+            *relevance,
+            self.fts_query_coverage_weight,
+            *priors,
+            *kind_scores,
+        )
         if any(not math.isfinite(value) for value in numeric_values):
             raise ValueError("ranking weights and scores must be finite")
         if any(weight < 0 for weight in (*relevance, *priors)):
             raise ValueError("ranking weights must be non-negative")
         if not math.isclose(sum(relevance), 1.0):
             raise ValueError("relevance weights must sum to 1")
+        if not 0.0 <= self.fts_query_coverage_weight <= 1.0:
+            raise ValueError("FTS query-coverage weight must be between 0 and 1")
         if sum(priors) >= 1.0:
             raise ValueError("ranking prior weights must sum to less than 1")
         if any(not 0.0 <= score <= 1.0 for score in kind_scores):
             raise ValueError("memory kind scores must be between 0 and 1")
-        if not math.isfinite(self.recency_half_life_days) or self.recency_half_life_days <= 0:
+        if (
+            not math.isfinite(self.recency_half_life_days)
+            or self.recency_half_life_days <= 0
+        ):
             raise ValueError("recency half-life must be positive")
         if (
             not math.isfinite(self.score_floor)
@@ -88,7 +214,9 @@ class RankingConfig:
             or self.ambiguity_margin < 0
             or self.ambiguity_margin > 1
         ):
-            raise ValueError("ranking confidence gates must be finite and between 0 and 1")
+            raise ValueError(
+                "ranking confidence gates must be finite and between 0 and 1"
+            )
 
     @property
     def relevance_weight(self) -> float:
@@ -148,9 +276,14 @@ class SQLiteVersionedEmbeddingBackend:
     embedded documents or a deterministic CI vector.
     """
 
-    required_columns = frozenset({
-        "fact_id", "embedding", "dim", "embedding_identity",
-    })
+    required_columns = frozenset(
+        {
+            "fact_id",
+            "embedding",
+            "dim",
+            "embedding_identity",
+        }
+    )
 
     def __init__(
         self,
@@ -229,8 +362,11 @@ class SQLiteVersionedEmbeddingBackend:
               AND j.job_id IS NULL
             """,
             (
-                document_identity, dimensions, document_identity,
-                embedding_version, dimensions,
+                document_identity,
+                dimensions,
+                document_identity,
+                embedding_version,
+                dimensions,
             ),
         ).fetchone()
         if missing_active is not None and int(missing_active[0]) > 0:
@@ -278,7 +414,7 @@ class SQLiteVersionedEmbeddingBackend:
 
         loaded: dict[int, Sequence[float]] = {}
         for offset in range(0, len(fact_ids), self._sql_batch_size):
-            batch = fact_ids[offset:offset + self._sql_batch_size]
+            batch = fact_ids[offset : offset + self._sql_batch_size]
             placeholders = ",".join("?" for _ in batch)
             rows = self._conn.execute(
                 f"""
@@ -324,8 +460,10 @@ class SQLiteVersionedEmbeddingBackend:
                       AND fact_id IN ({placeholders})
                     """,
                     (
-                        self.document_identity, self.embedding_version,
-                        self.dimensions, *missing,
+                        self.document_identity,
+                        self.embedding_version,
+                        self.dimensions,
+                        *missing,
                     ),
                 ).fetchall()
             }
@@ -373,7 +511,9 @@ class SQLiteStoredEmbeddingWriter:
             raise ValueError("model fingerprint must equal embedding version")
         if prefix_policy == "none":
             if query_prefix or document_prefix:
-                raise ValueError("none prefix policy requires empty query/document prefixes")
+                raise ValueError(
+                    "none prefix policy requires empty query/document prefixes"
+                )
         elif prefix_policy.startswith("sha256-"):
             digest = hashlib.sha256(
                 f"{query_prefix}\0{document_prefix}".encode("utf-8")
@@ -530,7 +670,9 @@ class VersionedStoredEmbeddingAdapter:
 
     def _validate_vector(self, vector: Sequence[float], kind: str) -> None:
         if len(vector) != self.backend.dimensions:
-            raise ValueError(f"{kind} embedding dimensions do not match backend metadata")
+            raise ValueError(
+                f"{kind} embedding dimensions do not match backend metadata"
+            )
         if any(not math.isfinite(float(value)) for value in vector):
             raise ValueError(f"{kind} embedding contains a non-finite value")
 
@@ -546,6 +688,7 @@ def deterministic_retriever_factory(
     dense_weight: float = DEFAULT_RANKING_CONFIG.dense_weight,
     min_score: float = DEFAULT_RANKING_CONFIG.score_floor,
     vector_backend: str = "auto",
+    vector_fallback_telemetry: VectorFallbackTelemetry | None = None,
 ) -> RetrieverFactory:
     """Return an offline factory suitable for tests and explicit CI config."""
 
@@ -559,6 +702,7 @@ def deterministic_retriever_factory(
             dense_weight=dense_weight,
             min_score=min_score,
             vector_backend=vector_backend,
+            vector_fallback_telemetry=vector_fallback_telemetry,
         )
 
     return build
@@ -584,7 +728,9 @@ class DeterministicFeatureHashEmbedder:
         normalized = " ".join(_TOKEN_RE.findall(text.lower()))
         features = [f"w:{token}" for token in normalized.split()]
         compact = normalized.replace(" ", "_")
-        features.extend(f"c3:{compact[i:i + 3]}" for i in range(max(0, len(compact) - 2)))
+        features.extend(
+            f"c3:{compact[i : i + 3]}" for i in range(max(0, len(compact) - 2))
+        )
         vector = [0.0] * self.dimensions
         for feature in features:
             digest = hashlib.blake2b(feature.encode("utf-8"), digest_size=8).digest()
@@ -604,25 +750,65 @@ class DeterministicFeatureHashEmbedder:
 
 
 def named_anchor_tokens(text: str) -> frozenset[str]:
-    """Return explicit capitalized names that must occur in a result."""
+    """Return normalized explicit names that must occur in a result.
+
+    Anchor matching uses the same tokenizer as candidate matching.  Keeping a
+    hyphenated surface form such as ``GPT-5`` as one anchor could never match
+    candidate tokens (``gpt``, ``5``), causing a false fail-closed abstention.
+    The first-person pronoun is grammatical capitalization, not a name.
+    """
 
     words = _WORD_RE.findall(text)
-    return frozenset(
-        word.lower()
-        for index, word in enumerate(words)
-        if word[0].isupper()
-        and not (index == 0 and word in _SENTENCE_OPENERS)
-    )
+    anchors = []
+    for index, word in enumerate(words):
+        if word.isdigit() or not word[0].isupper() or word == "I":
+            continue
+        if index == 0 and word in _SENTENCE_OPENERS:
+            continue
+        if not anchors and word in _LEADING_REQUEST_VERBS:
+            continue
+        parts = re.split(r"[-_]", word)
+        anchors.extend(
+            token
+            for part_index, part in enumerate(parts)
+            if part and (part_index == 0 or part[0].isupper() or part.isdigit())
+            for token in _tokens(part)
+        )
+    return frozenset(anchors)
 
 
 def _tokens(text: str) -> frozenset[str]:
     return frozenset(_TOKEN_RE.findall(text.lower()))
 
 
+def _anchor_match_tokens(text: str) -> frozenset[str]:
+    """Return exact tokens plus normalized adjacent compound spellings."""
+
+    tokens = _TOKEN_RE.findall(text.lower())
+    matches = set(tokens)
+    for short, full in _MONTH_ALIASES.items():
+        if short in matches:
+            matches.add(full)
+        if full in matches:
+            matches.add(short)
+    for width in (2, 3):
+        matches.update(
+            "".join(tokens[offset : offset + width])
+            for offset in range(0, len(tokens) - width + 1)
+        )
+    return frozenset(matches)
+
+
 def _jaccard(left: frozenset[str], right: frozenset[str]) -> float:
     if not left or not right:
         return 0.0
     return len(left & right) / len(left | right)
+
+
+def _query_coverage(query: frozenset[str], document: frozenset[str]) -> float:
+    if not query:
+        return 0.0
+    return len(query & document) / len(query)
 
 
 def _cosine(left: Sequence[float], right: Sequence[float]) -> float:
@@ -636,8 +822,7 @@ def _cosine(left: Sequence[float], right: Sequence[float]) -> float:
     # public score to a built-in float so protocol JSON serialization cannot
     # fail only after dense coverage becomes complete.
     return float(
-        sum(a * b for a, b in zip(left, right, strict=True))
-        / (left_norm * right_norm)
+        sum(a * b for a, b in zip(left, right, strict=True)) / (left_norm * right_norm)
     )
 
 
@@ -661,7 +846,9 @@ def _as_utc(value: Any) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
-def _recency_score(row: Mapping[str, Any], now: datetime, half_life_days: float) -> float:
+def _recency_score(
+    row: Mapping[str, Any], now: datetime, half_life_days: float
+) -> float:
     timestamp = _as_utc(row.get("updated_at")) or _as_utc(row.get("created_at"))
     if timestamp is None:
         return 0.0
@@ -694,6 +881,7 @@ class HybridRetriever:
         vector_backend: str = "auto",
         ranking_config: RankingConfig = DEFAULT_RANKING_CONFIG,
         now: datetime | None = None,
+        vector_fallback_telemetry: VectorFallbackTelemetry | None = None,
     ):
         relevance_weights = (
             ranking_config.fts_weight if fts_weight is None else fts_weight,
@@ -705,8 +893,14 @@ class HybridRetriever:
             sum(relevance_weights), 1.0
         ):
             raise ValueError("retrieval weights must be non-negative and sum to 1")
-        if not math.isfinite(min_score) or not 0 <= min_score <= 1 or candidate_limit < 1:
-            raise ValueError("min_score must be between 0 and 1 and candidate_limit positive")
+        if (
+            not math.isfinite(min_score)
+            or not 0 <= min_score <= 1
+            or candidate_limit < 1
+        ):
+            raise ValueError(
+                "min_score must be between 0 and 1 and candidate_limit positive"
+            )
         if vector_backend not in {"auto", "sqlite-vec", "brute"}:
             raise ValueError("vector_backend must be auto, sqlite-vec, or brute")
         self._conn = conn
@@ -716,8 +910,13 @@ class HybridRetriever:
         self._ranking = ranking_config
         self._min_score = min_score
         self._candidate_limit = candidate_limit
+        self._vector_fallback_telemetry = (
+            vector_fallback_telemetry or VectorFallbackTelemetry()
+        )
         self._vector_index: SQLiteVecIndex | None = None
-        if vector_backend != "brute" and isinstance(embedder, VersionedStoredEmbeddingAdapter):
+        if vector_backend != "brute" and isinstance(
+            embedder, VersionedStoredEmbeddingAdapter
+        ):
             backend = embedder.backend
             document_identity = getattr(backend, "document_identity", None)
             if isinstance(document_identity, str):
@@ -727,6 +926,8 @@ class HybridRetriever:
                     backend.dimensions,
                     warn=True,
                 )
+        if self._vector_index is not None:
+            self._vector_fallback_telemetry.recover()
         clock = now or datetime.now(timezone.utc).replace(
             hour=0, minute=0, second=0, microsecond=0
         )
@@ -737,7 +938,9 @@ class HybridRetriever:
         self.metadata = {
             "retrieval_stack": "standalone_core_fts+jaccard+pluggable_dense",
             "embedder_identity": str(embedder.identity),
-            "embedder_production_ready": bool(getattr(embedder, "production_ready", True)),
+            "embedder_production_ready": bool(
+                getattr(embedder, "production_ready", True)
+            ),
             "filter_before_dense_ranking": True,
             "explicit_named_anchor_abstention": True,
             "natural_language_query_parser": "quoted_token_or_v1",
@@ -747,6 +950,11 @@ class HybridRetriever:
                 "dense_weight*cosine)+trust_weight*trust+"
                 "memory_kind_weight*memory_kind+recency_weight*recency"
             ),
+            "fts_score_formula": (
+                "(1-query_coverage_weight)*reciprocal_bm25_rank+"
+                "query_coverage_weight*distinct_query_token_coverage"
+            ),
+            "fts_query_coverage_weight": ranking_config.fts_query_coverage_weight,
             "weights": {
                 "relevance": ranking_config.relevance_weight,
                 "fts": relevance_weights[0],
@@ -761,6 +969,15 @@ class HybridRetriever:
             "recency_half_life_days": ranking_config.recency_half_life_days,
             "vector_backend_config": vector_backend,
             "vector_backend": "sqlite-vec" if self._vector_index else "brute",
+            "dense_candidate_coverage": (
+                "global" if self._vector_index is not None else "bounded"
+            ),
+            "candidate_generation": (
+                "global-index-plus-lexical"
+                if self._vector_index is not None
+                else "recent-plus-lexical"
+            ),
+            **self._vector_fallback_telemetry.snapshot(),
         }
         self.metadata.update(dict(getattr(embedder, "metadata", {})))
 
@@ -780,7 +997,7 @@ class HybridRetriever:
             return {}
         loaded: dict[int, tuple[float, ...]] = {}
         for offset in range(0, len(fact_ids), 500):
-            batch = fact_ids[offset:offset + 500]
+            batch = fact_ids[offset : offset + 500]
             placeholders = ",".join("?" for _ in batch)
             rows = self._conn.execute(
                 f"""
@@ -793,9 +1010,8 @@ class HybridRetriever:
             ).fetchall()
             for row in rows:
                 blob = row[1]
-                if (
-                    int(row[2]) != dimensions
-                    or not isinstance(blob, bytes | bytearray | memoryview)
+                if int(row[2]) != dimensions or not isinstance(
+                    blob, bytes | bytearray | memoryview
                 ):
                     continue
                 try:
@@ -820,41 +1036,168 @@ class HybridRetriever:
         if not query or limit <= 0:
             return []
 
-        # This SQL boundary excludes invalid, superseded, conflicted, and
-        # out-of-scope facts.  Trust filtering and named-anchor abstention also
-        # happen before document text reaches the dense embedder.
-        candidates = active_facts(
-            self._conn,
-            allowed_scopes=self._allowed_scopes,
-            category=category,
-            limit=self._candidate_limit,
+        columns = frozenset(
+            str(row[1])
+            for row in self._conn.execute("PRAGMA table_info(facts)").fetchall()
         )
-        candidates = [row for row in candidates if float(row.get("trust_score") or 0.0) >= min_trust]
+        active_predicates = [
+            f"{name} IS NULL"
+            for name in ("invalid_at", "superseded_by", "conflict_group")
+            if name in columns
+        ]
+        scope_sql, scope_params = build_visibility_predicate(
+            self._allowed_scopes,
+            scope_column_available="scope" in columns,
+            sensitivity_column_available="sensitivity" in columns,
+        )
+        active_predicates.append(scope_sql)
+        active_params: list[Any] = list(scope_params)
+        if category is not None:
+            active_predicates.append("category = ?")
+            active_params.append(category)
+        active_predicates.append("trust_score >= ?")
+        active_params.append(min_trust)
+
+        fts_scores: dict[int, float] = {}
+        fts_ids: list[int] = []
+        fts_query = _fts_query(query)
+        global_index_mode = self._vector_index is not None
+        if fts_query:
+            fts_predicates = ["facts_fts MATCH ?"]
+            fts_predicates.extend(
+                f"f.{name} IS NULL"
+                for name in ("invalid_at", "superseded_by", "conflict_group")
+                if name in columns
+            )
+            fts_scope_sql, fts_scope_params = build_visibility_predicate(
+                self._allowed_scopes,
+                scope_column="f.scope",
+                sensitivity_column="f.sensitivity",
+                scope_column_available="scope" in columns,
+                sensitivity_column_available="sensitivity" in columns,
+            )
+            fts_predicates.append(fts_scope_sql)
+            fts_params: list[Any] = [fts_query, *fts_scope_params]
+            if category is not None:
+                fts_predicates.append("f.category = ?")
+                fts_params.append(category)
+            fts_predicates.append("f.trust_score >= ?")
+            fts_params.append(min_trust)
+            fts_limit_sql = ""
+            if not global_index_mode:
+                fts_limit_sql = "LIMIT ?"
+                fts_params.append(self._candidate_limit)
+            rows = self._conn.execute(
+                f"""
+                SELECT f.fact_id
+                FROM facts_fts
+                JOIN facts AS f ON f.fact_id = facts_fts.rowid
+                WHERE {" AND ".join(fts_predicates)}
+                ORDER BY bm25(facts_fts), f.fact_id DESC
+                {fts_limit_sql}
+                """,
+                fts_params,
+            ).fetchall()
+            for rank, row in enumerate(rows):
+                fact_id = int(row[0])
+                fts_ids.append(fact_id)
+                fts_scores[fact_id] = 1.0 / (rank + 1.0)
+
+        query_vector: Sequence[float] | None = None
+        dense_scores: dict[int, float] | None = None
+        dense_ids: list[int] = []
+        if self._vector_index is not None:
+            # sqlite-vec holds every canonical vector, while authorization and
+            # lifecycle state live in ``facts``. Score the complete eligible
+            # set exactly, then take the global dense window. This removes the
+            # former newest-N gate that made old semantic-only memories
+            # unreachable once the store grew past ``candidate_limit``.
+            eligible_rows = self._conn.execute(
+                f"SELECT f.fact_id, f.content, f.tags FROM facts AS f "
+                "JOIN fact_embeddings AS e ON e.fact_id = f.fact_id "
+                "AND e.embedding_identity = ? AND e.dim = ? WHERE "
+                f"{' AND '.join(active_predicates)}",
+                (
+                    self._vector_index.identity,
+                    self._vector_index.dimensions,
+                    *active_params,
+                ),
+            ).fetchall()
+            anchors = named_anchor_tokens(query)
+            eligible_ids = [
+                int(row["fact_id"])
+                for row in eligible_rows
+                if not anchors
+                or anchors <= _anchor_match_tokens(f"{row['content']} {row['tags']}")
+            ]
+            if eligible_ids:
+                query_vector = self._embedder.embed_query(query)
+                try:
+                    dense_scores = self._vector_index.scores(query_vector, eligible_ids)
+                    dense_ids = [
+                        fact_id
+                        for fact_id, _ in sorted(
+                            dense_scores.items(), key=lambda item: (-item[1], item[0])
+                        )
+                    ]
+                except Exception as exc:
+                    LOGGER.warning(
+                        "sqlite-vec health warning: %s; falling back to brute", exc
+                    )
+                    self._vector_index = None
+                    self.metadata["vector_backend"] = "brute"
+                    self.metadata["dense_candidate_coverage"] = "bounded"
+                    self.metadata["candidate_generation"] = "recent-plus-lexical"
+                    self._vector_fallback_telemetry.record("sqlite_vec_query_error")
+                    self.metadata.update(self._vector_fallback_telemetry.snapshot())
+                    dense_scores = None
+                    fts_ids = fts_ids[: self._candidate_limit]
+                    fts_scores = {fact_id: fts_scores[fact_id] for fact_id in fts_ids}
+        if dense_scores is None:
+            dense_ids = [
+                int(row[0])
+                for row in self._conn.execute(
+                    f"SELECT fact_id FROM facts WHERE {' AND '.join(active_predicates)} "
+                    "ORDER BY fact_id DESC LIMIT ?",
+                    (*active_params, self._candidate_limit),
+                ).fetchall()
+            ]
+
+        candidate_ids = tuple(dict.fromkeys((*dense_ids, *fts_ids)))
+        if not candidate_ids:
+            return []
+        selected_columns = tuple(name for name in _CANDIDATE_COLUMNS if name in columns)
+        loaded: dict[int, dict[str, Any]] = {}
+        for offset in range(0, len(candidate_ids), 500):
+            batch = candidate_ids[offset : offset + 500]
+            placeholders = ",".join("?" for _ in batch)
+            rows = self._conn.execute(
+                f"SELECT {', '.join(selected_columns)} FROM facts "
+                f"WHERE fact_id IN ({placeholders}) "
+                f"AND {' AND '.join(active_predicates)}",
+                (*batch, *active_params),
+            ).fetchall()
+            loaded.update((int(row["fact_id"]), dict(row)) for row in rows)
+        candidates = [loaded[fact_id] for fact_id in candidate_ids if fact_id in loaded]
+
+        # Trust, lifecycle, and scope filtering happened before document text
+        # reaches the dense embedder. Named anchors fail closed at the same boundary.
         anchors = named_anchor_tokens(query)
         if anchors:
             candidates = [
-                row for row in candidates
-                if anchors <= _tokens(f"{row.get('content', '')} {row.get('tags', '')}")
+                row
+                for row in candidates
+                if anchors
+                <= _anchor_match_tokens(
+                    f"{row.get('content', '')} {row.get('tags', '')}"
+                )
             ]
         if not candidates:
             return []
 
-        fts_scores: dict[int, float] = {}
-        fts_query = _fts_query(query)
-        if fts_query:
-            for rank, row in enumerate(search_fts(
-                self._conn,
-                fts_query,
-                allowed_scopes=self._allowed_scopes,
-                category=category,
-                min_trust=min_trust,
-                limit=self._candidate_limit,
-            )):
-                fts_scores[int(row["fact_id"])] = 1.0 / (rank + 1.0)
-
-        query_vector = self._embedder.embed_query(query)
-        dense_scores: dict[int, float] | None = None
-        if self._vector_index is not None:
+        if query_vector is None:
+            query_vector = self._embedder.embed_query(query)
+        if dense_scores is None and self._vector_index is not None:
             try:
                 dense_scores = self._vector_index.scores(
                     query_vector, tuple(int(row["fact_id"]) for row in candidates)
@@ -869,6 +1212,10 @@ class HybridRetriever:
                 )
                 self._vector_index = None
                 self.metadata["vector_backend"] = "brute"
+                self.metadata["dense_candidate_coverage"] = "bounded"
+                self.metadata["candidate_generation"] = "recent-plus-lexical"
+                self._vector_fallback_telemetry.record("sqlite_vec_query_error")
+                self.metadata.update(self._vector_fallback_telemetry.snapshot())
         document_vectors: Sequence[Sequence[float]] = ()
         if dense_scores is None:
             candidate_embedder = getattr(self._embedder, "embed_candidates", None)
@@ -879,7 +1226,9 @@ class HybridRetriever:
                     tuple(str(row["content"]) for row in candidates)
                 )
             if len(document_vectors) != len(candidates):
-                raise ValueError("embedder returned the wrong number of document vectors")
+                raise ValueError(
+                    "embedder returned the wrong number of document vectors"
+                )
 
         query_tokens = _tokens(query)
         fts_weight, jaccard_weight, dense_weight = self._weights
@@ -887,10 +1236,22 @@ class HybridRetriever:
         ranked: list[tuple[float, int, dict[str, Any]]] = []
         for position, row in enumerate(candidates):
             fact_id = int(row["fact_id"])
-            fts_score = fts_scores.get(fact_id, 0.0)
-            jaccard_score = _jaccard(query_tokens, _tokens(str(row["content"])))
+            # Tags can broaden FTS candidate recall, but only terms asserted in
+            # the fact content count as evidence that the question is covered.
+            # This keeps descriptive metadata from inflating lexical relevance.
+            document_tokens = _tokens(str(row["content"]))
+            fts_score = (
+                (
+                    (1.0 - ranking.fts_query_coverage_weight) * fts_scores[fact_id]
+                    + ranking.fts_query_coverage_weight
+                    * _query_coverage(query_tokens, document_tokens)
+                )
+                if fact_id in fts_scores
+                else 0.0
+            )
+            jaccard_score = _jaccard(query_tokens, document_tokens)
             dense_score = (
-                dense_scores[fact_id]
+                dense_scores.get(fact_id, 0.0)
                 if dense_scores is not None
                 else max(0.0, _cosine(query_vector, document_vectors[position]))
             )
@@ -918,18 +1279,26 @@ class HybridRetriever:
                 else None
             )
             result = dict(row)
-            result.update({
-                "score": score,
-                "_mmr_embedding": vector,
-                "fts_score": fts_score,
-                "jaccard_score": jaccard_score,
-                "dense_score": dense_score,
-                "trust_score_component": trust_score,
-                "memory_kind_score": memory_kind_score,
-                "recency_score": recency_score,
-            })
+            result.update(
+                {
+                    "score": score,
+                    "_mmr_embedding": vector,
+                    "fts_score": fts_score,
+                    "jaccard_score": jaccard_score,
+                    "dense_score": dense_score,
+                    "trust_score_component": trust_score,
+                    "memory_kind_score": memory_kind_score,
+                    "recency_score": recency_score,
+                }
+            )
             ranked.append((score, fact_id, result))
-        ranked.sort(key=lambda item: (-item[0], -float(item[2].get("trust_score") or 0.0), item[1]))
+        ranked.sort(
+            key=lambda item: (
+                -item[0],
+                -float(item[2].get("trust_score") or 0.0),
+                item[1],
+            )
+        )
         # A near-tie is ambiguous: returning the deterministic fact-id winner
         # would manufacture confidence from a tie-breaker.  Fail closed instead.
         if len(ranked) > 1 and ranked[0][0] - ranked[1][0] < ranking.ambiguity_margin:

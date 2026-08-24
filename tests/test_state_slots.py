@@ -10,6 +10,7 @@ from enfold.state_slots import (
     current_state_facts,
     decide_state_write,
     ensure_state_slot_schema,
+    list_state_conflicts,
     open_state_conflict,
     resolve_state_conflict,
 )
@@ -101,6 +102,30 @@ def test_schema_replaces_pre_scope_slot_index():
             'PRAGMA index_info("uq_facts_current_state_slot")'
         )
     ) == ("scope", "subject_key", "predicate_key")
+
+
+def test_schema_replaces_nonunique_nonpartial_slot_index():
+    conn = _connection()
+    ensure_state_slot_schema(conn)
+    conn.execute("DROP INDEX uq_facts_current_state_slot")
+    conn.execute(
+        "CREATE INDEX uq_facts_current_state_slot "
+        "ON facts(scope, subject_key, predicate_key)"
+    )
+
+    assert ensure_state_slot_schema(conn) is True
+    index = next(
+        row
+        for row in conn.execute("PRAGMA index_list(facts)")
+        if row[1] == "uq_facts_current_state_slot"
+    )
+    assert (index[2], index[4]) == (1, 1)
+    sql = conn.execute(
+        "SELECT tbl_name, sql FROM sqlite_master WHERE type='index' AND name=?",
+        ("uq_facts_current_state_slot",),
+    ).fetchone()
+    assert sql[0] == "facts"
+    assert "WHERE memory_kind = 'state'" in sql[1]
 
 
 def test_partial_invariant_is_skipped_without_temporal_columns():
@@ -235,7 +260,7 @@ def test_conflict_lifecycle_is_visible_and_resolution_is_audited():
         conn,
         conflict.conflict_id,
         new_id,
-        resolved_by="victor",
+        resolved_by="avery",
         reason="confirmed from inspected config",
         resolved_at="2026-07-11T13:00:00Z",
     )
@@ -246,7 +271,7 @@ def test_conflict_lifecycle_is_visible_and_resolution_is_audited():
            FROM fact_conflicts WHERE conflict_id = ?""",
         (conflict.conflict_id,),
     ).fetchone()
-    assert audit == (new_id, "victor", "confirmed from inspected config")
+    assert audit == (new_id, "avery", "confirmed from inspected config")
     assert conn.execute(
         "SELECT superseded_by FROM facts WHERE fact_id = ?", (old_id,)
     ).fetchone()[0] == new_id
@@ -258,3 +283,30 @@ def test_unique_projection_rejects_two_nonconflicted_current_values():
     _insert_state(conn, "Uses v1")
     with pytest.raises(sqlite3.IntegrityError):
         _insert_state(conn, "Uses v2")
+
+
+def test_conflict_listing_is_bounded_and_supports_sql_pagination():
+    conn = _connection()
+    ensure_state_slot_schema(conn)
+    for number in range(205):
+        fact_id = conn.execute(
+            "INSERT INTO facts(content) VALUES (?)", (f"fact {number}",)
+        ).lastrowid
+        conflict_id = f"conflict-{number:03d}"
+        conn.execute(
+            "INSERT INTO fact_conflicts("
+            "conflict_id, subject_key, predicate_key, detected_at"
+            ") VALUES (?, 'person:avery', 'status', ?)",
+            (conflict_id, f"2026-07-20T00:{number // 60:02d}:{number % 60:02d}Z"),
+        )
+        conn.execute(
+            "INSERT INTO fact_conflict_members(conflict_id, fact_id) VALUES (?, ?)",
+            (conflict_id, fact_id),
+        )
+
+    assert len(list_state_conflicts(conn)) == 200
+    page = list_state_conflicts(conn, limit=2, offset=200)
+    assert tuple(record.conflict_id for record in page) == (
+        "conflict-200",
+        "conflict-201",
+    )

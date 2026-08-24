@@ -11,7 +11,7 @@ from enfold import (
 
 
 def test_identical_is_duplicate():
-    s = "CourseKit was described as stalled in the 2026-06-24 LDI discussion."
+    s = "Project Atlas was described as stalled in the weekly planning discussion."
     assert _is_near_duplicate(s, s, 0.9) is True
 
 

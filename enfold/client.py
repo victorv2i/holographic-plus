@@ -7,7 +7,7 @@ past the daemon's idle timeout and makes reconnect behavior explicit.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import os
 from pathlib import Path
 import socket
@@ -71,6 +71,7 @@ class ClientConfig:
     connect_timeout: float = 2.0
     request_timeout: float = 5.0
     max_frame_bytes: int = MAX_FRAME_SIZE
+    credential: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "socket_path", Path(self.socket_path))
@@ -93,8 +94,10 @@ class ClientConfig:
             capabilities=self.capabilities,
             protocol=self.protocol,
             schema_version=self.schema_version,
+            credential=self.credential,
         )
         object.__setattr__(self, "capabilities", validated.capabilities)
+        object.__setattr__(self, "credential", validated.credential)
 
 
 class EnfoldClient:
@@ -158,6 +161,7 @@ class EnfoldClient:
             capabilities=self.config.capabilities,
             protocol=self.config.protocol,
             schema_version=self.config.schema_version,
+            credential=self.config.credential,
         )
 
     def _send(self, client: socket.socket, frame: Frame) -> None:

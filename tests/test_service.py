@@ -6,13 +6,15 @@ import sqlite3
 import numpy as np
 import pytest
 
+from enfold.core_store import insert_fact
 from enfold.policy import MemoryPolicy
 from enfold.extraction_enqueue import ExtractionEnqueuer
 from enfold.embeddings import embedding_to_bytes
 from enfold.hybrid_retrieval import HybridRetriever
 from enfold.protocol import ClientContext, Request
 from enfold.schema import migrate
-from enfold.service import EnfoldService, ServiceRequestError
+from enfold.service import EnfoldService, MAX_WRITE_TEXT_BYTES, ServiceRequestError
+from enfold.state_slots import open_state_conflict
 
 
 def _store(tmp_path) -> sqlite3.Connection:
@@ -66,6 +68,67 @@ def _write(
     )
 
 
+@pytest.mark.parametrize("field", ["content", "observation_content"])
+def test_write_text_over_service_byte_limit_is_typed_validation_error(
+    tmp_path, field
+):
+    conn = _store(tmp_path)
+    service = EnfoldService(conn, MemoryPolicy({"terminal-install": ("private",)}))
+    context = _context("terminal-install", "terminal", "terminal", scopes=("private",))
+    oversized = "é" * (MAX_WRITE_TEXT_BYTES // 2 + 1)
+    params = {
+        "idempotency_key": f"oversized-{field}",
+        "content": "Small fact text.",
+        "source_type": "agent_report",
+        field: oversized,
+    }
+
+    with pytest.raises(ServiceRequestError, match="UTF-8 bytes") as rejected:
+        service.handle(context, _request("oversized", "memory.write", **params))
+
+    assert rejected.value.code == "invalid_params"
+    assert conn.execute("SELECT count(*) FROM facts").fetchone()[0] == 0
+    conn.close()
+
+
+def test_atomic_write_batch_rolls_back_prior_write_on_policy_rejection(tmp_path):
+    conn = _store(tmp_path)
+    service = EnfoldService(conn, MemoryPolicy({"terminal-install": ("private",)}))
+    context = _context("terminal-install", "terminal", "terminal", scopes=("private",))
+    requests = (
+        _request(
+            "batch-1",
+            "memory.write",
+            idempotency_key="batch-1",
+            content="A valid first batch fact.",
+            source_type="automatic_extraction",
+        ),
+        _request(
+            "batch-2",
+            "memory.write",
+            idempotency_key="batch-2",
+            content="api_key = abcdefghijklmnopqrstuv",
+            source_type="automatic_extraction",
+        ),
+    )
+
+    batch = service.handle_write_batch(context, requests)
+
+    assert batch.committed is False
+    assert [response["outcome"] for response in batch.responses] == [
+        "inserted",
+        "rejected",
+    ]
+    for table in (
+        "facts",
+        "observations",
+        "fact_provenance",
+        "memory_write_log",
+    ):
+        assert conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0] == 0
+    conn.close()
+
+
 @pytest.mark.parametrize(
     ("near_dedup_enabled", "expected_outcome", "expected_history_size"),
     [(True, "near_dedup", 2), (False, "inserted", 1)],
@@ -77,12 +140,12 @@ def test_service_near_duplicate_merge_and_off_switch(
     identity = "fake:service:document:none:v1"
     service = EnfoldService(
         conn,
-        MemoryPolicy({"codex-install": ("private",)}),
+        MemoryPolicy({"terminal-install": ("private",)}),
         embedding_identity=identity,
         query_embedder=lambda _content: np.asarray((1.0, 0.0), dtype=np.float32),
         near_dedup_enabled=near_dedup_enabled,
     )
-    context = _context("codex-install", "codex", "codex", scopes=("private",))
+    context = _context("terminal-install", "terminal", "terminal", scopes=("private",))
     existing = _write(
         service, context, "existing", "The build uses port 3100.", trust_score=0.8
     )
@@ -137,7 +200,7 @@ def setup(tmp_path):
     contexts = {
         "client-a": _context("client-a-install", "client-a", "client-a"),
         "client-b": _context("client-b-install", "client-b", "client-b"),
-        "hermes": _context("hermes-install", "hermes", "wonny"),
+        "hermes": _context("hermes-install", "hermes", "avery"),
     }
     yield conn, service, contexts
     conn.close()
@@ -155,9 +218,30 @@ def test_cross_agent_writes_have_trusted_client_and_hermes_provenance(setup):
            FROM observations ORDER BY observation_id"""
     ).fetchall()
     assert [tuple(row) for row in rows] == [
-        ("client-a-install", "client-a-session", "client-a", "enfold", "service-layer", "abc123"),
-        ("client-b-install", "client-b-session", "client-b", "enfold", "service-layer", "abc123"),
-        ("hermes-install", "wonny-session", "wonny", "enfold", "service-layer", "abc123"),
+        (
+            "client-a-install",
+            "client-a-session",
+            "client-a",
+            "enfold",
+            "service-layer",
+            "abc123",
+        ),
+        (
+            "client-b-install",
+            "client-b-session",
+            "client-b",
+            "enfold",
+            "service-layer",
+            "abc123",
+        ),
+        (
+            "hermes-install",
+            "avery-session",
+            "avery",
+            "enfold",
+            "service-layer",
+            "abc123",
+        ),
     ]
     for name, result in outcomes.items():
         evidence = service.handle(
@@ -201,9 +285,12 @@ def test_server_grants_narrow_reads_and_writes_without_cross_scope_oracles(setup
     )
     assert rejected["outcome"] == "rejected"
     assert rejected["fact_id"] is None
-    assert conn.execute(
-        "SELECT COUNT(*) FROM facts WHERE fact_id = ?", (work["fact_id"],)
-    ).fetchone()[0] == 1
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM facts WHERE fact_id = ?", (work["fact_id"],)
+        ).fetchone()[0]
+        == 1
+    )
 
     with pytest.raises(ServiceRequestError, match="not found") as hidden:
         service.handle(
@@ -211,6 +298,257 @@ def test_server_grants_narrow_reads_and_writes_without_cross_scope_oracles(setup
             _request("evidence-hidden", "memory.evidence", fact_id=work["fact_id"]),
         )
     assert hidden.value.code == "not_found"
+
+
+def test_sensitive_facts_require_matching_capability_on_every_read_surface(tmp_path):
+    conn = _store(tmp_path)
+    policy = MemoryPolicy(
+        {
+            "sensitive-install": ("private", "sensitive"),
+            "ordinary-install": ("private",),
+        }
+    )
+    service = EnfoldService(conn, policy)
+    sensitive_context = _context(
+        "sensitive-install",
+        "terminal",
+        "terminal",
+        scopes=("private", "sensitive"),
+    )
+    ordinary_context = _context(
+        "ordinary-install", "terminal", "terminal", scopes=("private",)
+    )
+    sensitive_not_requested = _context(
+        "sensitive-install",
+        "terminal",
+        "terminal",
+        scopes=("private",),
+        session="terminal-not-sensitive",
+    )
+    rejected = _write(
+        service,
+        sensitive_not_requested,
+        "sensitive-capability-not-requested",
+        "Avery hidden deployment plan",
+        scope="private",
+        sensitivity="sensitive",
+    )
+    assert rejected["outcome"] == "rejected"
+    assert rejected["fact_id"] is None
+    stored = _write(
+        service,
+        sensitive_context,
+        "sensitive-private",
+        "Avery sensitive deployment planning",
+        scope="private",
+        sensitivity="sensitive",
+    )
+
+    assert service.handle(
+        ordinary_context,
+        _request("search-sensitive", "memory.search", query="deployment planning"),
+    )["facts"] == []
+    assert service.handle(
+        ordinary_context,
+        _request(
+            "context-sensitive",
+            "memory.context",
+            query="deployment planning",
+            token_budget=256,
+        ),
+    )["facts"] == []
+    for method in ("memory.evidence", "memory.history"):
+        with pytest.raises(ServiceRequestError, match="not found") as hidden:
+            service.handle(
+                ordinary_context,
+                _request(f"hidden-{method}", method, fact_id=stored["fact_id"]),
+            )
+        assert hidden.value.code == "not_found"
+
+    visible = service.handle(
+        sensitive_context,
+        _request("visible-sensitive", "memory.evidence", fact_id=stored["fact_id"]),
+    )
+    assert visible["fact"]["fact_id"] == stored["fact_id"]
+    conn.close()
+
+
+def test_sensitive_provenance_requires_matching_capability(tmp_path):
+    conn = _store(tmp_path)
+    policy = MemoryPolicy(
+        {
+            "sensitive-install": ("private", "sensitive"),
+            "ordinary-install": ("private",),
+        }
+    )
+    service = EnfoldService(conn, policy)
+    sensitive_context = _context(
+        "sensitive-install",
+        "terminal",
+        "terminal",
+        scopes=("private", "sensitive"),
+    )
+    ordinary_context = _context(
+        "ordinary-install", "terminal", "terminal", scopes=("private",)
+    )
+    normal = _write(
+        service,
+        ordinary_context,
+        "normal-observation",
+        "Avery uses Enfold for shared memory",
+    )
+    _write(
+        service,
+        sensitive_context,
+        "sensitive-observation",
+        "Avery uses Enfold for shared memory",
+        sensitivity="sensitive",
+    )
+
+    ordinary = service.handle(
+        ordinary_context,
+        _request("ordinary-evidence", "memory.evidence", fact_id=normal["fact_id"]),
+    )
+    assert [item["client_id"] for item in ordinary["evidence"]] == [
+        "ordinary-install"
+    ]
+    ordinary_search = service.handle(
+        ordinary_context,
+        _request("ordinary-search", "memory.search", query="shared memory"),
+    )["facts"]
+    assert ordinary_search[0]["attribution"]["performed_by"] == "terminal"
+    assert ordinary_search[0]["attribution"]["evidence_count"] == 1
+
+    privileged = service.handle(
+        sensitive_context,
+        _request(
+            "privileged-evidence", "memory.evidence", fact_id=normal["fact_id"]
+        ),
+    )
+    assert {item["client_id"] for item in privileged["evidence"]} == {
+        "ordinary-install",
+        "sensitive-install",
+    }
+    conn.close()
+
+
+def test_history_filters_sensitive_successors_from_visible_anchor(tmp_path):
+    conn = _store(tmp_path)
+    policy = MemoryPolicy(
+        {
+            "sensitive-install": ("private", "sensitive"),
+            "ordinary-install": ("private",),
+        }
+    )
+    service = EnfoldService(conn, policy)
+    ordinary_context = _context(
+        "ordinary-install", "terminal", "terminal", scopes=("private",)
+    )
+    sensitive_context = _context(
+        "sensitive-install",
+        "terminal",
+        "terminal",
+        scopes=("private", "sensitive"),
+    )
+    state = {"subject_key": "project:enfold", "predicate_key": "release_plan"}
+    normal = _write(
+        service,
+        ordinary_context,
+        "normal-history",
+        "Enfold release plan is an alpha",
+        state={**state, "object_value": "alpha", "valid_from": "2026-08-01T00:00:00Z"},
+    )
+    _write(
+        service,
+        sensitive_context,
+        "sensitive-history",
+        "Enfold release plan has a sensitive codename",
+        sensitivity="sensitive",
+        state={
+            **state,
+            "object_value": "sensitive-codename",
+            "valid_from": "2026-08-02T00:00:00Z",
+        },
+    )
+
+    ordinary = service.handle(
+        ordinary_context,
+        _request("ordinary-history", "memory.history", fact_id=normal["fact_id"]),
+    )
+    assert [fact["fact_id"] for fact in ordinary["facts"]] == [normal["fact_id"]]
+    privileged = service.handle(
+        sensitive_context,
+        _request("privileged-history", "memory.history", fact_id=normal["fact_id"]),
+    )
+    assert len(privileged["facts"]) == 2
+    conn.close()
+
+
+def test_conflict_reads_require_visible_member_sensitivity(tmp_path):
+    conn = _store(tmp_path)
+    fact_id = insert_fact(
+        conn,
+        "Enfold release codename is sensitive",
+        scope="private",
+        sensitivity="sensitive",
+        memory_kind="state",
+        subject_key="project:enfold",
+        predicate_key="release_codename",
+    )
+    conflict = open_state_conflict(
+        conn,
+        "project:enfold",
+        "release_codename",
+        (fact_id,),
+        scope="private",
+    )
+    conn.commit()
+    service = EnfoldService(
+        conn,
+        MemoryPolicy(
+            {
+                "sensitive-install": ("private", "sensitive"),
+                "ordinary-install": ("private",),
+            },
+            conflict_resolution_authorities=(
+                "sensitive-install",
+                "ordinary-install",
+            ),
+        ),
+    )
+    ordinary_context = _context(
+        "ordinary-install", "terminal", "terminal", scopes=("private",)
+    )
+    sensitive_context = _context(
+        "sensitive-install",
+        "terminal",
+        "terminal",
+        scopes=("private", "sensitive"),
+    )
+
+    assert service.handle(
+        ordinary_context,
+        _request("ordinary-conflicts", "memory.conflicts"),
+    )["conflicts"] == []
+    with pytest.raises(ServiceRequestError, match="not found") as hidden_resolution:
+        service.handle(
+            ordinary_context,
+            _request(
+                "ordinary-resolution",
+                "memory.resolve_conflict",
+                conflict_id=conflict.conflict_id,
+                resolution_fact_id=fact_id,
+                reason="must not resolve a hidden conflict",
+            ),
+        )
+    assert hidden_resolution.value.code == "not_found"
+    privileged = service.handle(
+        sensitive_context,
+        _request("sensitive-conflicts", "memory.conflicts"),
+    )["conflicts"]
+    assert privileged[0]["conflict_id"] == conflict.conflict_id
+    assert privileged[0]["members"][0]["fact_id"] == fact_id
+    conn.close()
 
 
 def test_search_answers_who_did_or_learned_with_visible_only_attribution(setup):
@@ -311,48 +649,65 @@ def test_state_and_attribution_fields_are_credential_screened(setup):
         contexts["client-a"],
         "screen-state",
         "An otherwise harmless claim",
-        asserted_by="Victor",
+        asserted_by="Avery",
         state={
             "subject_key": "service:database",
             "predicate_key": "connection",
-            "object_value": "postgresql://user:password123@example.test/db",
+            "object_value": (
+                "postgresql://user:" + "password123" + "@example.test/db"
+            ),
         },
     )
     assert result["outcome"] == "rejected"
     assert result["fact_id"] is None
     assert conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0] == before
-    assert "password123" not in conn.execute(
-        "SELECT detail_json FROM memory_write_log WHERE idempotency_key = 'screen-state'"
-    ).fetchone()[0]
+    assert (
+        "password123"
+        not in conn.execute(
+            "SELECT detail_json FROM memory_write_log WHERE idempotency_key = 'screen-state'"
+        ).fetchone()[0]
+    )
 
 
 def test_state_supersession_conflict_history_evidence_and_settled_search(setup):
     _conn, service, contexts = setup
-    state = {"subject_key": "agent:wonny", "predicate_key": "preferred_model"}
+    state = {"subject_key": "agent:avery", "predicate_key": "preferred_model"}
     first = _write(
         service,
         contexts["hermes"],
         "state-1",
-        "Wonny prefers model Terra 5.5",
+        "Avery prefers model Terra 5.5",
         source_authority=0.8,
-        state={**state, "object_value": "terra-5.5", "valid_from": "2026-07-11T10:00:00Z"},
+        state={
+            **state,
+            "object_value": "terra-5.5",
+            "valid_from": "2026-07-11T10:00:00Z",
+        },
         evidence_excerpt="Observed in the Hermes configuration.",
     )
     replacement = _write(
         service,
         contexts["client-a"],
         "state-2",
-        "Wonny prefers model Terra 5.6",
+        "Avery prefers model Terra 5.6",
         source_authority=0.8,
-        state={**state, "object_value": "terra-5.6", "valid_from": "2026-07-12T10:00:00Z"},
+        state={
+            **state,
+            "object_value": "terra-5.6",
+            "valid_from": "2026-07-12T10:00:00Z",
+        },
     )
     conflicting = _write(
         service,
         contexts["client-b"],
         "state-3",
-        "Wonny prefers model Unknown 1",
+        "Avery prefers model Unknown 1",
         source_authority=0.2,
-        state={**state, "object_value": "unknown-1", "valid_from": "2026-07-13T10:00:00Z"},
+        state={
+            **state,
+            "object_value": "unknown-1",
+            "valid_from": "2026-07-13T10:00:00Z",
+        },
     )
 
     assert first["outcome"] == "add"
@@ -363,7 +718,9 @@ def test_state_supersession_conflict_history_evidence_and_settled_search(setup):
         _request("history-1", "memory.history", **state, scope="private"),
     )["facts"]
     assert [fact["fact_id"] for fact in history] == [
-        first["fact_id"], replacement["fact_id"], conflicting["fact_id"]
+        first["fact_id"],
+        replacement["fact_id"],
+        conflicting["fact_id"],
     ]
     assert history[0]["superseded_by"] == replacement["fact_id"]
 
@@ -381,27 +738,37 @@ def test_state_supersession_conflict_history_evidence_and_settled_search(setup):
     )["conflicts"]
     assert len(conflicts) == 1
     assert set(conflicts[0]["member_fact_ids"]) == {
-        replacement["fact_id"], conflicting["fact_id"]
+        replacement["fact_id"],
+        conflicting["fact_id"],
     }
     assert {member["fact_id"] for member in conflicts[0]["members"]} == set(
         conflicts[0]["member_fact_ids"]
     )
-    assert service.handle(
-        contexts["hermes"],
-        _request("search-conflict", "memory.search", query="prefers model"),
-    )["facts"] == []
+    assert (
+        service.handle(
+            contexts["hermes"],
+            _request("search-conflict", "memory.search", query="prefers model"),
+        )["facts"]
+        == []
+    )
 
 
 def test_authorized_conflict_resolution_restores_settled_truth_and_audits(setup):
     conn, service, contexts = setup
-    slot = {"subject_key": "agent:wonny", "predicate_key": "model"}
+    slot = {"subject_key": "agent:avery", "predicate_key": "model"}
     first = _write(
-        service, contexts["hermes"], "resolve-1", "Wonny uses Terra",
+        service,
+        contexts["hermes"],
+        "resolve-1",
+        "Avery uses Terra",
         source_authority=0.8,
         state={**slot, "object_value": "terra", "valid_from": "2026-07-11T10:00:00Z"},
     )
     other = _write(
-        service, contexts["client-b"], "resolve-2", "Wonny uses Model Z",
+        service,
+        contexts["client-b"],
+        "resolve-2",
+        "Avery uses Model Z",
         source_authority=0.2,
         state={**slot, "object_value": "model-z", "valid_from": "2026-07-12T10:00:00Z"},
     )
@@ -411,7 +778,8 @@ def test_authorized_conflict_resolution_restores_settled_truth_and_audits(setup)
         service.handle(
             contexts["client-b"],
             _request(
-                "resolve-denied", "memory.resolve_conflict",
+                "resolve-denied",
+                "memory.resolve_conflict",
                 conflict_id=conflict_id,
                 resolution_fact_id=first["fact_id"],
                 reason="self-claimed authority",
@@ -422,24 +790,31 @@ def test_authorized_conflict_resolution_restores_settled_truth_and_audits(setup)
     result = service.handle(
         contexts["hermes"],
         _request(
-            "resolve-ok", "memory.resolve_conflict",
+            "resolve-ok",
+            "memory.resolve_conflict",
             conflict_id=conflict_id,
             resolution_fact_id=first["fact_id"],
-            reason="Victor confirmed Terra",
+            reason="Avery confirmed Terra",
         ),
     )["resolution"]
     assert result["resolution_fact_id"] == first["fact_id"]
     assert result["superseded_fact_ids"] == [other["fact_id"]]
-    assert service.handle(
-        contexts["hermes"], _request("settled", "memory.search", query="Terra")
-    )["facts"][0]["fact_id"] == first["fact_id"]
+    assert (
+        service.handle(
+            contexts["hermes"], _request("settled", "memory.search", query="Terra")
+        )["facts"][0]["fact_id"]
+        == first["fact_id"]
+    )
     audit = conn.execute(
         """SELECT resolver_client_id, resolver_session_id, resolver_agent_id, reason
            FROM fact_conflict_resolutions WHERE conflict_id = ?""",
         (conflict_id,),
     ).fetchone()
     assert tuple(audit) == (
-        "hermes-install", "wonny-session", "wonny", "Victor confirmed Terra"
+        "hermes-install",
+        "avery-session",
+        "avery",
+        "Avery confirmed Terra",
     )
 
 
@@ -447,20 +822,31 @@ def test_undated_state_uses_observed_time_and_untyped_dedup_is_scope_local(setup
     conn, service, contexts = setup
     slot = {"subject_key": "project:enfold", "predicate_key": "phase"}
     first = _write(
-        service, contexts["client-a"], "time-1", "Enfold is in alpha",
-        observed_at="2026-07-11T10:00:00Z", source_authority=0.5,
+        service,
+        contexts["client-a"],
+        "time-1",
+        "Enfold is in alpha",
+        observed_at="2026-07-11T10:00:00Z",
+        source_authority=0.5,
         state={**slot, "object_value": "alpha"},
     )
     second = _write(
-        service, contexts["client-a"], "time-2", "Enfold is in beta",
-        observed_at="2026-07-12T10:00:00Z", source_authority=0.5,
+        service,
+        contexts["client-a"],
+        "time-2",
+        "Enfold is in beta",
+        observed_at="2026-07-12T10:00:00Z",
+        source_authority=0.5,
         state={**slot, "object_value": "beta"},
     )
     assert first["outcome"] == "add"
     assert second["outcome"] == "supersede"
-    assert conn.execute(
-        "SELECT valid_from FROM facts WHERE fact_id = ?", (second["fact_id"],)
-    ).fetchone()[0] == "2026-07-12T10:00:00Z"
+    assert (
+        conn.execute(
+            "SELECT valid_from FROM facts WHERE fact_id = ?", (second["fact_id"],)
+        ).fetchone()[0]
+        == "2026-07-12T10:00:00Z"
+    )
 
     private = _write(service, contexts["client-a"], "dedup-1", "Exact shared text")
     duplicate = _write(service, contexts["hermes"], "dedup-2", "Exact shared text")
@@ -511,7 +897,11 @@ def test_context_is_scoped_cited_current_and_conflict_safe(setup):
         "context-conflict-first",
         "UnstableAtlas model is Terra.",
         source_authority=0.8,
-        state={**conflict_slot, "object_value": "terra", "valid_from": "2026-07-10T10:00:00Z"},
+        state={
+            **conflict_slot,
+            "object_value": "terra",
+            "valid_from": "2026-07-10T10:00:00Z",
+        },
     )
     _write(
         service,
@@ -519,8 +909,18 @@ def test_context_is_scoped_cited_current_and_conflict_safe(setup):
         "context-conflict-second",
         "UnstableAtlas model is Model Z.",
         source_authority=0.2,
-        state={**conflict_slot, "object_value": "model-z", "valid_from": "2026-07-11T10:00:00Z"},
+        state={
+            **conflict_slot,
+            "object_value": "model-z",
+            "valid_from": "2026-07-11T10:00:00Z",
+        },
     )
+    _conn.execute(
+        "UPDATE facts SET correction_status = 'human_confirmed' "
+        "WHERE fact_id IN (?, ?)",
+        (private["fact_id"], current["fact_id"]),
+    )
+    _conn.commit()
 
     private_pack = service.handle(
         contexts["client-a"],
@@ -571,14 +971,19 @@ def test_context_validates_scope_and_token_budget(setup):
     with pytest.raises(ServiceRequestError, match="token_budget"):
         service.handle(
             contexts["client-a"],
-            _request("context-budget", "memory.context", query="Orchid", token_budget=15),
+            _request(
+                "context-budget", "memory.context", query="Orchid", token_budget=15
+            ),
         )
     with pytest.raises(ServiceRequestError) as denied:
         service.handle(
             contexts["client-b"],
             _request(
-                "context-scope", "memory.context", query="Orchid",
-                token_budget=64, scope="work",
+                "context-scope",
+                "memory.context",
+                query="Orchid",
+                token_budget=64,
+                scope="work",
             ),
         )
     assert denied.value.code == "access_denied"
@@ -588,7 +993,9 @@ def test_unknown_clients_and_nested_identity_spoofing_fail_closed(setup):
     _conn, service, contexts = setup
     unknown = _context("unknown-install", "client-a", "client-a")
     with pytest.raises(ServiceRequestError) as denied:
-        service.handle(unknown, _request("search-denied", "memory.search", query="anything"))
+        service.handle(
+            unknown, _request("search-denied", "memory.search", query="anything")
+        )
     assert denied.value.code == "access_denied"
 
     with pytest.raises(ServiceRequestError) as spoofed:
@@ -628,7 +1035,9 @@ def test_search_accepts_natural_language_and_reports_hybrid_capabilities(setup):
     assert "score" in response["facts"][0]
     assert response["retrieval"]["filter_before_dense_ranking"] is True
     assert response["retrieval"]["embedder_production_ready"] is False
-    assert response["retrieval"]["natural_language_query_parser"] == "quoted_token_or_v1"
+    assert (
+        response["retrieval"]["natural_language_query_parser"] == "quoted_token_or_v1"
+    )
 
 
 def test_service_search_serializes_dense_scores_as_builtin_json_numbers(tmp_path):
@@ -640,10 +1049,7 @@ def test_service_search_serializes_dense_scores_as_builtin_json_numbers(tmp_path
             return np.asarray((1.0, 0.0), dtype=np.float32)
 
         def embed_documents(self, texts):
-            return tuple(
-                np.asarray((1.0, 0.0), dtype=np.float32)
-                for _text in texts
-            )
+            return tuple(np.asarray((1.0, 0.0), dtype=np.float32) for _text in texts)
 
     conn = _store(tmp_path)
     service = EnfoldService(
@@ -692,7 +1098,7 @@ def test_daemon_owned_extraction_surface_enqueues_without_model_call(tmp_path):
     request = _request(
         "extract-1",
         "memory.extraction.enqueue",
-        transcript="Victor wants a shared local second brain.",
+        transcript="Avery wants a shared local second brain.",
         source="session_end",
     )
 
@@ -704,3 +1110,92 @@ def test_daemon_owned_extraction_surface_enqueues_without_model_call(tmp_path):
     assert second["replayed"] is True
     assert conn.execute("SELECT count(*) FROM extract_queue").fetchone()[0] == 1
     conn.close()
+
+
+def test_extraction_rejects_oversized_canonical_payload_before_enqueue(tmp_path):
+    conn = _store(tmp_path)
+    service = EnfoldService(
+        conn,
+        MemoryPolicy({"client-a-install": ("private",)}),
+        extraction_enqueuer=ExtractionEnqueuer(conn),
+    )
+    context = _context(
+        "client-a-install", "client-a", "client-a", scopes=("private",)
+    )
+
+    with pytest.raises(
+        ServiceRequestError, match="canonical extraction payload"
+    ) as error:
+        service.handle(
+            context,
+            _request(
+                "oversized-extraction",
+                "memory.extraction.enqueue",
+                transcript="x" * (12 * 1024),
+                source="session_end",
+            ),
+        )
+
+    assert error.value.code == "invalid_params"
+    assert conn.execute("SELECT count(*) FROM extract_queue").fetchone()[0] == 0
+    conn.close()
+
+
+def test_huge_numeric_parameter_is_typed_validation_error(setup):
+    _conn, service, contexts = setup
+
+    with pytest.raises(ServiceRequestError) as error:
+        service.handle(
+            contexts["hermes"],
+            _request(
+                "huge-min-trust",
+                "memory.search",
+                query="anything",
+                min_trust=10**10_000,
+            ),
+        )
+
+    assert error.value.code == "invalid_params"
+
+
+def test_conflicts_limit_batches_member_facts_and_reports_truncation(setup):
+    conn, service, contexts = setup
+    for index in range(3):
+        subject = f"agent:conflict-{index}"
+        predicate = "setting"
+        fact_id = insert_fact(
+            conn,
+            f"conflict value {index}",
+            memory_kind="state",
+            subject_key=subject,
+            predicate_key=predicate,
+            object_value=str(index),
+            scope="private",
+        )
+        open_state_conflict(
+            conn,
+            subject,
+            predicate,
+            (fact_id,),
+            detected_at=f"2026-07-0{index + 1}T00:00:00Z",
+        )
+    conn.commit()
+    statements = []
+    conn.set_trace_callback(statements.append)
+
+    result = service.handle(
+        contexts["hermes"],
+        _request("bounded-conflicts", "memory.conflicts", scope="private", limit=2),
+    )
+
+    conn.set_trace_callback(None)
+    assert len(result["conflicts"]) == 2
+    assert result["output_truncated"] is True
+    member_reads = [
+        statement for statement in statements
+        if "FROM facts WHERE fact_id IN" in statement
+    ]
+    assert len(member_reads) == 1
+    assert not any(
+        "FROM facts WHERE fact_id =" in statement for statement in statements
+    )

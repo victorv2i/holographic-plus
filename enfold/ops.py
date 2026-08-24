@@ -12,12 +12,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sqlite3
 import sys
 import tempfile
 from dataclasses import asdict
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 
 from .backup import (
     BackupError,
@@ -40,10 +41,12 @@ from .sqlite_vec_index import SQLiteVecError, rebuild_sqlite_vec_index
 
 
 LIVE_PATH_MESSAGE = (
-    "refusing to modify a database under .hermes; stop all Hermes, Codex, "
-    "Claude, MCP, and Enfold writers during a maintenance window, then pass "
+    "refusing to modify a database under .hermes; stop all client, MCP, and "
+    "Enfold writers during a maintenance window, then pass "
     "--allow-live explicitly"
 )
+_SAFE_ERROR_CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_BROWSE_APPLICATION_ID = 0x454E4644
 
 
 def _resolved(path: str | Path) -> Path:
@@ -194,7 +197,9 @@ def _browse_metadata(scopes: tuple[str, ...]) -> dict[str, object]:
     }
 
 
-def _atomic_json(path: Path, value: object) -> None:
+def _atomic_json(
+    path: Path, value: object, *, before_replace: Callable[[], None] | None = None
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
@@ -204,19 +209,102 @@ def _atomic_json(path: Path, value: object) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.chmod(temporary, 0o600)
+        if before_replace is not None:
+            before_replace()
         os.replace(temporary, path)
     finally:
         Path(temporary).unlink(missing_ok=True)
+
+
+def _browse_output_paths(destination: Path) -> set[Path]:
+    return {
+        _resolved(destination),
+        _resolved(f"{destination}-wal"),
+        _resolved(f"{destination}-shm"),
+        _resolved(destination.with_name("metadata.json")),
+    }
+
+
+def _database_write_paths(database: Path) -> set[Path]:
+    return {
+        _resolved(database),
+        _resolved(f"{database}-wal"),
+        _resolved(f"{database}-shm"),
+        _resolved(f"{database}.enfold.lock"),
+        _resolved(f"{database}.mcp-write.lock"),
+    }
+
+
+def _require_browse_metadata(metadata_path: Path) -> None:
+    if not metadata_path.exists() and not metadata_path.is_symlink():
+        return
+    try:
+        existing = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError, UnicodeError) as exc:
+        raise BackupError(
+            f"browse snapshot metadata already exists and is not Enfold browse "
+            f"snapshot metadata: {metadata_path}"
+        ) from exc
+    scopes = existing.get("scope_allowlist") if isinstance(existing, dict) else None
+    if (
+        not isinstance(scopes, list)
+        or not all(isinstance(scope, str) for scope in scopes)
+        or existing != _browse_metadata(tuple(scopes))
+    ):
+        raise BackupError(
+            f"browse snapshot metadata already exists and is not Enfold browse "
+            f"snapshot metadata: {metadata_path}"
+        )
+
+
+def _require_safe_browse_destination(database: Path, destination: Path) -> None:
+    metadata_path = destination.with_name("metadata.json")
+    if destination == metadata_path:
+        raise BackupError(
+            "browse snapshot destination must differ from its metadata path"
+        )
+    if destination.is_symlink():
+        raise BackupError("browse snapshot destination must not be a symlink")
+    if metadata_path.is_symlink():
+        raise BackupError("browse snapshot metadata must not be a symlink")
+    collisions = _browse_output_paths(destination) & _database_write_paths(database)
+    if collisions:
+        collision = min(collisions, key=str)
+        raise BackupError(
+            f"browse snapshot output collides with live database path: {collision}"
+        )
+    _require_browse_metadata(metadata_path)
+    if not destination.exists():
+        return
+    try:
+        with sqlite3.connect(
+            sqlite_file_uri(destination, mode="ro"), uri=True
+        ) as existing:
+            application_id = int(existing.execute("PRAGMA application_id").fetchone()[0])
+    except sqlite3.DatabaseError as exc:
+        raise BackupError(
+            f"browse snapshot destination already exists and is not an Enfold "
+            f"browse snapshot: {destination}"
+        ) from exc
+    if application_id != _BROWSE_APPLICATION_ID:
+        raise BackupError(
+            f"browse snapshot destination already exists and is not an Enfold "
+            f"browse snapshot: {destination}"
+        )
 
 
 def _browse_snapshot(args: argparse.Namespace) -> None:
     """Copy approved current facts from a read-only live snapshot into SQLite."""
 
     config = load_config(args.config, allow_live=True)
-    destination = _resolved(
+    requested_destination = Path(
         args.destination or "~/.local/state/enfold/browse/browse-snapshot.db"
-    )
+    ).expanduser()
+    if requested_destination.is_symlink():
+        raise BackupError("browse snapshot destination must not be a symlink")
+    destination = _resolved(requested_destination.parent) / requested_destination.name
     metadata_path = destination.with_name("metadata.json")
+    _require_safe_browse_destination(_resolved(config.database_path), destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
     source = _connect(config.database_path, read_only=True)
     temporary_source = tempfile.NamedTemporaryFile(
@@ -236,6 +324,7 @@ def _browse_snapshot(args: argparse.Namespace) -> None:
             temporary_destination.name
         ) as browse:
             require_compatible_schema(snapshot)
+            browse.execute(f"PRAGMA application_id = {_BROWSE_APPLICATION_ID}")
             browse.executescript(
                 """
                 CREATE TABLE facts (
@@ -279,8 +368,17 @@ def _browse_snapshot(args: argparse.Namespace) -> None:
                 ((row[0], row[1]) for row in facts),
             )
         os.chmod(temporary_destination.name, 0o400)
+        _require_safe_browse_destination(
+            _resolved(config.database_path), destination
+        )
         os.replace(temporary_destination.name, destination)
-        _atomic_json(metadata_path, _browse_metadata(config.browse_scopes))
+        _atomic_json(
+            metadata_path,
+            _browse_metadata(config.browse_scopes),
+            before_replace=lambda: _require_safe_browse_destination(
+                _resolved(config.database_path), destination
+            ),
+        )
     finally:
         if source is not None:
             source.close()
@@ -309,6 +407,154 @@ def _rebuild_vector_index(args: argparse.Namespace) -> None:
         "report": asdict(report),
         "ok": True,
     })
+
+
+def _public_error_code(value: object) -> str:
+    return value if isinstance(value, str) and _SAFE_ERROR_CODE.fullmatch(value) else "redacted"
+
+
+def _extraction_dead_status(args: argparse.Namespace) -> None:
+    """Inspect dead extraction rows without exposing transcript/model content."""
+
+    with _connect(args.database, read_only=True) as conn:
+        require_compatible_schema(conn)
+        rows = conn.execute(
+            "SELECT id, created_at, attempts, last_error, payload_hash, "
+            "proposal_hash IS NOT NULL FROM extract_queue "
+            "WHERE status = 'dead' ORDER BY id"
+        ).fetchall()
+    safe_rows = [
+        {
+            "id": int(row[0]),
+            "created_at": str(row[1]),
+            "attempts": int(row[2]),
+            "error_code": _public_error_code(row[3]),
+            "payload_sha256": str(row[4]),
+            "has_proposal_snapshot": bool(row[5]),
+        }
+        for row in rows
+    ]
+    _print_json(
+        {
+            "database": str(_resolved(args.database)),
+            "dead": len(safe_rows),
+            "rows": safe_rows,
+            "read_only": True,
+        }
+    )
+
+
+def _revive_extraction_dead(args: argparse.Namespace) -> None:
+    """Revive explicitly selected dead rows after a stopped-writer review."""
+
+    _require_live_override(args.database, allow_live=args.allow_live)
+    source_status = args.from_status
+    ids = tuple(dict.fromkeys(args.id))
+    if not ids:
+        raise BackupError("at least one dead extraction row id is required")
+    expected_error = args.expected_error
+    if not _SAFE_ERROR_CODE.fullmatch(expected_error):
+        raise BackupError("expected extraction error must be a safe error code")
+    placeholders = ",".join("?" for _ in ids)
+    with maintenance_database_lock(args.database):
+        with _connect(args.database, read_only=False) as conn:
+            require_compatible_schema(conn)
+            rows = conn.execute(
+                f"SELECT id, status, last_error FROM extract_queue "
+                f"WHERE id IN ({placeholders}) ORDER BY id",
+                ids,
+            ).fetchall()
+            found = {int(row[0]) for row in rows}
+            missing = sorted(set(ids) - found)
+            if missing:
+                raise BackupError(f"extraction rows were not found: {missing}")
+            invalid = [
+                int(row[0])
+                for row in rows
+                if row[1] != source_status or row[2] != expected_error
+            ]
+            if invalid:
+                raise BackupError(
+                    f"extraction rows are not {source_status} with the expected error: "
+                    f"{invalid}"
+                )
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute(
+                f"UPDATE extract_queue SET status = 'pending', attempts = 0, "
+                "not_before = NULL, lease_owner = NULL, lease_until = NULL, "
+                f"lease_token = NULL WHERE id IN ({placeholders}) "
+                "AND status = ? AND last_error = ?",
+                (*ids, source_status, expected_error),
+            )
+            if cursor.rowcount != len(ids):
+                conn.rollback()
+                raise BackupError("dead extraction rows changed during revival")
+            conn.commit()
+    _print_json(
+        {
+            "database": str(_resolved(args.database)),
+            "revived": list(ids),
+            "expected_error": expected_error,
+            "from_status": source_status,
+            "ok": True,
+        }
+    )
+
+
+def _acknowledge_extraction_dead(args: argparse.Namespace) -> None:
+    """Acknowledge explicitly reviewed dead rows without discarding evidence."""
+
+    _require_live_override(args.database, allow_live=args.allow_live)
+    ids = tuple(dict.fromkeys(args.id))
+    if not ids:
+        raise BackupError("at least one dead extraction row id is required")
+    expected_error = args.expected_error
+    if not _SAFE_ERROR_CODE.fullmatch(expected_error):
+        raise BackupError("expected extraction error must be a safe error code")
+    placeholders = ",".join("?" for _ in ids)
+    with maintenance_database_lock(args.database):
+        with _connect(args.database, read_only=False) as conn:
+            require_compatible_schema(conn)
+            rows = conn.execute(
+                f"SELECT id, status, last_error FROM extract_queue "
+                f"WHERE id IN ({placeholders}) ORDER BY id",
+                ids,
+            ).fetchall()
+            found = {int(row[0]) for row in rows}
+            missing = sorted(set(ids) - found)
+            if missing:
+                raise BackupError(f"extraction rows were not found: {missing}")
+            invalid = [
+                int(row[0])
+                for row in rows
+                if row[1] != "dead" or row[2] != expected_error
+            ]
+            if invalid:
+                raise BackupError(
+                    "extraction rows are not dead with the expected error: "
+                    f"{invalid}"
+                )
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute(
+                f"UPDATE extract_queue SET status = 'acknowledged' "
+                f"WHERE id IN ({placeholders}) "
+                "AND status = 'dead' AND last_error = ?",
+                (*ids, expected_error),
+            )
+            if cursor.rowcount != len(ids):
+                conn.rollback()
+                raise BackupError(
+                    "dead extraction rows changed during acknowledgement"
+                )
+            conn.commit()
+    _print_json(
+        {
+            "database": str(_resolved(args.database)),
+            "acknowledged": list(ids),
+            "expected_error": expected_error,
+            "ok": True,
+        }
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -426,6 +672,63 @@ def build_parser() -> argparse.ArgumentParser:
         help="allow a .hermes path after every writer is stopped",
     )
     vector_rebuild.set_defaults(handler=_rebuild_vector_index)
+
+    dead_status = commands.add_parser(
+        "extraction-dead-status",
+        help="inspect dead extraction rows without exposing queued content",
+    )
+    dead_status.add_argument(
+        "database", help="explicit schema-v1 SQLite database path"
+    )
+    dead_status.set_defaults(handler=_extraction_dead_status)
+
+    dead_revive = commands.add_parser(
+        "revive-extraction-dead",
+        help="revive explicitly reviewed extraction dead letters",
+    )
+    dead_revive.add_argument(
+        "database", help="explicit schema-v1 SQLite database path"
+    )
+    dead_revive.add_argument(
+        "--id", action="append", type=int, required=True,
+        help="dead extraction row id; repeat for multiple reviewed rows",
+    )
+    dead_revive.add_argument(
+        "--expected-error", required=True,
+        help="require every selected row to have this exact safe error code",
+    )
+    dead_revive.add_argument(
+        "--from-status",
+        choices=("dead", "acknowledged"),
+        default="dead",
+        help="explicit source status; acknowledged rows require an opt-in",
+    )
+    dead_revive.add_argument(
+        "--allow-live", action="store_true",
+        help="allow a .hermes path after every writer is stopped",
+    )
+    dead_revive.set_defaults(handler=_revive_extraction_dead)
+
+    dead_acknowledge = commands.add_parser(
+        "acknowledge-extraction-dead",
+        help="acknowledge explicitly reviewed extraction dead letters",
+    )
+    dead_acknowledge.add_argument(
+        "database", help="explicit schema-v1 SQLite database path"
+    )
+    dead_acknowledge.add_argument(
+        "--id", action="append", type=int, required=True,
+        help="dead extraction row id; repeat for multiple reviewed rows",
+    )
+    dead_acknowledge.add_argument(
+        "--expected-error", required=True,
+        help="require every selected row to have this exact safe error code",
+    )
+    dead_acknowledge.add_argument(
+        "--allow-live", action="store_true",
+        help="allow a .hermes path after every writer is stopped",
+    )
+    dead_acknowledge.set_defaults(handler=_acknowledge_extraction_dead)
     return parser
 
 

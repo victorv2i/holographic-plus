@@ -180,25 +180,35 @@ def erase_fact(
             queue_columns = _columns(conn, "extract_queue")
             id_column = "id" if "id" in queue_columns else "queue_id"
             if {id_column, "payload"}.issubset(queue_columns):
+                selected_columns = [f'"{id_column}"', "payload"]
+                if "payload_hash" in queue_columns:
+                    selected_columns.append("payload_hash")
+                if "proposal_json" in queue_columns:
+                    selected_columns.append("proposal_json")
                 rows = conn.execute(
-                    f'SELECT "{id_column}", payload FROM extract_queue'
+                    f'SELECT {", ".join(selected_columns)} FROM extract_queue'
                 ).fetchall()
-                for queue_id, payload in rows:
+                for row in rows:
+                    queue_id, payload = row[:2]
                     payload_text = str(payload)
                     payload_digest = hashlib.sha256(payload_text.encode()).hexdigest()
+                    next_column = 2
                     stored_hash = None
                     if "payload_hash" in queue_columns:
-                        stored = conn.execute(
-                            f'SELECT payload_hash FROM extract_queue WHERE "{id_column}" = ?',
-                            (queue_id,),
-                        ).fetchone()
-                        stored_hash = str(stored[0]) if stored and stored[0] else None
+                        stored_hash = str(row[next_column]) if row[next_column] else None
+                        next_column += 1
+                    proposal_text = ""
+                    if "proposal_json" in queue_columns and row[next_column] is not None:
+                        proposal_text = str(row[next_column])
                     linked = (
                         int(queue_id) in linked_queue_ids
                         or payload_digest in linked_payload_hashes
                         or stored_hash in linked_payload_hashes
                     )
-                    if not linked and (not original or original not in payload_text):
+                    content_match = original and (
+                        original in payload_text or original in proposal_text
+                    )
+                    if not linked and not content_match:
                         continue
                     replacement = json.dumps(
                         {"privacy_erased": True, "queue_id": int(queue_id)},
@@ -212,6 +222,10 @@ def erase_fact(
                         values.append(hashlib.sha256(replacement.encode()).hexdigest())
                     if "last_error" in queue_columns:
                         updates.append("last_error = NULL")
+                    if {"proposal_json", "proposal_hash"}.issubset(queue_columns):
+                        updates.extend(
+                            ("proposal_json = NULL", "proposal_hash = NULL")
+                        )
                     conn.execute(
                         f'UPDATE extract_queue SET {", ".join(updates)} '
                         f'WHERE "{id_column}" = ?',

@@ -423,6 +423,7 @@ def _parser(environ: Mapping[str, str]) -> argparse.ArgumentParser:
             "ENFOLD_SURFACE, ENFOLD_AGENT_ID, ENFOLD_SESSION_ID, "
             "ENFOLD_PARENT_AGENT_ID, ENFOLD_PROJECT_ROOT, ENFOLD_REPOSITORY, "
             "ENFOLD_BRANCH, ENFOLD_COMMIT_SHA, ENFOLD_ACCESS_SCOPES."
+            " ENFOLD_CLIENT_CREDENTIAL may be supplied by a trusted supervisor."
         ),
     )
     parser.add_argument("--socket-path", default=_env(environ, "ENFOLD_SOCKET_PATH"), help="absolute Enfold daemon Unix socket path [ENFOLD_SOCKET_PATH]")
@@ -483,6 +484,7 @@ def parse_config(
             capabilities=MEMORY_CAPABILITIES,
             connect_timeout=args.connect_timeout,
             request_timeout=args.request_timeout,
+            credential=_env(env, "ENFOLD_CLIENT_CREDENTIAL"),
         )
     except (TypeError, ValueError) as exc:
         parser.error(str(exc))

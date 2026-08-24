@@ -54,6 +54,15 @@ def _daemon(path, handler, **changes) -> UnixJsonDaemon:
     return UnixJsonDaemon(DaemonConfig(**values), handler)
 
 
+def test_client_config_repr_omits_plaintext_credential(tmp_path):
+    credential = "operator-" + "credential-value"
+
+    rendered = repr(_config(tmp_path / "enfold.sock", credential=credential))
+
+    assert credential not in rendered
+    assert "credential=" not in rendered
+
+
 def test_client_negotiates_context_and_returns_typed_result(tmp_path):
     path = tmp_path / "enfold.sock"
     seen = []

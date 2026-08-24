@@ -96,7 +96,13 @@ def test_real_unix_daemon_context_round_trip_is_bounded_and_cited(tmp_path):
     conn = sqlite3.connect(tmp_path / "context-arena.db", check_same_thread=False)
     conn.execute("PRAGMA foreign_keys=ON")
     migrate(conn)
-    service = EnfoldService(conn, MemoryPolicy({"context-client": ("private",)}))
+    service = EnfoldService(
+        conn,
+        MemoryPolicy(
+            {"context-client": ("private",)},
+            correction_authorities=("context-client",),
+        ),
+    )
     context = ClientContext(
         client_id="context-client",
         surface="arena",
@@ -112,6 +118,7 @@ def test_real_unix_daemon_context_round_trip_is_bounded_and_cited(tmp_path):
                 "idempotency_key": "context-write",
                 "content": "Cedar runbook is the current fast lane reference.",
                 "source_type": "synthetic_fixture",
+                "correction_status": "human_confirmed",
             },
         ),
     )

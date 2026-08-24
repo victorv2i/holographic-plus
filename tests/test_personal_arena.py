@@ -7,6 +7,9 @@ import pytest
 
 from enfold.schema import migrate
 from memory_eval.personal_arena import (
+    PersonalCase,
+    PersonalResult,
+    _summarize,
     load_personal_cases,
     run_personal_arena,
     snapshot_database,
@@ -98,6 +101,29 @@ def test_personal_arena_uses_snapshot_and_real_hybrid_filters(tmp_path):
     assert run.metadata["retrieval"]["embedder_production_ready"] is False
 
 
+def test_personal_arena_counts_positive_abstentions_as_recall_failures():
+    case = PersonalCase(
+        id="false-abstention",
+        query="Who owns Atlas?",
+        expected_fact_ids=(1,),
+        expected_content_regexes=(),
+        forbidden_content_regexes=(),
+        category="project",
+    )
+    summary = _summarize((PersonalResult(
+        case=case,
+        ranked_fact_ids=(1,),
+        expected_rank=1,
+        forbidden_rank=None,
+        abstained=True,
+    ),))
+
+    assert summary["recall_at_1"] == 0.0
+    assert summary["recall_at_3"] == 0.0
+    assert summary["false_abstentions"] == 1
+    assert summary["by_category"]["project"]["false_abstentions"] == 1
+
+
 def test_validate_personal_cases_rejects_inactive_expected_fact(tmp_path):
     source = tmp_path / "live.db"
     conn = _database(source)
@@ -108,5 +134,68 @@ def test_validate_personal_cases_rejects_inactive_expected_fact(tmp_path):
     }) + "\n")
 
     with pytest.raises(ValueError, match="not an active private fact"):
+        validate_personal_cases(conn, load_personal_cases(cases_path))
+    conn.close()
+
+
+@pytest.mark.parametrize(
+    "expectations",
+    [
+        {"expected_fact_ids": [2, 1]},
+        {
+            "expected_fact_ids": [2],
+            "expected_content_regexes": ["stale alternative", "Atlas launch date"],
+        },
+    ],
+)
+def test_validate_personal_cases_accepts_any_satisfiable_alternative(
+    tmp_path, expectations
+):
+    source = tmp_path / "live.db"
+    conn = _database(source)
+    cases_path = tmp_path / "cases.jsonl"
+    cases_path.write_text(
+        json.dumps(
+            {
+                "id": "alternative-targets",
+                "query": "Atlas date",
+                "category": "project",
+                **expectations,
+            }
+        )
+        + "\n"
+    )
+
+    validate_personal_cases(conn, load_personal_cases(cases_path))
+    conn.close()
+
+
+@pytest.mark.parametrize(
+    "expectation",
+    [
+        {"expected_fact_ids": [1]},
+        {"expected_content_regexes": ["Atlas launch date"]},
+    ],
+)
+def test_validate_personal_cases_rejects_expected_forbidden_overlap(
+    tmp_path, expectation
+):
+    source = tmp_path / "live.db"
+    conn = _database(source)
+    cases_path = tmp_path / "cases.jsonl"
+    cases_path.write_text(
+        json.dumps(
+            {
+                "id": "contradictory-target",
+                "query": "Atlas date",
+                "category": "project",
+                "forbidden_content_regexes": ["2026-07-18"],
+                **expectation,
+            }
+        )
+        + "\n"
+    )
+
+    with pytest.raises(ValueError, match="also matches a forbidden"):
         validate_personal_cases(conn, load_personal_cases(cases_path))
     conn.close()

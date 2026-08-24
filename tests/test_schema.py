@@ -2,6 +2,7 @@ import sqlite3
 
 import pytest
 
+from enfold.core_store import insert_fact, settled_fact_events
 from enfold.schema import (
     Migration,
     MigrationError,
@@ -89,6 +90,117 @@ def test_v1_shape_rejects_reintroduced_content_uniqueness():
 
     with pytest.raises(SchemaLedgerError, match="content_unique"):
         schema_version(conn)
+
+
+@pytest.mark.parametrize("name", ("facts_ai", "facts_ad", "facts_au"))
+def test_v1_shape_rejects_noop_facts_fts_triggers(name):
+    conn = sqlite3.connect(":memory:")
+    migrate(conn)
+    conn.execute(f'DROP TRIGGER "{name}"')
+    conn.execute(
+        f'CREATE TRIGGER "{name}" AFTER INSERT ON facts BEGIN SELECT 1; END'
+    )
+    conn.commit()
+
+    with pytest.raises(SchemaLedgerError, match=f"trigger-shape:{name}"):
+        schema_version(conn)
+
+
+def test_v1_shape_rejects_wrong_active_payload_hash_index():
+    conn = sqlite3.connect(":memory:")
+    migrate(conn)
+    conn.execute("DROP INDEX uq_extract_queue_active_payload_hash")
+    conn.execute(
+        "CREATE UNIQUE INDEX uq_extract_queue_active_payload_hash "
+        "ON extract_queue(status) WHERE status IN ('pending', 'processing')"
+    )
+    conn.commit()
+
+    with pytest.raises(
+        SchemaLedgerError,
+        match="index-shape:uq_extract_queue_active_payload_hash",
+    ):
+        schema_version(conn)
+
+
+def test_v1_shape_rejects_nonunique_nonpartial_state_slot_index():
+    conn = sqlite3.connect(":memory:")
+    migrate(conn)
+    conn.execute("DROP INDEX uq_facts_current_state_slot")
+    conn.execute(
+        "CREATE INDEX uq_facts_current_state_slot "
+        "ON facts(scope, subject_key, predicate_key)"
+    )
+    conn.commit()
+
+    with pytest.raises(
+        SchemaLedgerError,
+        match="index-shape:uq_facts_current_state_slot",
+    ):
+        schema_version(conn)
+
+
+def test_v1_shape_rejects_plain_table_named_facts_fts():
+    conn = sqlite3.connect(":memory:")
+    migrate(conn)
+    conn.execute("DROP TABLE facts_fts")
+    conn.execute("CREATE TABLE facts_fts(content TEXT, tags TEXT)")
+    conn.commit()
+
+    with pytest.raises(SchemaLedgerError, match="table-shape:facts_fts"):
+        schema_version(conn)
+
+
+def test_minimal_facts_migration_backfills_and_preserves_insert_timestamps():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(
+        """
+        CREATE TABLE facts (
+            fact_id INTEGER PRIMARY KEY,
+            content TEXT NOT NULL
+        );
+        INSERT INTO facts(content) VALUES ('legacy fact');
+        """
+    )
+
+    migrate(conn)
+    inserted_id = insert_fact(conn, "new fact")
+
+    timestamps = conn.execute(
+        "SELECT fact_id, created_at, updated_at FROM facts ORDER BY fact_id"
+    ).fetchall()
+    assert all(created_at is not None for _, created_at, _ in timestamps)
+    assert all(updated_at is not None for _, _, updated_at in timestamps)
+    assert inserted_id in {
+        event["fact_id"]
+        for event in settled_fact_events(conn)
+        if event["kind"] == "created"
+    }
+
+
+def test_settled_events_require_matching_sensitivity_capability():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    migrate(conn)
+    normal = insert_fact(
+        conn, "normal event", scope="private", sensitivity="normal"
+    )
+    sensitive = insert_fact(
+        conn, "sensitive event", scope="private", sensitivity="sensitive"
+    )
+    conn.commit()
+
+    assert [
+        event["fact_id"]
+        for event in settled_fact_events(conn, allowed_scopes=("private",))
+    ] == [normal]
+    assert {
+        event["fact_id"]
+        for event in settled_fact_events(
+            conn, allowed_scopes=("private", "sensitive")
+        )
+    } == {normal, sensitive}
 
 
 def test_failed_legacy_shape_upgrade_rolls_back_and_remains_v0():

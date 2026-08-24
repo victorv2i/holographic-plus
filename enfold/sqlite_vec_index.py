@@ -23,6 +23,9 @@ TABLE_NAMES = ("enfold_vec_embeddings_a", "enfold_vec_embeddings_b")
 ACTIVE_TABLE_KEY = "sqlite_vec_active_table"
 IDENTITY_KEY = "sqlite_vec_embedding_identity"
 DIMENSIONS_KEY = "sqlite_vec_dimensions"
+SOURCE_GENERATION_KEY = "sqlite_vec_source_generation"
+INDEX_GENERATION_KEY = "sqlite_vec_index_generation"
+PAYLOAD_SAMPLE_SIZE = 5
 
 
 class SQLiteVecError(RuntimeError):
@@ -61,21 +64,59 @@ def _meta(conn: sqlite3.Connection, key: str) -> str | None:
 
 
 def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
-    return conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
-    ).fetchone() is not None
+    return (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
+        ).fetchone()
+        is not None
+    )
+
+
+def _generation(conn: sqlite3.Connection, key: str) -> int | None:
+    raw = _meta(conn, key)
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if value >= 0 else None
+
+
+def _ensure_generation_triggers(conn: sqlite3.Connection) -> None:
+    """Make every canonical vector mutation invalidate a stale derived index."""
+
+    for action in ("INSERT", "UPDATE", "DELETE"):
+        conn.execute(
+            f"""
+            CREATE TRIGGER IF NOT EXISTS enfold_vec_source_generation_{action.lower()}
+            AFTER {action} ON fact_embeddings
+            BEGIN
+                INSERT INTO enfold_meta(key, value) VALUES
+                    ('{SOURCE_GENERATION_KEY}', '1')
+                ON CONFLICT(key) DO UPDATE SET
+                    value = CAST(value AS INTEGER) + 1;
+            END
+            """
+        )
 
 
 class SQLiteVecIndex:
     """A validated identity/dimension-bound vec0 index on one connection."""
 
     def __init__(
-        self, conn: sqlite3.Connection, identity: str, dimensions: int, table_name: str
+        self,
+        conn: sqlite3.Connection,
+        identity: str,
+        dimensions: int,
+        table_name: str,
+        generation: int | None = None,
     ):
         self.conn = conn
         self.identity = identity
         self.dimensions = dimensions
         self.table_name = table_name
+        self.generation = generation
 
     @classmethod
     def open_configured(
@@ -124,44 +165,82 @@ class SQLiteVecIndex:
                 elif _meta(conn, DIMENSIONS_KEY) != str(dimensions):
                     reason = "embedding dimensions do not match index metadata"
                 else:
-                    source_count = int(conn.execute(
-                        "SELECT COUNT(*) FROM fact_embeddings "
-                        "WHERE embedding_identity=? AND dim=?",
-                        (identity, dimensions),
-                    ).fetchone()[0])
-                    index_count = int(conn.execute(
-                        f'SELECT COUNT(*) FROM "{table_name}"'
-                    ).fetchone()[0])
-                    missing = conn.execute(
-                        f"""
-                        SELECT fact_id FROM fact_embeddings
-                        WHERE embedding_identity=? AND dim=?
-                        EXCEPT SELECT rowid FROM "{table_name}" LIMIT 1
-                        """,
-                        (identity, dimensions),
-                    ).fetchone()
-                    extra = conn.execute(
-                        f"""
-                        SELECT rowid FROM "{table_name}"
-                        EXCEPT SELECT fact_id FROM fact_embeddings
-                        WHERE embedding_identity=? AND dim=? LIMIT 1
-                        """,
-                        (identity, dimensions),
-                    ).fetchone()
-                    if source_count != index_count or missing is not None or extra is not None:
-                        reason = "vec0 population does not match canonical embeddings"
+                    source_generation = _generation(conn, SOURCE_GENERATION_KEY)
+                    index_generation = _generation(conn, INDEX_GENERATION_KEY)
+                    if source_generation is None or index_generation is None:
+                        reason = "vec0 generation ledger is absent; rebuild the index"
+                    elif source_generation != index_generation:
+                        reason = "vec0 generation does not match canonical embeddings"
+                    else:
+                        # The generation ledger makes a full EXCEPT scan on
+                        # every new request unnecessary. Counts and a tiny
+                        # payload sample retain cheap defense against a broken
+                        # derived table while rebuild performs full validation.
+                        source_count = int(
+                            conn.execute(
+                                "SELECT COUNT(*) FROM fact_embeddings "
+                                "WHERE embedding_identity=? AND dim=?",
+                                (identity, dimensions),
+                            ).fetchone()[0]
+                        )
+                        index_count = int(
+                            conn.execute(
+                                f'SELECT COUNT(*) FROM "{table_name}"'
+                            ).fetchone()[0]
+                        )
+                        if source_count != index_count:
+                            reason = (
+                                "vec0 population does not match canonical embeddings"
+                            )
+                        elif source_count:
+                            samples = conn.execute(
+                                "SELECT fact_id, embedding FROM fact_embeddings "
+                                "WHERE embedding_identity=? AND dim=? "
+                                "ORDER BY fact_id LIMIT ?",
+                                (identity, dimensions, PAYLOAD_SAMPLE_SIZE),
+                            ).fetchall()
+                            for fact_id, source_embedding in samples:
+                                indexed = conn.execute(
+                                    f'SELECT embedding FROM "{table_name}" WHERE rowid=?',
+                                    (fact_id,),
+                                ).fetchone()
+                                if indexed is None or bytes(indexed[0]) != bytes(
+                                    source_embedding
+                                ):
+                                    reason = "vec0 payload does not match canonical embeddings"
+                                    break
             except Exception as exc:
                 reason = str(exc)
         if reason is not None:
             if warn:
-                LOGGER.warning("sqlite-vec health warning: %s; falling back to brute", reason)
+                LOGGER.warning(
+                    "sqlite-vec health warning: %s; falling back to brute", reason
+                )
             return None
-        return cls(conn, identity, dimensions, table_name)
+        return cls(conn, identity, dimensions, table_name, index_generation)
+
+    def _sync_generation_in_transaction(self) -> None:
+        """Mark the active derived table synchronized with canonical vectors."""
+
+        if (
+            self.table_name not in TABLE_NAMES
+            or _meta(self.conn, ACTIVE_TABLE_KEY) != self.table_name
+        ):
+            return
+        source_generation = _generation(self.conn, SOURCE_GENERATION_KEY)
+        if source_generation is None:
+            raise SQLiteVecError("vec0 generation ledger is absent; rebuild the index")
+        self.conn.execute(
+            "INSERT INTO enfold_meta(key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (INDEX_GENERATION_KEY, str(source_generation)),
+        )
+        self.generation = source_generation
 
     def count(self) -> int:
-        return int(self.conn.execute(
-            f'SELECT COUNT(*) FROM "{self.table_name}"'
-        ).fetchone()[0])
+        return int(
+            self.conn.execute(f'SELECT COUNT(*) FROM "{self.table_name}"').fetchone()[0]
+        )
 
     def scores(
         self, query_vector: Sequence[float], fact_ids: Sequence[int]
@@ -179,26 +258,27 @@ class SQLiteVecIndex:
         query = embedding_to_bytes(np.asarray(query_vector, dtype=np.float32))
         scores: dict[int, float] = {}
         for offset in range(0, len(fact_ids), 500):
-            batch = tuple(int(value) for value in fact_ids[offset:offset + 500])
+            batch = tuple(int(value) for value in fact_ids[offset : offset + 500])
             placeholders = ",".join("?" for _ in batch)
+            # ``MATCH ... k`` is a global nearest-neighbor operation. sqlite-
+            # vec versions and query plans have differed on whether a rowid
+            # filter is applied before that global KNN window. Compute exact
+            # cosine distance only for the already-authorized batch instead;
+            # this preserves authorization/candidate correctness even when
+            # many disallowed rows are closer to the query.
             rows = self.conn.execute(
                 f"""
-                SELECT rowid, distance FROM "{self.table_name}"
-                WHERE embedding MATCH ? AND k = ?
-                  AND rowid IN ({placeholders})
+                SELECT rowid, vec_distance_cosine(embedding, ?) AS distance
+                FROM "{self.table_name}" WHERE rowid IN ({placeholders})
                 """,
-                (query, len(batch), *batch),
+                (query, *batch),
             ).fetchall()
             for fact_id, distance in rows:
                 if distance is None:
-                    raise SQLiteVecError(
-                        "vec0 returned an invalid cosine distance"
-                    )
+                    raise SQLiteVecError("vec0 returned an invalid cosine distance")
                 score = 1.0 - float(distance)
                 if not math.isfinite(score):
-                    raise SQLiteVecError(
-                        "vec0 returned an invalid cosine distance"
-                    )
+                    raise SQLiteVecError("vec0 returned an invalid cosine distance")
                 scores[int(fact_id)] = max(0.0, score)
         if len(scores) != len(fact_ids):
             raise SQLiteVecError("vec0 query did not return every authorized candidate")
@@ -219,16 +299,19 @@ class SQLiteVecIndex:
             f'INSERT OR REPLACE INTO "{self.table_name}"(rowid, embedding) VALUES (?, ?)',
             (fact_id, embedding),
         )
+        self._sync_generation_in_transaction()
 
     def delete_in_transaction(self, fact_id: int) -> None:
         if not self.conn.in_transaction:
             raise RuntimeError("vec0 delete requires a caller-owned transaction")
         self.conn.execute(f'DELETE FROM "{self.table_name}" WHERE rowid=?', (fact_id,))
+        self._sync_generation_in_transaction()
 
     def clear_in_transaction(self) -> None:
         if not self.conn.in_transaction:
             raise RuntimeError("vec0 clear requires a caller-owned transaction")
         self.conn.execute(f'DELETE FROM "{self.table_name}"')
+        self._sync_generation_in_transaction()
 
 
 def rebuild_sqlite_vec_index(
@@ -243,13 +326,24 @@ def rebuild_sqlite_vec_index(
     load_sqlite_vec(conn)
     try:
         conn.execute("BEGIN IMMEDIATE")
+        _ensure_generation_triggers(conn)
+        source_generation = _generation(conn, SOURCE_GENERATION_KEY)
+        if source_generation is None:
+            source_generation = 0
+            conn.execute(
+                "INSERT INTO enfold_meta(key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (SOURCE_GENERATION_KEY, str(source_generation)),
+            )
         active = _meta(conn, ACTIVE_TABLE_KEY)
         target = TABLE_NAMES[1] if active == TABLE_NAMES[0] else TABLE_NAMES[0]
-        wrong_dim = int(conn.execute(
-            "SELECT COUNT(*) FROM fact_embeddings "
-            "WHERE embedding_identity=? AND dim<>?",
-            (embedding_identity, dimensions),
-        ).fetchone()[0])
+        wrong_dim = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM fact_embeddings "
+                "WHERE embedding_identity=? AND dim<>?",
+                (embedding_identity, dimensions),
+            ).fetchone()[0]
+        )
         if wrong_dim:
             raise SQLiteVecError(
                 f"configured identity has {wrong_dim} vector(s) with the wrong dimension"
@@ -280,7 +374,7 @@ def rebuild_sqlite_vec_index(
             conn.execute(f'DROP TABLE "{target}"')
         conn.execute(
             f'CREATE VIRTUAL TABLE "{target}" USING vec0('
-            f'embedding float[{dimensions}] distance_metric=cosine)'
+            f"embedding float[{dimensions}] distance_metric=cosine)"
         )
         conn.executemany(
             f'INSERT INTO "{target}"(rowid, embedding) VALUES (?, ?)', validated
@@ -292,6 +386,7 @@ def rebuild_sqlite_vec_index(
                 (IDENTITY_KEY, embedding_identity),
                 (DIMENSIONS_KEY, str(dimensions)),
                 (ACTIVE_TABLE_KEY, target),
+                (INDEX_GENERATION_KEY, str(source_generation)),
             ),
         )
         conn.commit()

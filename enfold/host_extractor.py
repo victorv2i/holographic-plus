@@ -4,6 +4,10 @@ The daemon can select this adapter through explicit supervised extraction
 configuration without taking a vendor SDK, credentials, or a shell dependency.
 The child receives one bounded JSON request on stdin and returns one bounded
 JSON response on stdout.
+
+On Windows, descendant cleanup is best-effort through ``taskkill /T``. Pipe
+handles are also closed and reader threads are joined within the configured
+grace period, but the platform cannot provide POSIX process-group guarantees.
 """
 
 from __future__ import annotations
@@ -21,6 +25,11 @@ import time
 from types import MappingProxyType
 from typing import Any, Callable, Mapping, Sequence
 
+from .extractor_artifact import (
+    ArtifactComponent,
+    ExtractorArtifactError,
+    InferenceRecipe,
+)
 from .extraction_processor import ExtractedMemory, ExtractionEnvelope
 
 
@@ -46,9 +55,19 @@ _PROPOSAL_FIELDS = frozenset(
 class HostExtractorError(RuntimeError):
     """Stable, redacted adapter failure suitable for durable queue status."""
 
-    def __init__(self, error_code: str) -> None:
+    def __init__(
+        self,
+        error_code: str,
+        *,
+        retryable: bool = True,
+        retry_after_seconds: float | None = None,
+        consumes_attempt: bool = True,
+    ) -> None:
         super().__init__(error_code)
         self.error_code = error_code
+        self.retryable = bool(retryable)
+        self.retry_after_seconds = retry_after_seconds
+        self.consumes_attempt = bool(consumes_attempt)
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,6 +122,35 @@ class HostExtractorConfig:
         # deliberately allowlist every variable required by the host child.
         object.__setattr__(self, "environment", MappingProxyType(environment))
 
+    def inference_recipe(
+        self,
+        *,
+        model_artifact_digest: str,
+        prompt: ArtifactComponent,
+        schema: ArtifactComponent,
+        source: ArtifactComponent,
+    ) -> InferenceRecipe:
+        """Build a deterministic recipe without inspecting environment values."""
+
+        if prompt.identity != self.prompt_identity:
+            raise ExtractorArtifactError(
+                "prompt artifact identity does not match host configuration"
+            )
+        return InferenceRecipe(
+            adapter_command=self.argv,
+            timeout_seconds=float(self.timeout_seconds),
+            terminate_grace_seconds=float(self.terminate_grace_seconds),
+            max_input_bytes=self.max_input_bytes,
+            max_output_bytes=self.max_output_bytes,
+            max_error_bytes=self.max_error_bytes,
+            environment_names=tuple(self.environment.keys()),
+            model_identity=self.model_identity,
+            model_artifact_digest=model_artifact_digest,
+            prompt=prompt,
+            schema=schema,
+            source=source,
+        )
+
 
 class SubprocessHostExtractor:
     """Run a host-provided extractor command without a shell or inherited env."""
@@ -117,12 +165,19 @@ class SubprocessHostExtractor:
             raise TypeError("config must be HostExtractorConfig")
         self._config = config
         self._popen = popen_factory
+        self._process_lock = threading.Lock()
+        self._active_processes: dict[int, tuple[object, Any, int | None]] = {}
 
     @property
     def identity(self) -> str:
         return f"subprocess:{self._config.model_identity}:{self._config.prompt_identity}"
 
-    def extract(self, envelope: ExtractionEnvelope) -> Sequence[ExtractedMemory]:
+    def extract(
+        self,
+        envelope: ExtractionEnvelope,
+        *,
+        register_invocation: Callable[[object], None] | None = None,
+    ) -> Sequence[ExtractedMemory]:
         payload = self._request_bytes(envelope)
         popen_kwargs: dict[str, Any] = {
             "stdin": subprocess.PIPE,
@@ -142,21 +197,96 @@ class SubprocessHostExtractor:
         except OSError as exc:
             raise HostExtractorError("adapter_unavailable") from exc
         group_id = self._process_group_id(process)
+        invocation = object()
+        with self._process_lock:
+            self._active_processes[id(invocation)] = (invocation, process, group_id)
         try:
-            stdout, _stderr = self._stream_process(process, payload)
-        except HostExtractorError:
-            self._terminate_then_kill(process, group_id)
-            raise
-        except OSError as exc:
-            self._terminate_then_kill(process, group_id)
-            raise HostExtractorError("adapter_unavailable") from exc
-        if process.returncode != 0:
-            self._terminate_then_kill(process, group_id)
-            raise HostExtractorError("adapter_exit")
-        if group_id is not None and self._group_exists(group_id):
-            self._terminate_then_kill(process, group_id)
-            raise HostExtractorError("adapter_cleanup_failed")
-        return self._parse_response(stdout)
+            if register_invocation is not None:
+                try:
+                    register_invocation(invocation)
+                except BaseException:
+                    self._terminate_then_kill(process, group_id)
+                    raise
+            try:
+                stdout, stderr = self._stream_process(process, payload)
+            except HostExtractorError:
+                self._terminate_then_kill(process, group_id)
+                raise
+            except OSError as exc:
+                self._terminate_then_kill(process, group_id)
+                raise HostExtractorError("adapter_unavailable") from exc
+            if process.returncode != 0:
+                self._terminate_then_kill(process, group_id)
+                raise self._exit_error(process.returncode, stderr)
+            if group_id is not None and self._group_exists(group_id):
+                self._terminate_then_kill(process, group_id)
+                raise HostExtractorError("adapter_cleanup_failed")
+            return self._parse_response(stdout)
+        finally:
+            with self._process_lock:
+                self._active_processes.pop(id(invocation), None)
+
+    def cancel(self, invocation: object) -> None:
+        """Best-effort cancellation of one active invocation."""
+
+        with self._process_lock:
+            active = self._active_processes.get(id(invocation))
+        if active is not None and active[0] is invocation:
+            self._terminate_then_kill(*active[1:])
+
+    def _exit_error(self, returncode: object, stderr: bytes = b"") -> HostExtractorError:
+        """Classify documented bundled-child statuses without guessing generics."""
+
+        if self._is_bundled_extractor_child():
+            if returncode == 64:
+                return HostExtractorError("adapter_invalid_config", retryable=False)
+            if returncode == 65:
+                return HostExtractorError("adapter_invalid_input", retryable=False)
+            if returncode == 69:
+                return HostExtractorError("adapter_unavailable", retryable=True)
+            if returncode == 75:
+                return HostExtractorError(
+                    "adapter_rate_limited",
+                    retry_after_seconds=self._retry_hint(stderr),
+                    consumes_attempt=False,
+                )
+            if returncode == 76:
+                return HostExtractorError("adapter_invalid_output", retryable=True)
+        return HostExtractorError("adapter_exit", retryable=True)
+
+    @staticmethod
+    def _retry_hint(stderr: bytes) -> float | None:
+        try:
+            value = json.loads(stderr.decode("ascii"))
+            seconds = value["retry_after_seconds"]
+        except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError):
+            return None
+        if (
+            isinstance(seconds, bool)
+            or not isinstance(seconds, (int, float))
+            or not math.isfinite(float(seconds))
+            or seconds < 0
+        ):
+            return None
+        return float(seconds)
+
+    def _is_bundled_extractor_child(self) -> bool:
+        argv = self._config.argv
+        command_name = os.path.basename(argv[0]).removesuffix(".exe")
+        if command_name in {
+            "enfold-ollama-extractor",
+            "enfold-openai-extractor",
+        }:
+            return True
+        return any(
+            option == "-m"
+            and module
+            in {
+                "enfold.ollama_extractor_child",
+                "enfold.openai_extractor_child",
+            }
+            for option, module in zip(argv, argv[1:])
+        )
 
     def _request_bytes(self, envelope: ExtractionEnvelope) -> bytes:
         if not isinstance(envelope, ExtractionEnvelope):
@@ -181,9 +311,11 @@ class SubprocessHostExtractor:
                 allow_nan=False,
             ).encode("utf-8")
         except (TypeError, ValueError, RecursionError) as exc:
-            raise HostExtractorError("adapter_input_too_large") from exc
+            raise HostExtractorError(
+                "adapter_input_too_large", retryable=False
+            ) from exc
         if len(encoded) > self._config.max_input_bytes:
-            raise HostExtractorError("adapter_input_too_large")
+            raise HostExtractorError("adapter_input_too_large", retryable=False)
         return encoded
 
     def _stream_process(self, process: Any, payload: bytes) -> tuple[bytes, bytes]:
@@ -305,7 +437,10 @@ class SubprocessHostExtractor:
         def reader(stream: Any, target: bytearray, limit: int) -> None:
             try:
                 while True:
-                    chunk = stream.read(8192)
+                    try:
+                        chunk = stream.read(8192)
+                    except (OSError, ValueError):
+                        return
                     if not chunk:
                         return
                     if len(target) + len(chunk) > limit:
@@ -327,24 +462,41 @@ class SubprocessHostExtractor:
                 except OSError:
                     pass
 
+        threads: list[threading.Thread] = []
         for stream, target, limit in (
             (process.stdout, stdout, self._config.max_output_bytes),
             (process.stderr, stderr, self._config.max_error_bytes),
         ):
-            threading.Thread(
+            thread = threading.Thread(
                 target=reader, args=(stream, target, limit), daemon=True
-            ).start()
-        threading.Thread(target=writer, daemon=True).start()
+            )
+            thread.start()
+            threads.append(thread)
+        writer_thread = threading.Thread(target=writer, daemon=True)
+        writer_thread.start()
+        threads.append(writer_thread)
         deadline = time.monotonic() + float(self._config.timeout_seconds)
-        while True:
-            if overflow:
-                raise HostExtractorError(overflow[0])
-            if readers_done.is_set() and process.poll() is not None:
-                process.wait(timeout=0)
-                return bytes(stdout), bytes(stderr)
-            if time.monotonic() >= deadline:
-                raise HostExtractorError("adapter_timeout")
-            time.sleep(0.01)
+        try:
+            while True:
+                if overflow:
+                    raise HostExtractorError(overflow[0])
+                if readers_done.is_set() and process.poll() is not None:
+                    process.wait(timeout=0)
+                    return bytes(stdout), bytes(stderr)
+                if time.monotonic() >= deadline:
+                    raise HostExtractorError("adapter_timeout")
+                time.sleep(0.01)
+        finally:
+            for stream in (process.stdin, process.stdout, process.stderr):
+                try:
+                    stream.close()
+                except (OSError, ValueError):
+                    pass
+            join_deadline = time.monotonic() + float(
+                self._config.terminate_grace_seconds
+            )
+            for thread in threads:
+                thread.join(max(0.0, join_deadline - time.monotonic()))
 
     @staticmethod
     def _process_group_id(process: Any) -> int | None:
@@ -385,11 +537,25 @@ class SubprocessHostExtractor:
         try:
             if group_id is not None:
                 os.killpg(group_id, sig)
+            elif os.name == "nt" and isinstance(getattr(process, "pid", None), int):
+                subprocess.run(
+                    (
+                        "taskkill",
+                        "/PID",
+                        str(process.pid),
+                        "/T",
+                        "/F",
+                    ),
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=float(self._config.terminate_grace_seconds),
+                )
             elif sig == signal.SIGTERM:
                 process.terminate()
             else:
                 process.kill()
-        except (OSError, ProcessLookupError):
+        except (OSError, ProcessLookupError, subprocess.TimeoutExpired):
             pass
 
     def _wait_for_exit(self, process: Any, group_id: int | None) -> bool:

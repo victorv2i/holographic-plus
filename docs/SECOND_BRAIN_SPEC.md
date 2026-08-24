@@ -6,7 +6,7 @@ Compatibility baseline: Enfold 0.7.x
 
 ## 1. Purpose
 
-Enfold is a local-first memory service shared by multiple AI-agent surfaces.
+Enfold is a local-first memory service shared by multiple client surfaces.
 Its primary deployment target is one machine running Hermes and other MCP
 clients against one canonical memory store.
 
@@ -77,7 +77,7 @@ Each adapter establishes immutable connection context:
 - `client_id`: stable installation identity;
 - `surface`: `hermes`, `mcp-client-a`, `mcp-client-b`, `mcp`, or another registered
   surface;
-- `agent_id`: `wonny`, a Hermes cron/delegate identifier, or client agent;
+- `agent_id`: `primary`, a Hermes cron/delegate identifier, or client agent;
 - `session_id`: conversation or task identifier;
 - `parent_agent_id`: optional delegation parent;
 - `project_root`, `repository`, `branch`, and `commit`: optional development

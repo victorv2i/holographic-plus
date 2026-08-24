@@ -65,6 +65,39 @@ stops future claims during shutdown, and stops before its connection closes.
 Automatic extraction remains disabled by default and is repository-verified,
 not rehearsed against a copy of the real store or live-activated.
 
+An extractor-selected exact transcript span establishes provenance, not semantic
+entailment. Each automatic proposal must name one exact `evidence_span_id`, and
+the processor requires a separately configured, trusted evidence verifier to
+return `verified` before it writes canonical memory. With no verifier, the safe
+default is `needs_review`: the job is dead-lettered as
+`proposal_support_unverified` and no fact, observation, or provenance record is
+written. A verifier must be independent of the extractor; lexical containment
+or substring matching is not a verifier. Worker health exposes whether this
+boundary is configured. Legacy raw queue payloads and legacy bare proposal
+snapshots are likewise quarantined and never replayed into canonical memory.
+
+Verified typed extraction persists `memory_kind`, subject, predicate, object,
+confidence, and temporal value on the fact itself for `state`, `preference`,
+`commitment`, and `event`. Only `state` uses exact state-slot supersession and
+conflict semantics; the other kinds remain attributed non-slot facts.
+
+Validated proposal batches now commit all authoritative facts, state changes,
+provenance, write logs, embedding jobs, and leased-row completion together.
+Any late failure rolls the batch back while preserving its proposal snapshot
+for a deterministic retry; external query embedding is kept outside the write
+transaction.
+
+Daemon-supervised extraction activation is additionally fail-closed on two
+pins: the bundled local Ollama tag must resolve to the configured immutable
+model digest, and the measured inference recipe must match its configured
+digest. The recipe covers the model artifact, argv and supervisor limits,
+prompt, schema, adapter executable, and installed child-side sources. Both
+checks run before the database is opened. Check and authenticated health expose
+only the verified/not-required state and recipe format version, never digests
+or Ollama registry payloads. The worker periodically repeats attestation before
+claiming more queue work and pauses claims on failure, closing the mutable-tag
+drift window without dead-lettering unclaimed jobs.
+
 ## Dense embedding boundary
 
 Stored semantic retrieval validates an exact model identity, version,

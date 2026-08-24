@@ -87,7 +87,12 @@ def test_slow_query_embedding_does_not_block_write_or_second_read(
             embedder.embed(query)
             return []
 
-    def retriever_factory(_config, _connection, _query_embedder=None):
+    def retriever_factory(
+        _config,
+        _connection,
+        _query_embedder=None,
+        _vector_fallback_telemetry=None,
+    ):
         return lambda _conn, _scopes: SlowRetriever()
 
     original_open = server_module._open_existing_v1
@@ -224,7 +229,7 @@ def test_every_projection_method_routes_through_read_pool(method):
     router = PerRequestReadHandler(
         mutation_handler, open_read_connection, build_read_handler
     )
-    context = ClientContext("test", "codex", "codex", "session")
+    context = ClientContext("test", "terminal", "terminal", "session")
 
     assert router(context, Request("request", method, {})) == method
     assert handled == [(opened[0], method)]

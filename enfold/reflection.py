@@ -42,11 +42,13 @@ import logging
 import re
 import sqlite3
 import threading
+from contextlib import nullcontext
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
 _SUPERSEDED_PREFIXES = ("superseded", "stale/disabled", "historical/superseded")
+_COSINE_POPULATION_LIMIT = 2_000
 
 
 # ── Schema: durable min-interval clock ──────────────────────────────────────
@@ -103,7 +105,12 @@ def _is_legacy_superseded(content: str) -> bool:
 def _active_fact_rows(conn: sqlite3.Connection) -> Dict[int, Dict[str, Any]]:
     """All currently-valid source facts as ``{fact_id: {content, category}}``."""
     cols = {row[1] for row in conn.execute("PRAGMA table_info(facts)").fetchall()}
-    where = " WHERE invalid_at IS NULL" if "invalid_at" in cols else ""
+    predicates = [
+        f"{column} IS NULL"
+        for column in ("invalid_at", "superseded_by", "conflict_group")
+        if column in cols
+    ]
+    where = f" WHERE {' AND '.join(predicates)}" if predicates else ""
     rows = conn.execute(f"SELECT fact_id, content, category FROM facts{where}").fetchall()
     return {
         int(r["fact_id"]): dict(r)
@@ -115,20 +122,30 @@ def _active_fact_rows(conn: sqlite3.Connection) -> Dict[int, Dict[str, Any]]:
 def _sources_still_active(conn: sqlite3.Connection, source_ids: List[int]) -> bool:
     if not source_ids:
         return False
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(facts)").fetchall()}
+    selected = ["fact_id", "content", "category"]
+    selected.extend(
+        column
+        for column in ("invalid_at", "superseded_by", "conflict_group")
+        if column in cols
+    )
     placeholders = ",".join("?" * len(source_ids))
     rows = conn.execute(
-        f"SELECT fact_id, content, category, invalid_at FROM facts "
+        f"SELECT {', '.join(selected)} FROM facts "
         f"WHERE fact_id IN ({placeholders})",
         source_ids,
     ).fetchall()
     if len(rows) != len(set(source_ids)):
         return False
     for row in rows:
-        if row["invalid_at"] is not None:
-            return False
         if row["category"] == "insight":
             return False
         if _is_legacy_superseded(row["content"]):
+            return False
+        if any(
+            column in row.keys() and row[column] is not None
+            for column in ("invalid_at", "superseded_by", "conflict_group")
+        ):
             return False
     return True
 
@@ -177,6 +194,7 @@ def _cosine_clusters(
     embedding_identity: Optional[str],
     cosine_low: float,
     cosine_high: float,
+    max_clusters: int,
 ) -> List[List[int]]:
     """Pairs of active facts whose dense cosine similarity is in
     ``[cosine_low, cosine_high)``: related, but not near-duplicates (the
@@ -193,19 +211,24 @@ def _cosine_clusters(
     if matrix.size == 0:
         return []
 
-    ids = ids_arr.astype(int).tolist()
-    sims = matrix @ matrix.T
+    active_indices = [
+        index for index, fact_id in enumerate(ids_arr) if int(fact_id) in active_ids
+    ][:_COSINE_POPULATION_LIMIT]
+    if len(active_indices) < 2:
+        return []
+    ids = ids_arr[active_indices].astype(int).tolist()
+    matrix = matrix[active_indices]
     clusters: List[List[int]] = []
     n = len(ids)
     for i in range(n):
-        if ids[i] not in active_ids:
-            continue
-        for j in range(i + 1, n):
-            if ids[j] not in active_ids:
-                continue
-            sim = float(sims[i][j])
+        similarities = matrix[i + 1:] @ matrix[i]
+        for offset, similarity in enumerate(similarities, start=1):
+            j = i + offset
+            sim = float(similarity)
             if cosine_low <= sim < cosine_high:
                 clusters.append(sorted({ids[i], ids[j]}))
+                if len(clusters) >= max_clusters:
+                    return clusters
     return clusters
 
 
@@ -243,7 +266,12 @@ def select_clusters(
     clusters = _entity_clusters(conn, active_ids, entity_hub_degree_limit)
     if len(clusters) < max_clusters:
         clusters += _cosine_clusters(
-            embed_store, active_ids, embedding_identity, cosine_low, cosine_high
+            embed_store,
+            active_ids,
+            embedding_identity,
+            cosine_low,
+            cosine_high,
+            max_clusters - len(clusters),
         )
     return clusters[:max_clusters]
 
@@ -251,7 +279,7 @@ def select_clusters(
 # ── Prompt + defensive parse ─────────────────────────────────────────────────
 
 _SYSTEM = """\
-You are a memory reflection assistant for an AI agent called Hermes.
+You are a memory reflection assistant for the Hermes client.
 You will be shown a small cluster of related facts already in long-term memory.
 
 Your job: decide whether these facts, taken TOGETHER, imply ONE durable
@@ -290,10 +318,10 @@ def _parse_reflection_response(raw: str, valid_ids) -> Optional[Dict[str, Any]]:
 
     Returns ``{"insight": str, "source_fact_ids": [int, ...]}`` only when the
     response is valid JSON, the insight is non-empty and not the literal
-    "NONE", and every cited id is a member of *valid_ids* with at least one
-    citation present. Any other shape (garbage, missing citations, citations
-    outside the cluster, an explicit NONE) returns None: reflection is
-    strictly grounded, so an ungrounded or unparseable response is always
+    "NONE", and every cited id is a member of *valid_ids* with at least two
+    distinct citations present. Any other shape (garbage, missing citations,
+    citations outside the cluster, an explicit NONE) returns None: reflection
+    is strictly grounded, so an ungrounded or unparseable response is always
     treated as "nothing to add" rather than guessed at.
     """
     text = (raw or "").strip()
@@ -324,12 +352,12 @@ def _parse_reflection_response(raw: str, valid_ids) -> Optional[Dict[str, Any]]:
         return None
 
     try:
-        cited = [int(i) for i in raw_ids]
+        cited = list(dict.fromkeys(int(i) for i in raw_ids))
     except (TypeError, ValueError):
         return None
 
     valid = set(int(v) for v in valid_ids)
-    if not cited or any(i not in valid for i in cited):
+    if len(cited) < 2 or any(i not in valid for i in cited):
         return None
 
     return {"insight": insight, "source_fact_ids": cited}
@@ -463,6 +491,7 @@ def run_reflection(
     entity_hub_degree_limit: int = 25,
     dedup_check=None,
     insert_fact,
+    insert_guard=None,
     lock: Optional["threading.RLock"] = None,
 ) -> int:
     """Run one opportunistic reflection pass; returns the number of insights inserted.
@@ -478,7 +507,8 @@ def run_reflection(
     *lock*, when given, is held only around each DB read/write, the same
     pattern the extraction queue worker uses: an LLM call (network I/O, can
     take seconds) never holds the store lock, so it never blocks a
-    concurrent session-thread fact add or search.
+    concurrent session-thread fact add or search. *insert_guard*, when given,
+    is acquired before *lock* for the final source revalidation and insert.
     """
     if not enabled:
         return 0
@@ -526,14 +556,6 @@ def run_reflection(
         source_ids = sorted(result["source_fact_ids"])
         tags = "source_facts:" + ",".join(str(i) for i in source_ids)
 
-        with lock:
-            if not _sources_still_active(conn, source_ids):
-                logger.debug(
-                    "reflection: skipped insight with stale source facts %s",
-                    source_ids,
-                )
-                continue
-
         if dedup_check is not None:
             try:
                 dup = dedup_check(content, category="insight")
@@ -548,7 +570,16 @@ def run_reflection(
                 continue
 
         try:
-            fact_id = insert_fact(content, category="insight", tags=tags)
+            guard = insert_guard() if insert_guard is not None else nullcontext()
+            with guard:
+                with lock:
+                    if not _sources_still_active(conn, source_ids):
+                        logger.debug(
+                            "reflection: skipped insight with stale source facts %s",
+                            source_ids,
+                        )
+                        continue
+                    fact_id = insert_fact(content, category="insight", tags=tags)
         except Exception as exc:
             logger.debug("reflection: insert failed: %s", exc)
             continue

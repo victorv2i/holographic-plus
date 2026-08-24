@@ -9,9 +9,12 @@ run concurrently on connections owned by the application.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import errno
+import hashlib
+import hmac
 import logging
+import math
 import os
 from pathlib import Path
 import socket
@@ -19,6 +22,7 @@ import stat
 import struct
 import threading
 import time
+from types import MappingProxyType
 from typing import Any, Optional, Protocol
 
 from .protocol import (
@@ -60,6 +64,13 @@ READ_ONLY_METHODS = frozenset({
     "memory.entities",
     "memory.entity",
     "memory.conflicts",
+})
+
+_EXTRACTION_ENQUEUE_VALIDATION_ERRORS = frozenset({
+    "transcript, source, and scope must be non-empty",
+    "extraction scope must be present in context access scopes",
+    "extraction metadata must contain JSON values",
+    "canonical extraction payload exceeds size limit",
 })
 
 
@@ -153,6 +164,7 @@ class DaemonConfig:
     shutdown_timeout: float = 5.0
     backlog: int = 16
     cleanup_stale_socket: bool = False
+    client_credentials: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "socket_path", Path(self.socket_path))
@@ -163,10 +175,36 @@ class DaemonConfig:
         object.__setattr__(self, "server_capabilities", tuple(self.server_capabilities))
         if self.max_frame_bytes < 512:
             raise ValueError("max_frame_bytes must be at least 512")
-        if self.client_timeout <= 0 or self.shutdown_timeout <= 0:
+        if any(
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or not math.isfinite(timeout)
+            or timeout <= 0
+            for timeout in (self.client_timeout, self.shutdown_timeout)
+        ):
             raise ValueError("timeouts must be positive")
         if self.backlog <= 0:
             raise ValueError("backlog must be positive")
+        credentials: dict[str, str] = {}
+        for client_id, digest in self.client_credentials.items():
+            if not isinstance(client_id, str) or not client_id.strip():
+                raise ValueError("client credential IDs must not be empty")
+            if (
+                not isinstance(digest, str)
+                or len(digest) != 71
+                or not digest.startswith("sha256:")
+            ):
+                raise ValueError("client credentials must be sha256 digests")
+            try:
+                bytes.fromhex(digest.removeprefix("sha256:"))
+            except ValueError as exc:
+                raise ValueError("client credentials must be sha256 digests") from exc
+            credentials[client_id.strip()] = digest.lower()
+        if len(set(credentials.values())) != len(credentials):
+            raise ValueError("client credentials must be unique per client")
+        object.__setattr__(
+            self, "client_credentials", MappingProxyType(credentials)
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -263,6 +301,19 @@ class UnixJsonDaemon:
                 continue
             thread.join(max(0.0, deadline - time.monotonic()))
         self._unlink_owned_socket()
+        if self.has_live_threads():
+            raise DaemonError("daemon request-handler threads did not stop cleanly")
+
+    def has_live_threads(self) -> bool:
+        """Return whether a serve or request-handler thread is still running."""
+
+        serve_thread = self._serve_thread
+        with self._clients_lock:
+            client_threads = tuple(self._client_threads)
+        return bool(
+            (serve_thread is not None and serve_thread.is_alive())
+            or any(thread.is_alive() for thread in client_threads)
+        )
 
     def request_shutdown(self) -> None:
         """Signal the serve loop without taking locks or joining threads.
@@ -528,7 +579,27 @@ class UnixJsonDaemon:
                 error=ProtocolError(exc.code, exc.message),
                 schema_version=self.config.schema_version,
             )
+        except ValueError as exc:
+            if (
+                decoded.method == "memory.extraction.enqueue"
+                and str(exc) in _EXTRACTION_ENQUEUE_VALIDATION_ERRORS
+            ):
+                response = Response(
+                    decoded.request_id,
+                    False,
+                    error=ProtocolError("invalid_params", str(exc)),
+                    schema_version=self.config.schema_version,
+                )
+            else:
+                logger.exception("request handler failed")
+                response = Response(
+                    decoded.request_id,
+                    False,
+                    error=ProtocolError("internal_error", "request handler failed"),
+                    schema_version=self.config.schema_version,
+                )
         except Exception:
+            logger.exception("request handler failed")
             response = Response(
                 decoded.request_id,
                 False,
@@ -559,6 +630,19 @@ class UnixJsonDaemon:
                 f"client schema {handshake.schema_version}; server schema "
                 f"{self.config.schema_version}",
             ), None
+        if self.config.client_credentials:
+            expected = self.config.client_credentials.get(handshake.context.client_id)
+            supplied = handshake.credential
+            actual = (
+                "sha256:" + hashlib.sha256(supplied.encode("utf-8")).hexdigest()
+                if supplied is not None
+                else ""
+            )
+            if expected is None or not hmac.compare_digest(expected, actual):
+                return self._handshake_refusal(
+                    "invalid_client_credentials",
+                    "client identity credentials were not accepted",
+                ), None
         return response, _NegotiatedConnection(
             context=handshake.context,
             capabilities=response.capabilities,

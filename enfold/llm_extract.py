@@ -19,6 +19,9 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
+from .policy import default_credential_screen
+from .provenance import WriteRequest
+
 if TYPE_CHECKING:
     from plugins.memory.holographic.store import MemoryStore
 
@@ -31,10 +34,14 @@ class InsertFactsResult:
     skipped: int = 0
     failed: int = 0
 
+
+class ExtractionParseError(ValueError):
+    """The model response could not be parsed as an extraction array."""
+
 # ── Prompt ────────────────────────────────────────────────────────────────────
 
 _SYSTEM = """\
-You are a memory extraction assistant for an AI agent called Hermes.
+You are a memory extraction assistant for the Hermes client.
 Your job: read a conversation and extract atomic facts worth remembering long-term.
 
 RULES:
@@ -221,20 +228,23 @@ def _parse_response(raw: str) -> List[Dict[str, str]]:
     raw = raw.strip()
     try:
         parsed = json.loads(raw)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as direct_error:
         block = _extract_json_array(raw)
         if block is None:
-            logger.debug("llm_extract: no JSON array in response: %r", raw[:200])
-            return []
+            raise ExtractionParseError(
+                "extraction response contains no JSON array "
+                f"(length={len(raw)}, parse_error_pos={direct_error.pos})"
+            ) from direct_error
         try:
             parsed = json.loads(block)
         except json.JSONDecodeError as exc:
-            logger.debug("llm_extract: JSON parse failed (%s) on: %r", exc, block[:300])
-            return []
+            raise ExtractionParseError(
+                "extraction response contains invalid JSON "
+                f"(length={len(raw)}, parse_error_pos={exc.pos})"
+            ) from exc
 
     if not isinstance(parsed, list):
-        logger.debug("llm_extract: response is not a list: %r", str(parsed)[:200])
-        return []
+        raise ExtractionParseError("extraction response must be a JSON array")
     validated = []
     for item in parsed:
         if not isinstance(item, dict):
@@ -298,18 +308,46 @@ def extract_facts_from_transcript(
     return _parse_response(raw)
 
 
-def _content_exists(store: "MemoryStore", content: str) -> bool:
+def _existing_fact_id(store: "MemoryStore", content: str) -> Optional[int]:
     conn = getattr(store, "_conn", None)
     if conn is None:
-        return False
+        return None
     try:
         row = conn.execute(
             "SELECT fact_id FROM facts WHERE content = ? LIMIT 1",
             (content,),
         ).fetchone()
     except Exception:
-        return False
-    return row is not None
+        return None
+    return int(row[0]) if row is not None else None
+
+
+def _credential_shaped(content: str, category: str, tags: str) -> bool:
+    request = WriteRequest(
+        idempotency_key="legacy-extraction-screen",
+        content=content,
+        source_type="automatic_extraction",
+        category=category,
+        tags=tags,
+    )
+    return default_credential_screen(request) is not None
+
+
+def _finish_supersede(
+    content: str,
+    category: str,
+    fact_id: int,
+    *,
+    update_check,
+    supersede,
+) -> bool:
+    if update_check is None or supersede is None:
+        return True
+    update_target = update_check(content, category=category)
+    if update_target is None or int(update_target["fact_id"]) == int(fact_id):
+        return True
+    result = supersede(int(update_target["fact_id"]), int(fact_id))
+    return result is not False
 
 
 def _total_changes(store: "MemoryStore") -> Optional[int]:
@@ -328,8 +366,9 @@ def insert_facts(
 ) -> InsertFactsResult:
     """Insert extracted facts into the store and return outcome counts.
 
-    Per-fact storage failures are logged and counted so the queue can retry
-    the transcript. Duplicates and empty facts count as skipped, not failed.
+    Per-fact storage and supersede failures are logged and counted so the
+    queue can retry its persisted proposal snapshot. Duplicates, unsafe
+    credential-shaped proposals, and empty facts count as skipped.
 
     When *dedup_check* is given (the provider's near-duplicate gate, the same
     one the interactive fact_store "add" action uses), each fact is checked
@@ -353,16 +392,58 @@ def insert_facts(
             if not content:
                 skipped += 1
                 continue
+            if _credential_shaped(content, category, tags):
+                logger.warning(
+                    "llm_extract: dropped credential-shaped extraction proposal"
+                )
+                skipped += 1
+                continue
             if dedup_check is not None:
                 dup = dedup_check(content, category=category)
                 if dup is not None:
+                    if dup.get("content", "").strip() == content:
+                        try:
+                            completed = _finish_supersede(
+                                content,
+                                category,
+                                int(dup["fact_id"]),
+                                update_check=update_check,
+                                supersede=supersede,
+                            )
+                        except Exception as sup_exc:
+                            completed = False
+                            logger.warning(
+                                "llm_extract: supersede retry failed for %s: %s",
+                                dup.get("fact_id"), sup_exc,
+                            )
+                        if not completed:
+                            failed += 1
+                            continue
                     logger.debug(
                         "llm_extract: skipped near-duplicate of fact %s: %r",
                         dup.get("fact_id"), content[:80],
                     )
                     skipped += 1
                     continue
-            if _content_exists(store, content):
+            existing_id = _existing_fact_id(store, content)
+            if existing_id is not None:
+                try:
+                    completed = _finish_supersede(
+                        content,
+                        category,
+                        existing_id,
+                        update_check=update_check,
+                        supersede=supersede,
+                    )
+                except Exception as sup_exc:
+                    completed = False
+                    logger.warning(
+                        "llm_extract: supersede retry failed for %d: %s",
+                        existing_id, sup_exc,
+                    )
+                if not completed:
+                    failed += 1
+                    continue
                 skipped += 1
                 continue
             update_target = None
@@ -386,9 +467,21 @@ def insert_facts(
                     logger.debug("llm_extract: embed callback failed for %d: %s", fact_id, emb_exc)
             if update_target is not None and fact_id and int(update_target["fact_id"]) != int(fact_id):
                 try:
-                    supersede(int(update_target["fact_id"]), int(fact_id))
+                    completed = supersede(
+                        int(update_target["fact_id"]), int(fact_id)
+                    )
                 except Exception as sup_exc:
-                    logger.debug("llm_extract: supersede callback failed for %d: %s", fact_id, sup_exc)
+                    completed = False
+                    logger.warning(
+                        "llm_extract: supersede callback failed for %d: %s",
+                        fact_id, sup_exc,
+                    )
+                if completed is False:
+                    failed += 1
+                    logger.warning(
+                        "llm_extract: supersede callback reported failure for %d",
+                        fact_id,
+                    )
         except Exception as exc:
             failed += 1
             logger.debug("llm_extract: add_fact failed: %s", exc)

@@ -12,6 +12,7 @@ from enfold.backup import (
     restore_database,
     verify_database,
 )
+from enfold.sqlite_vec_index import SQLiteVecError, load_sqlite_vec
 
 
 def _make_database(path):
@@ -64,6 +65,52 @@ def test_restore_round_trip_is_verified(tmp_path):
             ("one",),
             ("two",),
         ]
+
+
+def test_backup_and_restore_verify_vec0_virtual_tables(tmp_path):
+    pytest.importorskip("sqlite_vec")
+    source = tmp_path / "vec-source.db"
+    backup = tmp_path / "vec-backup.db"
+    restored = tmp_path / "vec-restored.db"
+    with sqlite3.connect(source) as conn:
+        load_sqlite_vec(conn)
+        conn.execute(
+            "CREATE VIRTUAL TABLE enfold_vectors "
+            "USING vec0(embedding float[2] distance_metric=cosine)"
+        )
+        conn.commit()
+
+    copied = backup_database(source, backup)
+    round_trip = restore_database(backup, restored)
+
+    assert copied.ok is True
+    assert round_trip.ok is True
+    with sqlite3.connect(restored) as conn:
+        load_sqlite_vec(conn)
+        assert conn.execute("SELECT count(*) FROM enfold_vectors").fetchone()[0] == 0
+
+
+def test_vec0_verification_fails_closed_when_extension_is_unavailable(
+    tmp_path, monkeypatch
+):
+    pytest.importorskip("sqlite_vec")
+    path = tmp_path / "vec.db"
+    with sqlite3.connect(path) as conn:
+        load_sqlite_vec(conn)
+        conn.execute(
+            "CREATE VIRTUAL TABLE enfold_vectors "
+            "USING vec0(embedding float[2] distance_metric=cosine)"
+        )
+        conn.commit()
+    conn = sqlite3.connect(path)
+
+    def unavailable(_conn):
+        raise SQLiteVecError("fixture extension unavailable")
+
+    monkeypatch.setattr("enfold.backup.load_sqlite_vec", unavailable)
+    with pytest.raises(BackupError, match="requires sqlite-vec"):
+        verify_database(conn)
+    conn.close()
 
 
 def test_backup_refuses_to_overwrite_without_opt_in(tmp_path):

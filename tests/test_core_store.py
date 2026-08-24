@@ -2,11 +2,13 @@ import sqlite3
 
 import pytest
 
+import enfold.core_store as core_store
 from enfold.core_store import (
     active_facts,
     connect_database,
     ensure_core_schema,
     get_active_fact,
+    historical_facts_by_id,
     insert_fact,
     link_fact_entities,
     resolve_entity,
@@ -30,6 +32,32 @@ def test_connection_factory_applies_sqlite_operational_pragmas(tmp_path):
     assert conn.execute("PRAGMA synchronous").fetchone()[0] == 1
     assert conn.row_factory is sqlite3.Row
     conn.close()
+
+
+def test_connection_factory_fails_closed_when_wal_is_unavailable(
+    tmp_path, monkeypatch
+):
+    class Cursor:
+        def fetchone(self):
+            return ("delete",)
+
+    class Connection:
+        row_factory = None
+        closed = False
+
+        def execute(self, _sql):
+            return Cursor()
+
+        def close(self):
+            self.closed = True
+
+    connection = Connection()
+    monkeypatch.setattr(core_store.sqlite3, "connect", lambda *args, **kwargs: connection)
+
+    with pytest.raises(RuntimeError, match="cannot enable WAL"):
+        connect_database(tmp_path / "memory.db")
+
+    assert connection.closed
 
 
 def test_owned_schema_has_current_fact_entity_and_fts_shape(tmp_path):
@@ -74,9 +102,9 @@ def test_fresh_store_preserves_repeated_historical_content(tmp_path):
     """State can legitimately change X -> Y -> X without losing history."""
 
     conn = _store(tmp_path)
-    first = insert_fact(conn, "Victor prefers the compact layout")
-    middle = insert_fact(conn, "Victor prefers the spacious layout")
-    latest = insert_fact(conn, "Victor prefers the compact layout")
+    first = insert_fact(conn, "Avery prefers the compact layout")
+    middle = insert_fact(conn, "Avery prefers the spacious layout")
+    latest = insert_fact(conn, "Avery prefers the compact layout")
     conn.execute(
         "UPDATE facts SET superseded_by = ? WHERE fact_id = ?", (middle, first)
     )
@@ -114,8 +142,8 @@ def test_active_reads_exclude_invalid_and_superseded_facts(tmp_path):
 
 def test_scope_predicate_is_enforced_before_active_and_fts_results(tmp_path):
     conn = _store(tmp_path)
-    private = insert_fact(conn, "Victor private planning", scope="private")
-    work = insert_fact(conn, "Victor work planning", scope="work")
+    private = insert_fact(conn, "Avery private planning", scope="private")
+    work = insert_fact(conn, "Avery work planning", scope="work")
     conn.commit()
 
     assert [row["fact_id"] for row in active_facts(conn, allowed_scopes=("work",))] == [work]
@@ -126,10 +154,53 @@ def test_scope_predicate_is_enforced_before_active_and_fts_results(tmp_path):
     conn.close()
 
 
+def test_sensitive_reads_require_matching_sensitivity_capability(tmp_path):
+    conn = _store(tmp_path)
+    normal = insert_fact(
+        conn, "Avery normal planning", scope="private", sensitivity="normal"
+    )
+    sensitive = insert_fact(
+        conn, "Avery sensitive planning", scope="private", sensitivity="sensitive"
+    )
+    secret = insert_fact(
+        conn, "Avery secret planning", scope="private", sensitivity="secret"
+    )
+    conn.commit()
+
+    assert [
+        row["fact_id"]
+        for row in active_facts(conn, allowed_scopes=("private",))
+    ] == [normal]
+    assert [
+        row["fact_id"]
+        for row in active_facts(conn, allowed_scopes=("private", "sensitive"))
+    ] == [sensitive, normal]
+    assert [
+        row["fact_id"]
+        for row in search_fts(
+            conn, "planning", allowed_scopes=("private", "secret")
+        )
+    ] == [secret, normal]
+    assert get_active_fact(conn, sensitive, allowed_scopes=("private",)) is None
+    assert (
+        get_active_fact(
+            conn, sensitive, allowed_scopes=("private", "sensitive")
+        )["fact_id"]
+        == sensitive
+    )
+    assert [
+        row["fact_id"]
+        for row in historical_facts_by_id(
+            conn, (normal, sensitive, secret), allowed_scopes=("private",)
+        )
+    ] == [normal]
+    conn.close()
+
+
 def test_unresolved_conflicts_are_not_returned_as_settled_truth(tmp_path):
     conn = _store(tmp_path)
-    settled = insert_fact(conn, "Victor uses the compact layout")
-    disputed = insert_fact(conn, "Victor uses the spacious layout")
+    settled = insert_fact(conn, "Avery uses the compact layout")
+    disputed = insert_fact(conn, "Avery uses the spacious layout")
     conn.execute(
         "UPDATE facts SET conflict_group = 'layout-conflict' WHERE fact_id = ?",
         (disputed,),
@@ -144,10 +215,10 @@ def test_unresolved_conflicts_are_not_returned_as_settled_truth(tmp_path):
 
 def test_entity_resolution_and_links_share_callers_transaction(tmp_path):
     conn = _store(tmp_path)
-    fact_id = insert_fact(conn, "Victor uses Enfold")
-    victor = resolve_entity(conn, "Victor", entity_type="person")
-    assert resolve_entity(conn, "victor") == victor
-    link_fact_entities(conn, fact_id, (victor,))
+    fact_id = insert_fact(conn, "Avery uses Enfold")
+    avery = resolve_entity(conn, "Avery", entity_type="person")
+    assert resolve_entity(conn, "avery") == avery
+    link_fact_entities(conn, fact_id, (avery,))
     conn.rollback()
 
     assert conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0] == 0

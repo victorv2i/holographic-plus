@@ -46,10 +46,10 @@ def test_attributed_enqueue_is_after_commit_model_free_and_idempotent(tmp_path):
     queue = ExtractionEnqueuer(conn)
 
     first = queue.enqueue_after_commit(
-        _context(), "Victor prefers local memory.", source="session_end"
+        _context(), "Avery prefers local memory.", source="session_end"
     )
     second = queue.enqueue_after_commit(
-        _context(), "Victor prefers local memory.", source="session_end"
+        _context(), "Avery prefers local memory.", source="session_end"
     )
 
     assert first.replayed is False

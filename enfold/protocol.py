@@ -291,6 +291,7 @@ class Handshake:
     capabilities: tuple[str, ...] = SUPPORTED_CAPABILITIES
     protocol: ProtocolVersion = field(default_factory=ProtocolVersion)
     schema_version: int = SUPPORTED_SCHEMA_VERSION
+    credential: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.context, ClientContext):
@@ -299,19 +300,32 @@ class Handshake:
         if not isinstance(self.protocol, ProtocolVersion):
             raise ProtocolValidationError("protocol must be ProtocolVersion")
         object.__setattr__(self, "schema_version", _strict_int(self.schema_version, "schema_version"))
+        if self.credential is not None:
+            object.__setattr__(
+                self,
+                "credential",
+                _required_string(self.credential, "credential", token=True),
+            )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        value = {
             "type": "handshake",
             "protocol": self.protocol.to_dict(),
             "schema_version": self.schema_version,
             "capabilities": list(self.capabilities),
             "context": self.context.to_dict(),
         }
+        if self.credential is not None:
+            value["credential"] = self.credential
+        return value
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "Handshake":
-        _check_keys(data, {"type", "protocol", "schema_version", "capabilities", "context"})
+        _check_keys(
+            data,
+            {"type", "protocol", "schema_version", "capabilities", "context"},
+            {"credential"},
+        )
         if data["type"] != "handshake":
             raise ProtocolValidationError("frame type must be handshake")
         return cls(
@@ -319,6 +333,7 @@ class Handshake:
             capabilities=_string_tuple(data["capabilities"], "capabilities"),
             protocol=ProtocolVersion.from_dict(data["protocol"]),
             schema_version=_strict_int(data["schema_version"], "schema_version"),
+            credential=_optional_string(data.get("credential"), "credential"),
         )
 
 

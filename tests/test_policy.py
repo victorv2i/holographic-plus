@@ -83,6 +83,19 @@ def test_secret_classification_and_common_credential_shapes_are_rejected():
     assert decision == PolicyDecision("rejected", "credential-shaped content")
 
 
+def test_sensitive_write_requires_matching_client_capability():
+    ordinary = MemoryPolicy({"client-a-install": ("private",)})
+    privileged = MemoryPolicy(
+        {"client-a-install": ("private", "sensitive")}
+    )
+    request = _request(scope="private", sensitivity="sensitive")
+
+    assert ordinary.evaluate_write(
+        request, client_id="client-a-install"
+    ) == PolicyDecision("rejected", "sensitive durable write is not authorized")
+    assert privileged.evaluate_write(request, client_id="client-a-install") is None
+
+
 def test_credential_screen_covers_metadata_tags_and_source_uri():
     policy = MemoryPolicy({"client-a-install": ("private",)})
 
@@ -94,6 +107,22 @@ def test_credential_screen_covers_metadata_tags_and_source_uri():
         assert policy.evaluate_write(request) == PolicyDecision(
             "rejected", "credential-shaped content"
         )
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "My deployment API token is " + "sk-" + "arena-7F3A9Z.",
+        "The client secret was abcdefgh12345678.",
+        "My password is correct-horse-battery-staple.",
+    ],
+)
+def test_credential_screen_covers_natural_language_disclosure(content):
+    policy = MemoryPolicy({"client-a-install": ("private",)})
+
+    assert policy.evaluate_write(_request(content=content)) == PolicyDecision(
+        "rejected", "credential-shaped content"
+    )
 
 
 def test_custom_credential_screen_can_request_human_review():
@@ -129,7 +158,7 @@ def test_correction_claims_require_explicit_server_authority():
 @pytest.mark.parametrize(
     "value",
     [
-        "postgresql://user:password123@example.test/db",
+        "postgresql://user:" + "password123" + "@example.test/db",
         # Joined at runtime so secret scanners never see a contiguous token.
         "-".join(("xoxb", "1234567890", "abcdefghijklmnop")),
         "eyJabcdefghij.abcdefghijkl.abcdefghijkl",

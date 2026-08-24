@@ -9,8 +9,9 @@ the adapter testable without installing or importing Hermes.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from hashlib import sha256
+import math
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -125,6 +126,7 @@ class HermesAdapterConfig:
     client_id: str = HERMES_CLIENT_ID
     connect_timeout: float = 2.0
     request_timeout: float = 5.0
+    credential: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "socket_path", Path(self.socket_path))
@@ -132,6 +134,18 @@ class HermesAdapterConfig:
             raise ValueError("socket_path must be absolute")
         if not self.client_id.strip():
             raise ValueError("client_id must not be empty")
+        if self.credential is not None and (
+            not isinstance(self.credential, str) or not self.credential.strip()
+        ):
+            raise ValueError("credential must not be empty")
+        if any(
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or not math.isfinite(timeout)
+            or timeout <= 0
+            for timeout in (self.connect_timeout, self.request_timeout)
+        ):
+            raise ValueError("timeouts must be positive")
 
 
 class HermesProtocolAdapter:
@@ -157,6 +171,7 @@ class HermesProtocolAdapter:
             context=context,
             connect_timeout=self.config.connect_timeout,
             request_timeout=self.config.request_timeout,
+            credential=self.config.credential,
         )
         transport = self._transport_factory(client_config)
         return HermesMemorySession(

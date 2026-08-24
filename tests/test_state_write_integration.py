@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import sqlite3
 
+import pytest
+
 from enfold.policy import MemoryPolicy
 from enfold.provenance import ConnectionContext, WriteRequest
 from enfold.schema import migrate
@@ -109,12 +111,16 @@ def test_migrated_store_typed_state_add_dedup_supersede_and_replay():
         valid_from="2026-07-12T12:00:00Z",
     )
     assert replacement.outcome == "supersede"
-    assert read_current_state(
-        conn, "cron:morning-briefing", "model"
-    ).fact_id == replacement.fact_id
-    assert conn.execute(
-        "SELECT superseded_by FROM facts WHERE fact_id = ?", (first.fact_id,)
-    ).fetchone()[0] == replacement.fact_id
+    assert (
+        read_current_state(conn, "cron:morning-briefing", "model").fact_id
+        == replacement.fact_id
+    )
+    assert (
+        conn.execute(
+            "SELECT superseded_by FROM facts WHERE fact_id = ?", (first.fact_id,)
+        ).fetchone()[0]
+        == replacement.fact_id
+    )
 
     replay = _write(
         service,
@@ -125,6 +131,80 @@ def test_migrated_store_typed_state_add_dedup_supersede_and_replay():
     assert replay.replayed is True
     assert replay.write_id == replacement.write_id
     assert conn.execute("SELECT count(*) FROM facts").fetchone()[0] == 2
+
+
+def test_late_batch_failure_restores_prior_current_state():
+    conn = _store()
+    service = MemoryWriteService(
+        conn,
+        _writer,
+        MemoryPolicy(
+            {"client-a-state-tests": ("private", "work")},
+            correction_authorities=("client-a-state-tests",),
+        ),
+    )
+    original = _write(service, "state-1", "terra-5.5")
+    calls = 0
+
+    def fail_second(connection, request, observation_id):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("late state batch failure")
+        return _writer(connection, request, observation_id)
+
+    service._fact_writer = fail_second
+    replacement_content = "Morning briefing uses terra-5.6"
+    other_content = "Evening briefing uses luna"
+    writes = (
+        (
+            WriteRequest(
+                "state-2",
+                replacement_content,
+                "inspected_config",
+                source_authority=0.8,
+            ),
+            StateCandidate(
+                content=replacement_content,
+                subject_key="cron:morning-briefing",
+                predicate_key="model",
+                object_value="terra-5.6",
+                source_authority=0.8,
+                valid_from="2026-07-12T12:00:00Z",
+            ),
+        ),
+        (
+            WriteRequest(
+                "state-3",
+                other_content,
+                "inspected_config",
+                source_authority=0.8,
+            ),
+            StateCandidate(
+                content=other_content,
+                subject_key="cron:evening-briefing",
+                predicate_key="model",
+                object_value="luna",
+                source_authority=0.8,
+                valid_from="2026-07-12T12:00:00Z",
+            ),
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="late state batch failure"):
+        service.write_batch(_context(), writes)
+
+    current = read_current_state(conn, "cron:morning-briefing", "model")
+    assert current is not None and current.fact_id == original.fact_id
+    assert conn.execute(
+        "SELECT invalid_at, superseded_by FROM facts WHERE fact_id = ?",
+        (original.fact_id,),
+    ).fetchone() == (None, None)
+    assert conn.execute("SELECT count(*) FROM facts").fetchone()[0] == 1
+    assert conn.execute(
+        "SELECT count(*) FROM facts WHERE memory_kind = 'state'"
+    ).fetchone()[0] == 1
+    assert conn.execute("SELECT count(*) FROM memory_write_log").fetchone()[0] == 1
 
 
 def test_migrated_store_conflicts_abstain_and_remain_durable_on_matching_write():
@@ -148,9 +228,7 @@ def test_migrated_store_conflicts_abstain_and_remain_durable_on_matching_write()
     assert len(conflicts) == 1
     assert set(conflicts[0].member_fact_ids) == set(
         fact.fact_id
-        for fact in current_state_facts(
-            conn, "cron:morning-briefing", "model"
-        )
+        for fact in current_state_facts(conn, "cron:morning-briefing", "model")
     )
 
     same_member = _write(
@@ -183,12 +261,14 @@ def test_migrated_store_state_slot_identity_isolated_by_scope():
 
     assert private.outcome == "add"
     assert work.outcome == "add"
-    assert read_current_state(
-        conn, "cron:morning-briefing", "model", "private"
-    ).fact_id == private.fact_id
-    assert read_current_state(
-        conn, "cron:morning-briefing", "model", "work"
-    ).fact_id == work.fact_id
+    assert (
+        read_current_state(conn, "cron:morning-briefing", "model", "private").fact_id
+        == private.fact_id
+    )
+    assert (
+        read_current_state(conn, "cron:morning-briefing", "model", "work").fact_id
+        == work.fact_id
+    )
     assert list_state_conflicts(conn, "private") == ()
     assert list_state_conflicts(conn, "work") == ()
 
@@ -210,9 +290,9 @@ def test_typed_state_cannot_silently_replace_human_corrected_truth():
         authority=0.6,
         correction_status="human_corrected",
     )
-    observations_before = conn.execute(
-        "SELECT count(*) FROM observations"
-    ).fetchone()[0]
+    observations_before = conn.execute("SELECT count(*) FROM observations").fetchone()[
+        0
+    ]
 
     rejected = _write(
         service,
@@ -226,6 +306,7 @@ def test_typed_state_cannot_silently_replace_human_corrected_truth():
     assert conn.execute("SELECT count(*) FROM observations").fetchone()[0] == (
         observations_before
     )
-    assert read_current_state(
-        conn, "cron:morning-briefing", "model"
-    ).fact_id == protected.fact_id
+    assert (
+        read_current_state(conn, "cron:morning-briefing", "model").fact_id
+        == protected.fact_id
+    )

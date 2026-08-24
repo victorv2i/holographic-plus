@@ -163,20 +163,48 @@ def validate_personal_cases(
             """,
             (case.category,),
         ).fetchall()
-        by_id = {int(row[0]) for row in eligible}
+        by_id = {int(row[0]): str(row[1]) for row in eligible}
+        if case.should_abstain:
+            continue
+        satisfiable = False
+        forbidden_match = False
         for fact_id in case.expected_fact_ids:
-            if fact_id not in by_id:
-                raise ValueError(
-                    f"case {case.id!r} expected fact {fact_id} is not an active private fact "
-                    f"in category {case.category!r}"
-                )
-        contents = [str(row[1]) for row in eligible]
+            content = by_id.get(fact_id)
+            if content is None:
+                continue
+            if any(
+                re.search(expression, content, re.IGNORECASE)
+                for expression in case.forbidden_content_regexes
+            ):
+                forbidden_match = True
+            else:
+                satisfiable = True
+        contents = list(by_id.values())
         for expression in case.expected_content_regexes:
-            if not any(re.search(expression, content, re.IGNORECASE) for content in contents):
-                raise ValueError(
-                    f"case {case.id!r} expected content regex does not match an active private fact: "
-                    f"{expression!r}"
-                )
+            matches = [
+                content
+                for content in contents
+                if re.search(expression, content, re.IGNORECASE)
+            ]
+            for content in matches:
+                if any(
+                    re.search(forbidden, content, re.IGNORECASE)
+                    for forbidden in case.forbidden_content_regexes
+                ):
+                    forbidden_match = True
+                else:
+                    satisfiable = True
+        if satisfiable:
+            continue
+        if forbidden_match:
+            raise ValueError(
+                f"case {case.id!r} expected alternative also matches a forbidden "
+                "content regex"
+            )
+        raise ValueError(
+            f"case {case.id!r} expected alternatives are not an active private fact "
+            f"in category {case.category!r}"
+        )
 
 
 def _expected_rank(case: PersonalCase, rows: Iterable[dict[str, Any]]) -> int | None:
@@ -212,10 +240,11 @@ def _summarize(results: tuple[PersonalResult, ...]) -> dict[str, Any]:
         protected = [result for result in group if result.case.forbidden_content_regexes]
         return {
             "cases": len(group),
-            "recall_at_1": _rate(sum(result.expected_rank == 1 for result in positive), len(positive)),
-            "recall_at_3": _rate(sum(result.expected_rank is not None and result.expected_rank <= 3 for result in positive), len(positive)),
+            "recall_at_1": _rate(sum(not result.abstained and result.expected_rank == 1 for result in positive), len(positive)),
+            "recall_at_3": _rate(sum(not result.abstained and result.expected_rank is not None and result.expected_rank <= 3 for result in positive), len(positive)),
             "stale_leak_rate": _rate(sum(result.forbidden_rank is not None and result.forbidden_rank <= 3 for result in protected), len(protected)),
             "abstention_correctness": _rate(sum(result.abstained for result in negative), len(negative)),
+            "false_abstentions": sum(result.abstained for result in positive),
         }
 
     by_category: dict[str, dict[str, Any]] = {}

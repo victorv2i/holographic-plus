@@ -9,8 +9,7 @@ import json
 import sqlite3
 from typing import Any
 
-from .core_store import active_facts, historical_facts_by_id
-from .state_slots import list_state_conflicts
+from .core_store import active_facts, build_visibility_predicate
 
 
 DEFAULT_LIMIT = 100
@@ -92,8 +91,9 @@ def _event_rows(
     since: str | None = None,
     until: str | None = None,
 ) -> tuple[list[dict[str, Any]], bool]:
-    placeholders = ", ".join("?" for _ in scopes)
-    scope_sql = f"f.scope IN ({placeholders})"
+    visibility_sql, visibility_params = build_visibility_predicate(
+        scopes, scope_column="f.scope", sensitivity_column="f.sensitivity"
+    )
     window_sql = ""
     window_params: tuple[str, ...] = ()
     if since is not None and until is not None:
@@ -108,17 +108,17 @@ def _event_rows(
         WITH fact_events AS (
             SELECT 'created' AS kind, f.created_at AS changed_at, f.fact_id
             FROM facts f
-            WHERE {scope_sql} AND f.conflict_group IS NULL
+            WHERE {visibility_sql} AND f.conflict_group IS NULL
             UNION ALL
             SELECT 'superseded', f.invalid_at, f.fact_id
             FROM facts f
-            WHERE {scope_sql} AND f.invalid_at IS NOT NULL
+            WHERE {visibility_sql} AND f.invalid_at IS NOT NULL
               AND f.superseded_by IS NOT NULL
             UNION ALL
             SELECT 'resolved', c.resolved_at, c.resolution_fact_id
             FROM fact_conflicts c
             JOIN facts f ON f.fact_id = c.resolution_fact_id
-            WHERE {scope_sql} AND c.resolved_at IS NOT NULL
+            WHERE {visibility_sql} AND c.resolved_at IS NOT NULL
         ), newest_events AS (
             SELECT e.kind, e.changed_at, {selected}
             FROM fact_events e
@@ -142,7 +142,13 @@ def _event_rows(
                  END,
                  fact_id
         """,
-        (*scopes, *scopes, *scopes, *window_params, PROJECTION_SCAN_LIMIT),
+        (
+            *visibility_params,
+            *visibility_params,
+            *visibility_params,
+            *window_params,
+            PROJECTION_SCAN_LIMIT,
+        ),
     ).fetchall()
     events = [
         {
@@ -193,6 +199,10 @@ def _matches_entity(fact: dict[str, Any], name: str) -> bool:
     return name.casefold() in _entity_names(fact)
 
 
+def _matches_entity_fields(subject: Any, tags: Any, name: str) -> bool:
+    return _matches_entity({"subject_key": subject, "tags": tags}, name)
+
+
 def _entity_events(
     conn: sqlite3.Connection,
     entity: str,
@@ -208,6 +218,140 @@ def _entity_events(
     selected = matched[-limit:]
     events, chars_truncated = _bounded(selected, limit)
     return events, scan_truncated or len(matched) > limit or chars_truncated
+
+
+def _entity_conflicts(
+    conn: sqlite3.Connection,
+    entity: str,
+    scopes: tuple[str, ...],
+    limit: int,
+) -> tuple[list[dict[str, Any]], bool]:
+    scope_values = ", ".join("(?, ?)" for _ in scopes)
+    scope_params = tuple(
+        value for ordinal, scope in enumerate(scopes) for value in (scope, ordinal)
+    )
+    selected = ", ".join(
+        f"f.{name} AS member_{name}" for name in _FACT_FIELDS
+    )
+    entity_visibility_sql, entity_visibility_params = build_visibility_predicate(
+        scopes,
+        scope_column="entity_fact.scope",
+        sensitivity_column="entity_fact.sensitivity",
+    )
+    member_visibility_sql, member_visibility_params = build_visibility_predicate(
+        scopes,
+        scope_column="f.scope",
+        sensitivity_column="f.sensitivity",
+    )
+    conn.create_function(
+        "_enfold_matches_entity", 3, _matches_entity_fields, deterministic=True
+    )
+    cursor = conn.execute(
+        f"""
+        WITH authorized_scopes(scope, ordinal) AS (VALUES {scope_values}),
+        matching_conflicts AS (
+            SELECT c.*, authorized.ordinal
+            FROM authorized_scopes authorized
+            JOIN fact_conflicts c ON c.scope = authorized.scope
+            WHERE c.resolved_at IS NULL
+              AND EXISTS (
+                  SELECT 1
+                  FROM fact_conflict_members visible_member
+                  JOIN facts entity_fact
+                    ON entity_fact.fact_id = visible_member.fact_id
+                   AND entity_fact.scope = c.scope
+                  WHERE visible_member.conflict_id = c.conflict_id
+                    AND {entity_visibility_sql}
+              )
+              AND (
+                  _enfold_matches_entity(c.subject_key, NULL, ?)
+                  OR EXISTS (
+                      SELECT 1
+                      FROM fact_conflict_members entity_member
+                      JOIN facts entity_fact
+                        ON entity_fact.fact_id = entity_member.fact_id
+                       AND entity_fact.scope = c.scope
+                      WHERE entity_member.conflict_id = c.conflict_id
+                        AND {entity_visibility_sql}
+                        AND _enfold_matches_entity(
+                            entity_fact.subject_key, entity_fact.tags, ?
+                        )
+                  )
+              )
+            ORDER BY authorized.ordinal, c.detected_at, c.conflict_id
+            LIMIT ?
+        ), ranked_members AS (
+            SELECT m.conflict_id, m.fact_id,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY m.conflict_id ORDER BY m.fact_id
+                   ) AS member_ordinal,
+                   COUNT(*) OVER (
+                       PARTITION BY m.conflict_id
+                   ) AS member_count
+            FROM fact_conflict_members m
+            JOIN matching_conflicts c ON c.conflict_id = m.conflict_id
+            JOIN facts f ON f.fact_id = m.fact_id
+            WHERE {member_visibility_sql}
+        )
+        SELECT c.conflict_id, c.scope, c.subject_key, c.predicate_key,
+               c.detected_at, m.member_count, {selected}
+        FROM matching_conflicts c
+        JOIN ranked_members m
+          ON m.conflict_id = c.conflict_id AND m.member_ordinal <= ?
+        JOIN facts f ON f.fact_id = m.fact_id AND f.scope = c.scope
+        WHERE c.resolved_at IS NULL
+        ORDER BY c.ordinal, c.detected_at, c.conflict_id, m.fact_id
+        """,
+        (
+            *scope_params,
+            *entity_visibility_params,
+            entity,
+            *entity_visibility_params,
+            entity,
+            limit + 1,
+            *member_visibility_params,
+            limit,
+        ),
+    )
+    conflicts: list[dict[str, Any]] = []
+    conflict_id: str | None = None
+    conflict: dict[str, Any] | None = None
+    members_truncated = False
+
+    def finish_conflict() -> None:
+        nonlocal members_truncated
+        if conflict is None:
+            return
+        if conflict["members_truncated"]:
+            members_truncated = True
+        conflicts.append(conflict)
+
+    try:
+        for row in cursor:
+            row_conflict_id = str(row["conflict_id"])
+            if row_conflict_id != conflict_id:
+                finish_conflict()
+                if len(conflicts) > limit:
+                    break
+                conflict_id = row_conflict_id
+                conflict = {
+                    "conflict_id": row_conflict_id,
+                    "scope": str(row["scope"]),
+                    "subject_key": str(row["subject_key"]),
+                    "predicate_key": str(row["predicate_key"]),
+                    "detected_at": str(row["detected_at"]),
+                    "members": [],
+                    "members_truncated": int(row["member_count"]) > limit,
+                }
+            if conflict is not None:
+                conflict["members"].append({
+                    name: row[f"member_{name}"] for name in _FACT_FIELDS
+                })
+        else:
+            finish_conflict()
+    finally:
+        cursor.close()
+    return conflicts[:limit], len(conflicts) > limit or members_truncated
 
 
 def timeline(
@@ -332,33 +476,7 @@ def entity_dossier(
     ]
     current = all_current[:cap]
     recent, recent_truncated = _entity_events(conn, entity, scopes, cap)
-    conflicts: list[dict[str, Any]] = []
-    for one_scope in scopes:
-        for conflict in list_state_conflicts(conn, one_scope):
-            member_facts = [
-                _fact(row)
-                for row in historical_facts_by_id(
-                    conn,
-                    conflict.member_fact_ids,
-                    allowed_scopes=(one_scope,),
-                )
-            ]
-            if conflict.subject_key.casefold() != entity.casefold() and not any(
-                _matches_entity(fact, entity) for fact in member_facts
-            ):
-                continue
-            conflicts.append(
-                {
-                    "conflict_id": conflict.conflict_id,
-                    "scope": conflict.scope,
-                    "subject_key": conflict.subject_key,
-                    "predicate_key": conflict.predicate_key,
-                    "detected_at": conflict.detected_at,
-                    "members": member_facts,
-                }
-            )
-    all_conflicts = conflicts
-    conflicts = all_conflicts[:cap]
+    conflicts, conflicts_truncated = _entity_conflicts(conn, entity, scopes, cap)
     result: dict[str, Any] = {
         "entity": entity,
         "current_facts": current,
@@ -367,7 +485,7 @@ def entity_dossier(
         "truncated": (
             len(all_current) > cap
             or len(scanned_current) == PROJECTION_SCAN_LIMIT
-            or len(all_conflicts) > cap
+            or conflicts_truncated
             or recent_truncated
         ),
     }

@@ -12,6 +12,7 @@ from enfold.rehearsal import (
     rehearse_snapshot,
     run_rehearsal,
 )
+from enfold.sqlite_vec_index import load_sqlite_vec
 
 
 def test_full_synthetic_backup_migrate_smoke_restore_rehearsal(tmp_path):
@@ -61,6 +62,28 @@ def test_explicit_offline_snapshot_rehearsal_never_modifies_source(tmp_path):
     assert report.smoke_evidence_verified is True
     assert report.source_unchanged is True
     assert database_fingerprint(snapshot) == before
+
+
+def test_database_fingerprint_supports_vec0_snapshot(tmp_path):
+    pytest.importorskip("sqlite_vec")
+    snapshot = tmp_path / "vec-snapshot.sqlite"
+    with sqlite3.connect(snapshot) as conn:
+        load_sqlite_vec(conn)
+        conn.execute(
+            "CREATE VIRTUAL TABLE enfold_vectors "
+            "USING vec0(embedding float[2] distance_metric=cosine)"
+        )
+        conn.execute(
+            "INSERT INTO enfold_vectors(rowid, embedding) VALUES (1, ?)",
+            (b"\x00\x00\x80?\x00\x00\x00\x00",),
+        )
+        conn.commit()
+
+    first = database_fingerprint(snapshot)
+    second = database_fingerprint(snapshot)
+
+    assert first == second
+    assert len(first) == 64
 
 
 def test_snapshot_rehearsal_refuses_live_or_reused_workdir(tmp_path):

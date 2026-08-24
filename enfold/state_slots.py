@@ -15,12 +15,23 @@ import sqlite3
 from typing import Literal, Optional
 import uuid
 
+from .core_store import build_visibility_predicate
+
 
 DecisionAction = Literal["add", "dedup", "supersede", "conflict"]
 
 
 _SUBJECT_KEY = re.compile(r"^[a-z0-9][a-z0-9._:/-]{0,127}$")
 _PREDICATE_KEY = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+_STATE_SLOT_INDEX_SQL = """
+    CREATE UNIQUE INDEX uq_facts_current_state_slot
+    ON facts(scope, subject_key, predicate_key)
+    WHERE memory_kind = 'state'
+      AND subject_key IS NOT NULL AND predicate_key IS NOT NULL
+      AND invalid_at IS NULL AND superseded_by IS NULL
+      AND conflict_group IS NULL
+"""
+_MAX_CONFLICT_LIMIT = 200
 
 
 class StateSlotInvariantError(RuntimeError):
@@ -87,6 +98,126 @@ def _parse_timestamp(value: Optional[str]) -> Optional[datetime]:
     return parsed.astimezone(timezone.utc)
 
 
+def _normalized_schema_sql(sql: str) -> str:
+    normalized = " ".join(sql.strip().rstrip(";").lower().split())
+    return normalized.replace(" if not exists", "")
+
+
+def _state_slot_index_has_expected_shape(conn: sqlite3.Connection) -> bool:
+    row = next(
+        (
+            item
+            for item in conn.execute('PRAGMA index_list("facts")')
+            if str(item[1]) == "uq_facts_current_state_slot"
+        ),
+        None,
+    )
+    if row is None or not bool(row[2]) or str(row[3]) != "c" or not bool(row[4]):
+        return False
+    columns = tuple(
+        str(item[2])
+        for item in conn.execute(
+            'PRAGMA index_info("uq_facts_current_state_slot")'
+        )
+    )
+    sql_row = conn.execute(
+        "SELECT tbl_name, sql FROM sqlite_master "
+        "WHERE type = 'index' AND name = ?",
+        ("uq_facts_current_state_slot",),
+    ).fetchone()
+    return bool(
+        columns == ("scope", "subject_key", "predicate_key")
+        and sql_row is not None
+        and str(sql_row[0]) == "facts"
+        and sql_row[1] is not None
+        and _normalized_schema_sql(str(sql_row[1]))
+        == _normalized_schema_sql(_STATE_SLOT_INDEX_SQL)
+    )
+
+
+def _canonicalize_existing_state_slots(
+    conn: sqlite3.Connection, columns: set[str]
+) -> None:
+    timestamp_columns = [
+        name for name in ("valid_from", "created_at") if name in columns
+    ]
+    selected = [
+        "fact_id", "subject_key", "predicate_key", "scope", "memory_kind",
+        "invalid_at", "superseded_by", "conflict_group", *timestamp_columns,
+    ]
+    rows = conn.execute(
+        f"SELECT {', '.join(selected)} FROM facts "
+        "WHERE subject_key IS NOT NULL AND predicate_key IS NOT NULL"
+    ).fetchall()
+    canonical: list[tuple[sqlite3.Row | tuple[object, ...], str, str, bool]] = []
+    for row in rows:
+        try:
+            subject_key = normalize_subject_key(str(row[1]))
+            predicate_key = normalize_predicate_key(str(row[2]))
+        except ValueError as exc:
+            raise StateSlotInvariantError(
+                f"fact {int(row[0])} has invalid persisted state-slot keys"
+            ) from exc
+        canonical.append(
+            (
+                row,
+                subject_key,
+                predicate_key,
+                (subject_key, predicate_key) != row[1:3],
+            )
+        )
+
+    active: dict[
+        tuple[str, str, str],
+        list[tuple[sqlite3.Row | tuple[object, ...], str, str, bool]],
+    ] = {}
+    for item in canonical:
+        row, subject_key, predicate_key, _changed = item
+        if (
+            row[4] == "state"
+            and row[5] is None
+            and row[6] is None
+            and row[7] is None
+        ):
+            active.setdefault((str(row[3]), subject_key, predicate_key), []).append(item)
+
+    repaired_at = _utc_now()
+    minimum = datetime.min.replace(tzinfo=timezone.utc)
+
+    def newest(item: tuple[sqlite3.Row | tuple[object, ...], str, str, bool]):
+        row = item[0]
+        for value in row[8:]:
+            try:
+                parsed = _parse_timestamp(str(value)) if value is not None else None
+            except ValueError:
+                parsed = None
+            if parsed is not None:
+                return (parsed, int(row[0]))
+        return (minimum, int(row[0]))
+
+    for members in active.values():
+        if len(members) < 2 or not any(item[3] for item in members):
+            continue
+        winner = max(members, key=newest)
+        winner_id = int(winner[0][0])
+        for loser in members:
+            loser_id = int(loser[0][0])
+            if loser_id != winner_id:
+                conn.execute(
+                    "UPDATE facts SET invalid_at = ?, superseded_by = ? "
+                    "WHERE fact_id = ?",
+                    (repaired_at, winner_id, loser_id),
+                )
+
+    for row, subject_key, predicate_key, changed in canonical:
+        if changed:
+            conn.execute(
+                "UPDATE facts SET subject_key = ?, predicate_key = ? "
+                "WHERE fact_id = ?",
+                (subject_key, predicate_key, int(row[0])),
+            )
+
+
 @dataclass(frozen=True, slots=True)
 class StateCandidate:
     content: str
@@ -103,6 +234,12 @@ class StateCandidate:
             "content", "scope", "subject_key", "predicate_key", "memory_kind"
         ):
             object.__setattr__(self, name, _required(getattr(self, name), name))
+        object.__setattr__(
+            self, "subject_key", normalize_subject_key(self.subject_key)
+        )
+        object.__setattr__(
+            self, "predicate_key", normalize_predicate_key(self.predicate_key)
+        )
         if not 0.0 <= self.source_authority <= 1.0:
             raise ValueError("source_authority must be between 0 and 1")
         _parse_timestamp(self.valid_from)
@@ -140,6 +277,7 @@ class ConflictRecord:
     predicate_key: str
     member_fact_ids: tuple[int, ...]
     detected_at: str
+    members_truncated: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -250,6 +388,12 @@ def ensure_state_slot_schema(conn: sqlite3.Connection) -> bool:
 
     if not {"invalid_at", "superseded_by"}.issubset(columns):
         return False
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'index' "
+        "AND name = 'uq_facts_current_state_slot'"
+    ).fetchone() is not None and not _state_slot_index_has_expected_shape(conn):
+        conn.execute("DROP INDEX uq_facts_current_state_slot")
+    _canonicalize_existing_state_slots(conn, columns)
     duplicate = conn.execute(
         """
         SELECT 1 FROM facts
@@ -264,27 +408,12 @@ def ensure_state_slot_schema(conn: sqlite3.Connection) -> bool:
     ).fetchone()
     if duplicate is not None:
         return False
-    index_columns = tuple(
-        str(row[2])
-        for row in conn.execute(
-            'PRAGMA index_info("uq_facts_current_state_slot")'
+    conn.execute(
+        _STATE_SLOT_INDEX_SQL.replace(
+            "CREATE UNIQUE INDEX", "CREATE UNIQUE INDEX IF NOT EXISTS", 1
         )
     )
-    if index_columns and index_columns != (
-        "scope", "subject_key", "predicate_key"
-    ):
-        conn.execute("DROP INDEX uq_facts_current_state_slot")
-    conn.execute(
-        """
-        CREATE UNIQUE INDEX IF NOT EXISTS uq_facts_current_state_slot
-        ON facts(scope, subject_key, predicate_key)
-        WHERE memory_kind = 'state'
-          AND subject_key IS NOT NULL AND predicate_key IS NOT NULL
-          AND invalid_at IS NULL AND superseded_by IS NULL
-          AND conflict_group IS NULL
-        """
-    )
-    return True
+    return _state_slot_index_has_expected_shape(conn)
 
 
 def current_state_facts(
@@ -349,28 +478,96 @@ def list_state_conflicts(
     scope: str = "private",
     *,
     unresolved_only: bool = True,
+    limit: int = _MAX_CONFLICT_LIMIT,
+    offset: int = 0,
+    member_limit: Optional[int] = None,
+    visibility_scopes: tuple[str, ...] | None = None,
 ) -> tuple[ConflictRecord, ...]:
-    """List durable conflicts visible in one exact memory scope."""
+    """List durable conflicts, optionally bounding members per conflict."""
 
     scope = _required(scope, "scope")
+    if (
+        isinstance(limit, bool)
+        or not isinstance(limit, int)
+        or not 1 <= limit <= _MAX_CONFLICT_LIMIT
+    ):
+        raise ValueError(f"limit must be between 1 and {_MAX_CONFLICT_LIMIT}")
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        raise ValueError("offset must be a non-negative integer")
+    if member_limit is not None and (
+        isinstance(member_limit, bool)
+        or not isinstance(member_limit, int)
+        or member_limit < 1
+    ):
+        raise ValueError("member_limit must be a positive integer or None")
     predicate = "AND c.resolved_at IS NULL" if unresolved_only else ""
+    if visibility_scopes is None:
+        visibility_sql, visibility_params = "1", ()
+    else:
+        visibility_sql, visibility_params = build_visibility_predicate(
+            visibility_scopes,
+            scope_column="f.scope",
+            sensitivity_column="f.sensitivity",
+        )
     rows = conn.execute(
         f"""
+        WITH selected_conflicts AS (
+            SELECT c.conflict_id, c.scope, c.subject_key, c.predicate_key,
+                   c.detected_at
+            FROM fact_conflicts c
+            WHERE c.scope = ? {predicate}
+              AND EXISTS (
+                  SELECT 1
+                  FROM fact_conflict_members m
+                  JOIN facts f ON f.fact_id = m.fact_id
+                  WHERE m.conflict_id = c.conflict_id AND {visibility_sql}
+              )
+            ORDER BY c.detected_at, c.conflict_id
+            LIMIT ? OFFSET ?
+        ), ranked_members AS (
+            SELECT m.conflict_id, m.fact_id,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY m.conflict_id ORDER BY m.fact_id
+                   ) AS member_ordinal,
+                   COUNT(*) OVER (
+                       PARTITION BY m.conflict_id
+                   ) AS member_count
+            FROM fact_conflict_members m
+            JOIN selected_conflicts c ON c.conflict_id = m.conflict_id
+            JOIN facts f ON f.fact_id = m.fact_id
+            WHERE {visibility_sql}
+        )
         SELECT c.conflict_id, c.scope, c.subject_key, c.predicate_key,
-               c.detected_at, m.fact_id
-        FROM fact_conflicts c
-        JOIN fact_conflict_members m ON m.conflict_id = c.conflict_id
-        WHERE c.scope = ? {predicate}
+               c.detected_at, m.fact_id, m.member_count
+        FROM selected_conflicts c
+        JOIN ranked_members m
+          ON m.conflict_id = c.conflict_id
+         AND (? IS NULL OR m.member_ordinal <= ?)
         ORDER BY c.detected_at, c.conflict_id, m.fact_id
         """,
-        (scope,),
+        (
+            scope,
+            *visibility_params,
+            limit,
+            offset,
+            *visibility_params,
+            member_limit,
+            member_limit,
+        ),
     ).fetchall()
-    grouped: dict[str, tuple[str, str, str, str, list[int]]] = {}
+    grouped: dict[str, tuple[str, str, str, str, list[int], bool]] = {}
     for row in rows:
         conflict_id = str(row[0])
         entry = grouped.get(conflict_id)
         if entry is None:
-            entry = (str(row[1]), str(row[2]), str(row[3]), str(row[4]), [])
+            entry = (
+                str(row[1]),
+                str(row[2]),
+                str(row[3]),
+                str(row[4]),
+                [],
+                member_limit is not None and int(row[6]) > member_limit,
+            )
             grouped[conflict_id] = entry
         entry[4].append(int(row[5]))
     return tuple(
@@ -381,6 +578,7 @@ def list_state_conflicts(
             values[2],
             tuple(values[4]),
             values[3],
+            values[5],
         )
         for conflict_id, values in grouped.items()
     )

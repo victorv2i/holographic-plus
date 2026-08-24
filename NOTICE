@@ -23,4 +23,4 @@ its persistent queue (`llm_extract.py`, `extract_queue.py`), the optimized
 retriever (`retrieval_plus.py`), and the hybrid scoring that merges dense
 similarity with the holographic signals.
 
-Copyright (c) 2026 Victor Iglesias. Released under the MIT License (see LICENSE).
+Copyright (c) 2026 victorv2i. Released under the MIT License (see LICENSE).

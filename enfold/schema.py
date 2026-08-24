@@ -12,6 +12,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
+import json
 
 
 SUPPORTED_SCHEMA_VERSION = 1
@@ -140,6 +141,35 @@ _V1_INDEXES = frozenset(
 )
 _V1_TRIGGERS = frozenset({"facts_ai", "facts_ad", "facts_au"})
 
+_V1_TRIGGER_SQL: Mapping[str, str] = {
+    "facts_ai": """
+        CREATE TRIGGER facts_ai AFTER INSERT ON facts BEGIN
+            INSERT INTO facts_fts(rowid, content, tags)
+            VALUES (new.fact_id, new.content, new.tags);
+        END
+    """,
+    "facts_ad": """
+        CREATE TRIGGER facts_ad AFTER DELETE ON facts BEGIN
+            INSERT INTO facts_fts(facts_fts, rowid, content, tags)
+            VALUES ('delete', old.fact_id, old.content, old.tags);
+        END
+    """,
+    "facts_au": """
+        CREATE TRIGGER facts_au AFTER UPDATE OF content, tags ON facts BEGIN
+            INSERT INTO facts_fts(facts_fts, rowid, content, tags)
+            VALUES ('delete', old.fact_id, old.content, old.tags);
+            INSERT INTO facts_fts(rowid, content, tags)
+            VALUES (new.fact_id, new.content, new.tags);
+        END
+    """,
+}
+
+_ACTIVE_PAYLOAD_HASH_INDEX_SQL = """
+    CREATE UNIQUE INDEX uq_extract_queue_active_payload_hash
+    ON extract_queue(payload_hash) WHERE payload_hash IS NOT NULL
+    AND status IN ('pending', 'processing')
+"""
+
 # These indexes were created by released legacy Enfold schemas but are not
 # required by v1.  Rebuilding ``facts`` drops them, so each admitted shape has
 # an explicit, canonical recreation statement.  Names alone are never enough:
@@ -191,6 +221,68 @@ def _content_has_unique_constraint(conn: sqlite3.Connection) -> bool:
         if columns == ["content"]:
             return True
     return False
+
+
+def _normalized_schema_sql(sql: str) -> str:
+    normalized = " ".join(sql.strip().rstrip(";").lower().split())
+    return normalized.replace(" if not exists", "")
+
+
+def _trigger_has_expected_shape(conn: sqlite3.Connection, name: str) -> bool:
+    row = conn.execute(
+        "SELECT tbl_name, sql FROM sqlite_master "
+        "WHERE type = 'trigger' AND name = ?",
+        (name,),
+    ).fetchone()
+    return bool(
+        row is not None
+        and str(row[0]) == "facts"
+        and row[1] is not None
+        and _normalized_schema_sql(str(row[1]))
+        == _normalized_schema_sql(_V1_TRIGGER_SQL[name])
+    )
+
+
+def _active_payload_hash_index_has_expected_shape(
+    conn: sqlite3.Connection,
+) -> bool:
+    row = next(
+        (
+            item
+            for item in conn.execute('PRAGMA index_list("extract_queue")')
+            if str(item[1]) == "uq_extract_queue_active_payload_hash"
+        ),
+        None,
+    )
+    if row is None or not bool(row[2]) or str(row[3]) != "c" or not bool(row[4]):
+        return False
+    columns = tuple(
+        str(item[2])
+        for item in conn.execute(
+            'PRAGMA index_info("uq_extract_queue_active_payload_hash")'
+        )
+    )
+    sql_row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+        ("uq_extract_queue_active_payload_hash",),
+    ).fetchone()
+    return bool(
+        columns == ("payload_hash",)
+        and sql_row is not None
+        and sql_row[0] is not None
+        and _normalized_schema_sql(str(sql_row[0]))
+        == _normalized_schema_sql(_ACTIVE_PAYLOAD_HASH_INDEX_SQL)
+    )
+
+
+def _facts_fts_has_expected_shape(conn: sqlite3.Connection) -> bool:
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'facts_fts'"
+    ).fetchone()
+    if row is None or row[0] is None:
+        return False
+    sql = str(row[0]).casefold()
+    return "virtual table" in sql and "fts5" in sql
 
 
 def _rebuild_legacy_unique_facts(conn: sqlite3.Connection) -> bool:
@@ -335,12 +427,34 @@ def _ensure_extraction_queue_schema(conn: sqlite3.Connection) -> None:
         "UPDATE extract_queue SET created_at = CURRENT_TIMESTAMP "
         "WHERE created_at IS NULL"
     )
-    snapshot_mismatch = conn.execute(
-        "SELECT id FROM extract_queue WHERE "
-        "(proposal_json IS NULL) != (proposal_hash IS NULL) LIMIT 1"
-    ).fetchone()
-    if snapshot_mismatch is not None:
-        raise MigrationError("extract_queue proposal snapshot columns are inconsistent")
+    for row_id, proposal_json, proposal_hash in conn.execute(
+        "SELECT id, proposal_json, proposal_hash FROM extract_queue WHERE "
+        "(proposal_json IS NULL) != (proposal_hash IS NULL)"
+    ):
+        try:
+            legacy_snapshot = json.loads(proposal_json)
+        except (TypeError, ValueError, RecursionError):
+            legacy_snapshot = None
+        if proposal_hash is not None or not isinstance(legacy_snapshot, list):
+            raise MigrationError(
+                "extract_queue proposal snapshot columns are inconsistent"
+            )
+        try:
+            canonical = json.dumps(
+                legacy_snapshot,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+        except (TypeError, ValueError, RecursionError) as exc:
+            raise MigrationError(
+                "extract_queue proposal snapshot columns are inconsistent"
+            ) from exc
+        conn.execute(
+            "UPDATE extract_queue SET proposal_json = ? WHERE id = ?",
+            (canonical, int(row_id)),
+        )
     invalid = conn.execute(
         "SELECT id FROM extract_queue WHERE payload IS NULL OR status IS NULL "
         "OR attempts IS NULL OR attempts < 0 LIMIT 1"
@@ -394,20 +508,26 @@ def verify_schema_shape(conn: sqlite3.Connection, version: int) -> None:
         for row in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")
     }
     missing.extend(f"index:{name}" for name in sorted(_V1_INDEXES - indexes))
+    if _table_exists(conn, "facts_fts") and not _facts_fts_has_expected_shape(conn):
+        missing.append("table-shape:facts_fts")
+    if (
+        "uq_extract_queue_active_payload_hash" in indexes
+        and not _active_payload_hash_index_has_expected_shape(conn)
+    ):
+        missing.append("index-shape:uq_extract_queue_active_payload_hash")
     if "uq_facts_current_state_slot" in indexes:
-        slot_columns = tuple(
-            str(row[2])
-            for row in conn.execute(
-                'PRAGMA index_info("uq_facts_current_state_slot")'
-            )
-        )
-        if slot_columns != ("scope", "subject_key", "predicate_key"):
+        from .state_slots import _state_slot_index_has_expected_shape
+
+        if not _state_slot_index_has_expected_shape(conn):
             missing.append("index-shape:uq_facts_current_state_slot")
     triggers = {
         str(row[0])
         for row in conn.execute("SELECT name FROM sqlite_master WHERE type='trigger'")
     }
     missing.extend(f"trigger:{name}" for name in sorted(_V1_TRIGGERS - triggers))
+    for name in sorted(_V1_TRIGGERS & triggers):
+        if not _trigger_has_expected_shape(conn, name):
+            missing.append(f"trigger-shape:{name}")
     if _table_exists(conn, "facts") and _content_has_unique_constraint(conn):
         missing.append("constraint:facts.content_unique")
     if missing:
@@ -448,6 +568,12 @@ def _migration_001_complete_schema(conn: sqlite3.Connection) -> None:
             if name not in base_columns:
                 conn.execute(f"ALTER TABLE facts ADD COLUMN {name} {definition}")
                 base_columns.add(name)
+        conn.execute(
+            "UPDATE facts SET "
+            "created_at = COALESCE(created_at, CURRENT_TIMESTAMP), "
+            "updated_at = COALESCE(updated_at, created_at, CURRENT_TIMESTAMP) "
+            "WHERE created_at IS NULL OR updated_at IS NULL"
+        )
 
     ensure_core_schema(conn)
     rebuilt_facts = _rebuild_legacy_unique_facts(conn)
@@ -518,10 +644,26 @@ def _needs_extraction_queue_patch(conn: sqlite3.Connection) -> bool:
     }
     if not {"proposal_json", "proposal_hash"}.issubset(columns):
         return True
-    return conn.execute(
-        "SELECT 1 FROM extract_queue WHERE "
-        "(proposal_json IS NULL) != (proposal_hash IS NULL) LIMIT 1"
-    ).fetchone() is not None
+    for proposal_json, proposal_hash in conn.execute(
+        "SELECT proposal_json, proposal_hash FROM extract_queue WHERE "
+        "(proposal_json IS NULL) != (proposal_hash IS NULL)"
+    ):
+        if proposal_hash is not None:
+            return True
+        try:
+            legacy_snapshot = json.loads(proposal_json)
+            canonical = json.dumps(
+                legacy_snapshot,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+        except (TypeError, ValueError, RecursionError):
+            return True
+        if not isinstance(legacy_snapshot, list) or proposal_json != canonical:
+            return True
+    return False
 
 
 def _apply_extraction_queue_patch(conn: sqlite3.Connection) -> None:
@@ -549,6 +691,26 @@ def _apply_extraction_queue_patch(conn: sqlite3.Connection) -> None:
     finally:
         if foreign_keys_enabled:
             conn.execute("PRAGMA foreign_keys=ON")
+
+
+def _apply_state_slot_patch(conn: sqlite3.Connection) -> None:
+    """Atomically canonicalize persisted v1 state-slot keys."""
+
+    from .state_slots import ensure_state_slot_schema
+
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        if not ensure_state_slot_schema(conn):
+            raise MigrationError(
+                "cannot install v1 current-state uniqueness invariant; resolve "
+                "duplicate active state slots first"
+            )
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        if isinstance(exc, SchemaError):
+            raise
+        raise MigrationError("state-slot canonicalization patch failed") from exc
 
 
 def schema_version(conn: sqlite3.Connection) -> int:
@@ -673,6 +835,7 @@ def migrate(
     # it for automatic writes.
     if target_version >= 1:
         _apply_extraction_queue_patch(conn)
+        _apply_state_slot_patch(conn)
     return schema_version(conn)
 
 

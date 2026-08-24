@@ -184,6 +184,7 @@ def _write_fact(
         "source_type": "synthetic_fixture",
         "scope": fact.scope,
         "source_authority": fact.source_authority,
+        "correction_status": "human_confirmed",
     }
     if fact.state is not None:
         params["state"] = dict(fact.state)
@@ -217,7 +218,10 @@ def run_context_arena(
     )
     service = EnfoldService(
         conn,
-        MemoryPolicy({"context-arena-client": scopes}),
+        MemoryPolicy(
+            {"context-arena-client": scopes},
+            correction_authorities=("context-arena-client",),
+        ),
     )
     try:
         fact_ids = {

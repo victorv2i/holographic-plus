@@ -7,16 +7,22 @@ connection to the intersection of requested and configured scopes.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 import re
 from types import MappingProxyType
-from typing import Callable, Iterable, Mapping, Optional
+from typing import Callable, Iterable, Iterator, Mapping, Optional
 
 from .provenance import ConnectionContext, WriteRequest
 
 
 BASE_SCOPES = frozenset({"private", "work", "public", "sensitive", "secret"})
 SENSITIVITIES = frozenset({"normal", "sensitive", "secret"})
+LEGACY_EXTRACTION_CLIENT_ID = "legacy-extract-queue"
+_LEGACY_EXTRACTION_WRITE_AUTHORIZED: ContextVar[bool] = ContextVar(
+    "legacy_extraction_write_authorized", default=False
+)
 PROVENANCE_RELATIONS = frozenset(
     {"supports", "contradicts", "verifies", "corrects", "derived_from"}
 )
@@ -69,12 +75,27 @@ class PolicyDecision:
 CredentialScreen = Callable[[WriteRequest], Optional[PolicyDecision]]
 
 
+@contextmanager
+def legacy_extraction_write_authorization() -> Iterator[None]:
+    """Authorize the reserved legacy identity for one extraction write batch."""
+
+    token = _LEGACY_EXTRACTION_WRITE_AUTHORIZED.set(True)
+    try:
+        yield
+    finally:
+        _LEGACY_EXTRACTION_WRITE_AUTHORIZED.reset(token)
+
+
 _CREDENTIAL_SHAPES = (
-    re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
+    re.compile(r"-----BEGIN (?:[A-Z0-9]+(?: [A-Z0-9]+)* )?PRIVATE KEY-----"),
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
     re.compile(r"\b(?:ghp|github_pat|sk-[A-Za-z0-9_-]{8})[A-Za-z0-9_-]{12,}\b"),
     re.compile(
         r"(?i)\b(?:api[_ -]?key|client[_ -]?secret|password|token)\b['\"]?\s*[:=]\s*['\"]?[^\s'\"]{8,}"
+    ),
+    re.compile(
+        r"(?i)\b(?:api[_ -]?(?:key|token)|client[_ -]?secret|password|token)\b"
+        r"['\"]?\s+(?:is|was)\s+['\"]?[^\s'\"]{8,}"
     ),
     re.compile(r"(?i)\bauthorization\s*:\s*bearer\s+[A-Za-z0-9._~+/=-]{8,}"),
     re.compile(r"\bAIza[0-9A-Za-z_-]{30,}\b"),
@@ -144,6 +165,12 @@ class MemoryPolicy:
 
     def authorize_context(self, context: ConnectionContext) -> ConnectionContext:
         grants = self._grants.get(context.client_id)
+        if (
+            grants is None
+            and context.client_id == LEGACY_EXTRACTION_CLIENT_ID
+            and _LEGACY_EXTRACTION_WRITE_AUTHORIZED.get()
+        ):
+            grants = ("private",)
         if grants is None:
             raise UnknownMemoryClient(
                 f"memory client {context.client_id!r} has no server-side scope grant"
@@ -173,6 +200,13 @@ class MemoryPolicy:
         validate_correction_status(request.correction_status)
         if request.scope == "secret" or request.sensitivity == "secret":
             return PolicyDecision("rejected", "secret durable writes are disabled")
+        if request.sensitivity == "sensitive" and (
+            client_id is None
+            or "sensitive" not in self._grants.get(client_id, ())
+        ):
+            return PolicyDecision(
+                "rejected", "sensitive durable write is not authorized"
+            )
         claims_correction = (
             request.source_type == "human_correction"
             or request.relation == "corrects"

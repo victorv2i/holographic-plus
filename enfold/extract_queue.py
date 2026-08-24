@@ -21,6 +21,7 @@ are needed.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import random
 import re
@@ -29,6 +30,9 @@ import threading
 import time
 import uuid
 from typing import Any, Dict, Iterable, Optional
+
+from .policy import default_credential_screen
+from .provenance import WriteRequest
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +73,15 @@ _RESETS_IN_RE = re.compile(r"resets_in_seconds\D{0,12}(\d+)", re.IGNORECASE)
 _RESETS_AT_RE = re.compile(r"resets_at\D{0,12}(\d{9,12})", re.IGNORECASE)
 
 
+class _ClaimedLeaseOwner(str):
+    """String-compatible owner carrying the exact lease incarnation fence."""
+
+    def __new__(cls, owner: str, lease_until: float):
+        value = super().__new__(cls, owner)
+        value.lease_until = lease_until
+        return value
+
+
 def is_quota_error(error: Optional[str]) -> bool:
     """True when a failure message looks like a provider quota / rate limit."""
     text = (error or "").lower()
@@ -105,7 +118,8 @@ CREATE TABLE IF NOT EXISTS extract_queue (
     not_before REAL,
     lease_owner TEXT,
     lease_until REAL,
-    payload_hash TEXT
+    payload_hash TEXT,
+    proposal_json TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_extract_queue_status
@@ -144,6 +158,7 @@ class ExtractQueue:
             ("lease_owner", "TEXT"),
             ("lease_until", "REAL"),
             ("payload_hash", "TEXT"),
+            ("proposal_json", "TEXT"),
         ):
             if name in cols:
                 continue
@@ -199,6 +214,38 @@ class ExtractQueue:
             return False
         return time.time() - float(created_epoch) >= MAX_ROW_AGE_SECONDS
 
+    @staticmethod
+    def _lease_fence(
+        lease_owner: Optional[str],
+    ) -> tuple[Optional[str], float | None]:
+        """Return owner and incarnation fence carried by a claimed owner.
+
+        A plain owner string remains supported as unfenced legacy
+        compatibility; callers should pass back the value returned by
+        ``next_pending()`` to fence same-owner lease reclamation.
+        """
+        if lease_owner is None:
+            return None, None
+        lease_until = getattr(lease_owner, "lease_until", None)
+        return str(lease_owner), float(lease_until) if lease_until is not None else None
+
+    @staticmethod
+    def _credential_shaped_proposal(proposal: dict[str, str]) -> bool:
+        encoded = json.dumps(
+            proposal,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        request = WriteRequest(
+            idempotency_key="legacy-extraction-snapshot-screen",
+            content=str(proposal.get("content", "")).strip() or "invalid proposal",
+            source_type="automatic_extraction",
+            category=str(proposal.get("category", "general")),
+            tags=str(proposal.get("tags", "")),
+        )
+        return default_credential_screen(request, (encoded,)) is not None
+
     # ------------------------------------------------------------------
     # Write
     # ------------------------------------------------------------------
@@ -248,14 +295,54 @@ class ExtractQueue:
         """Delete a successfully processed row.
 
         Claimed rows may only be completed by their current lease owner.
+        A plain owner string is accepted as unfenced legacy compatibility.
         """
+        owner, lease_until = self._lease_fence(lease_owner)
         with self._lock:
             cur = self._conn.execute(
                 """
                 DELETE FROM extract_queue
                 WHERE id = ? AND status = ? AND lease_owner = ?
+                  AND (? IS NULL OR lease_until = ?)
                 """,
-                (row_id, STATUS_PROCESSING, lease_owner),
+                (row_id, STATUS_PROCESSING, owner, lease_until, lease_until),
+            )
+            self._conn.commit()
+            return int(cur.rowcount) == 1
+
+    def save_proposals(
+        self,
+        row_id: int,
+        proposals: list[dict[str, str]],
+        lease_owner: Optional[str] = None,
+    ) -> bool:
+        """Persist the parsed model output before any proposal is inserted.
+
+        A plain owner string is accepted as unfenced legacy compatibility.
+        """
+        safe_proposals = [
+            proposal
+            for proposal in proposals
+            if not self._credential_shaped_proposal(proposal)
+        ]
+        encoded = json.dumps(safe_proposals, sort_keys=True, separators=(",", ":"))
+        owner, lease_until = self._lease_fence(lease_owner)
+        with self._lock:
+            cur = self._conn.execute(
+                """
+                UPDATE extract_queue
+                SET proposal_json = COALESCE(proposal_json, ?)
+                WHERE id = ? AND status = ? AND lease_owner = ?
+                  AND (? IS NULL OR lease_until = ?)
+                """,
+                (
+                    encoded,
+                    row_id,
+                    STATUS_PROCESSING,
+                    owner,
+                    lease_until,
+                    lease_until,
+                ),
             )
             self._conn.commit()
             return int(cur.rowcount) == 1
@@ -272,19 +359,26 @@ class ExtractQueue:
         Rows past MAX_ROW_AGE_SECONDS are marked dead regardless of the
         attempt count, with last_error noting the age cap.
 
+        A plain owner string is accepted as unfenced legacy compatibility.
         Returns the new attempt count (0 if the row no longer exists).
         """
+        owner, lease_until = self._lease_fence(lease_owner)
         with self._lock:
             row = self._conn.execute(
                 """
-                SELECT attempts, strftime('%s', created_at), status, lease_owner
+                SELECT attempts, strftime('%s', created_at), status, lease_owner,
+                       lease_until
                 FROM extract_queue WHERE id = ?
                 """,
                 (row_id,),
             ).fetchone()
             if row is None:
                 return 0
-            if row[2] != STATUS_PROCESSING or row[3] != lease_owner:
+            if (
+                row[2] != STATUS_PROCESSING
+                or row[3] != owner
+                or (lease_until is not None and row[4] != lease_until)
+            ):
                 return 0
             attempts = int(row[0]) + 1
             message = (error or "")[:500]
@@ -293,17 +387,28 @@ class ExtractQueue:
                 message += _AGE_CAP_NOTE
             else:
                 status = STATUS_DEAD if attempts >= max_attempts else STATUS_PENDING
-            self._conn.execute(
+            cur = self._conn.execute(
                 """
                 UPDATE extract_queue
                 SET attempts = ?, last_error = ?, status = ?,
                     lease_owner = NULL, lease_until = NULL
-                WHERE id = ?
+                WHERE id = ? AND status = ? AND lease_owner = ? AND attempts = ?
+                  AND (? IS NULL OR lease_until = ?)
                 """,
-                (attempts, message, status, row_id),
+                (
+                    attempts,
+                    message,
+                    status,
+                    row_id,
+                    STATUS_PROCESSING,
+                    owner,
+                    int(row[0]),
+                    lease_until,
+                    lease_until,
+                ),
             )
             self._conn.commit()
-            return attempts
+            return attempts if int(cur.rowcount) == 1 else 0
 
     def mark_quota_failed(
         self,
@@ -318,56 +423,96 @@ class ExtractQueue:
         (epoch seconds). Rows past MAX_ROW_AGE_SECONDS are marked dead with
         last_error noting the age cap.
 
+        A plain owner string is accepted as unfenced legacy compatibility.
         Returns True when the row was rescheduled, False when it went dead by
         the age cap or no longer exists.
         """
+        owner, lease_until = self._lease_fence(lease_owner)
         with self._lock:
             row = self._conn.execute(
                 """
-                SELECT strftime('%s', created_at), status, lease_owner
+                SELECT strftime('%s', created_at), status, lease_owner, attempts,
+                       lease_until
                 FROM extract_queue WHERE id = ?
                 """,
                 (row_id,),
             ).fetchone()
             if row is None:
                 return False
-            if row[1] != STATUS_PROCESSING or row[2] != lease_owner:
+            if (
+                row[1] != STATUS_PROCESSING
+                or row[2] != owner
+                or (lease_until is not None and row[4] != lease_until)
+            ):
                 return False
             message = (error or "")[:500]
             if self._age_exceeded(row[0]):
-                self._conn.execute(
+                cur = self._conn.execute(
                     """
                     UPDATE extract_queue
                     SET last_error = ?, status = ?, not_before = NULL,
                         lease_owner = NULL, lease_until = NULL
-                    WHERE id = ?
+                    WHERE id = ? AND status = ? AND lease_owner = ? AND attempts = ?
+                      AND (? IS NULL OR lease_until = ?)
                     """,
-                    (message + _AGE_CAP_NOTE, STATUS_DEAD, row_id),
+                    (
+                        message + _AGE_CAP_NOTE,
+                        STATUS_DEAD,
+                        row_id,
+                        STATUS_PROCESSING,
+                        owner,
+                        int(row[3]),
+                        lease_until,
+                        lease_until,
+                    ),
                 )
                 self._conn.commit()
                 return False
-            self._conn.execute(
+            cur = self._conn.execute(
                 """
                 UPDATE extract_queue
                 SET last_error = ?, not_before = ?, status = ?,
                     lease_owner = NULL, lease_until = NULL
-                WHERE id = ?
+                WHERE id = ? AND status = ? AND lease_owner = ? AND attempts = ?
+                  AND (? IS NULL OR lease_until = ?)
                 """,
-                (message, float(not_before), STATUS_PENDING, row_id),
+                (
+                    message,
+                    float(not_before),
+                    STATUS_PENDING,
+                    row_id,
+                    STATUS_PROCESSING,
+                    owner,
+                    int(row[3]),
+                    lease_until,
+                    lease_until,
+                ),
             )
             self._conn.commit()
-            return True
+            return int(cur.rowcount) == 1
 
     def release_claim(self, row_id: int, lease_owner: str) -> bool:
-        """Return a claimed row to pending without consuming an attempt."""
+        """Return a claimed row to pending without consuming an attempt.
+
+        A plain owner string is accepted as unfenced legacy compatibility.
+        """
+        owner, lease_until = self._lease_fence(lease_owner)
         with self._lock:
             cur = self._conn.execute(
                 """
                 UPDATE extract_queue
                 SET status = ?, lease_owner = NULL, lease_until = NULL
                 WHERE id = ? AND status = ? AND lease_owner = ?
+                  AND (? IS NULL OR lease_until = ?)
                 """,
-                (STATUS_PENDING, row_id, STATUS_PROCESSING, lease_owner),
+                (
+                    STATUS_PENDING,
+                    row_id,
+                    STATUS_PROCESSING,
+                    owner,
+                    lease_until,
+                    lease_until,
+                ),
             )
             self._conn.commit()
             return int(cur.rowcount) == 1
@@ -464,6 +609,9 @@ class ExtractQueue:
         DB is broken.
 
         Expired processing leases are eligible to be claimed by a new owner.
+        The returned ``lease_owner`` is a string-compatible claim handle that
+        carries the lease incarnation; pass it back to mutation methods for
+        same-owner ABA fencing.
 
         Index-based row access so this works with any row_factory.
         """
@@ -520,7 +668,8 @@ class ExtractQueue:
                 return None
             claimed = self._conn.execute(
                 """
-                SELECT id, payload, attempts, lease_owner, lease_until
+                SELECT id, payload, attempts, lease_owner, lease_until,
+                       proposal_json
                 FROM extract_queue WHERE id = ?
                 """,
                 (row_id,),
@@ -532,8 +681,9 @@ class ExtractQueue:
             "id": int(claimed[0]),
             "payload": claimed[1],
             "attempts": int(claimed[2]),
-            "lease_owner": claimed[3],
+            "lease_owner": _ClaimedLeaseOwner(str(claimed[3]), float(claimed[4])),
             "lease_until": float(claimed[4]),
+            "proposal_json": claimed[5],
         }
 
     def pending_count(self) -> int:

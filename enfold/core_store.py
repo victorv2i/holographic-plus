@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Iterable, Sequence
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -120,12 +121,18 @@ def connect_database(
         check_same_thread=check_same_thread,
         timeout=busy_timeout_ms / 1000,
     )
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    return conn
+    try:
+        conn.row_factory = sqlite3.Row
+        journal_mode = str(conn.execute("PRAGMA journal_mode=WAL").fetchone()[0])
+        if journal_mode.lower() != "wal":
+            raise RuntimeError("database cannot enable WAL journal mode")
+        conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        return conn
+    except BaseException:
+        conn.close()
+        raise
 
 
 def ensure_core_schema(conn: sqlite3.Connection) -> None:
@@ -202,6 +209,7 @@ def insert_fact(
             raise ValueError(f"{name} must be between 0 and 1")
 
     available = _fact_columns(conn)
+    now = datetime.now(timezone.utc).isoformat(timespec="microseconds")
     values: dict[str, Any] = {
         "content": content,
         "category": category,
@@ -216,6 +224,8 @@ def insert_fact(
         "scope": scope,
         "sensitivity": sensitivity,
         "valid_from": valid_from,
+        "created_at": now,
+        "updated_at": now,
     }
     if "scope" not in available and scope != DEFAULT_SCOPE:
         raise ValueError("legacy facts schema cannot persist a non-private scope")
@@ -259,7 +269,14 @@ def build_scope_predicate(
     ``column`` is selected by trusted call sites, not user input.
     """
 
-    if column not in {"scope", "f.scope"}:
+    if column not in {
+        "scope",
+        "f.scope",
+        "o.scope",
+        "previous.scope",
+        "following.scope",
+        "entity_fact.scope",
+    }:
         raise ValueError("unsupported scope column")
     if allowed_scopes is None:
         return "1", ()
@@ -270,6 +287,50 @@ def build_scope_predicate(
         return ("1", ()) if DEFAULT_SCOPE in scopes else ("0", ())
     placeholders = ", ".join("?" for _ in scopes)
     return f"{column} IN ({placeholders})", scopes
+
+
+def build_visibility_predicate(
+    allowed_scopes: Sequence[str] | None,
+    *,
+    scope_column: str = "scope",
+    sensitivity_column: str = "sensitivity",
+    scope_column_available: bool = True,
+    sensitivity_column_available: bool = True,
+) -> tuple[str, tuple[str, ...]]:
+    """Build scope authorization plus sensitivity-capability filtering.
+
+    Normal records require only their ordinary scope. Sensitive and secret
+    records additionally require the matching capability in ``allowed_scopes``.
+    ``None`` retains the internal unrestricted behavior used by legacy callers.
+    """
+
+    if sensitivity_column not in {
+        "sensitivity",
+        "f.sensitivity",
+        "o.sensitivity",
+        "previous.sensitivity",
+        "following.sensitivity",
+        "entity_fact.sensitivity",
+    }:
+        raise ValueError("unsupported sensitivity column")
+    scope_sql, scope_params = build_scope_predicate(
+        allowed_scopes,
+        column=scope_column,
+        scope_column_available=scope_column_available,
+    )
+    if allowed_scopes is None or not sensitivity_column_available:
+        return scope_sql, scope_params
+    scopes = tuple(dict.fromkeys(_required_text(value, "scope") for value in allowed_scopes))
+    sensitivity_predicates = [f"COALESCE({sensitivity_column}, 'normal') = 'normal'"]
+    sensitivity_params: list[str] = []
+    for sensitivity in ("sensitive", "secret"):
+        if sensitivity in scopes:
+            sensitivity_predicates.append(f"{sensitivity_column} = ?")
+            sensitivity_params.append(sensitivity)
+    return (
+        f"({scope_sql}) AND ({' OR '.join(sensitivity_predicates)})",
+        (*scope_params, *sensitivity_params),
+    )
 
 
 def _active_predicates(columns: frozenset[str], *, prefix: str = "") -> list[str]:
@@ -296,8 +357,10 @@ def active_facts(
         return []
     columns = _fact_columns(conn)
     predicates = _active_predicates(columns)
-    scope_sql, scope_params = build_scope_predicate(
-        allowed_scopes, scope_column_available="scope" in columns
+    scope_sql, scope_params = build_visibility_predicate(
+        allowed_scopes,
+        scope_column_available="scope" in columns,
+        sensitivity_column_available="sensitivity" in columns,
     )
     predicates.append(scope_sql)
     params: list[Any] = list(scope_params)
@@ -323,8 +386,10 @@ def get_active_fact(
 
     columns = _fact_columns(conn)
     predicates = ["fact_id = ?", *_active_predicates(columns)]
-    scope_sql, scope_params = build_scope_predicate(
-        allowed_scopes, scope_column_available="scope" in columns
+    scope_sql, scope_params = build_visibility_predicate(
+        allowed_scopes,
+        scope_column_available="scope" in columns,
+        sensitivity_column_available="sensitivity" in columns,
     )
     predicates.append(scope_sql)
     row = conn.execute(
@@ -351,10 +416,12 @@ def search_fts(
     columns = _fact_columns(conn)
     predicates = ["facts_fts MATCH ?", *_active_predicates(columns, prefix="f.")]
     params: list[Any] = [query]
-    scope_sql, scope_params = build_scope_predicate(
+    scope_sql, scope_params = build_visibility_predicate(
         allowed_scopes,
-        column="f.scope",
+        scope_column="f.scope",
+        sensitivity_column="f.sensitivity",
         scope_column_available="scope" in columns,
+        sensitivity_column_available="sensitivity" in columns,
     )
     predicates.append(scope_sql)
     params.extend(scope_params)
@@ -400,8 +467,12 @@ def settled_fact_events(
     }
     if not required.issubset(columns):
         raise RuntimeError("fact store does not support settled event projections")
-    scope_sql, scope_params = build_scope_predicate(
-        allowed_scopes, column="f.scope", scope_column_available=True
+    scope_sql, scope_params = build_visibility_predicate(
+        allowed_scopes,
+        scope_column="f.scope",
+        sensitivity_column="f.sensitivity",
+        scope_column_available=True,
+        sensitivity_column_available=True,
     )
     window_sql = ""
     window_params: tuple[str, ...] = ()
@@ -454,10 +525,12 @@ def historical_facts_by_id(
     if not ids:
         return []
     columns = _fact_columns(conn)
-    scope_sql, scope_params = build_scope_predicate(
+    scope_sql, scope_params = build_visibility_predicate(
         allowed_scopes,
-        column="f.scope",
+        scope_column="f.scope",
+        sensitivity_column="f.sensitivity",
         scope_column_available="scope" in columns,
+        sensitivity_column_available="sensitivity" in columns,
     )
     placeholders = ",".join("?" for _ in ids)
     rows = conn.execute(

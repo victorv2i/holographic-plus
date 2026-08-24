@@ -20,14 +20,15 @@ Guard rails on ``execute_merge``:
     - Refuses any *db_path* under a ``.hermes`` directory, live or not,
       checking both the literal path and its resolved (realpath) form so a
       symlink cannot bypass the check.
-    - Requires *backup_path* to already exist on disk.
+    - Requires *backup_path* to be a distinct, readable SQLite database.
     - Refuses unless the computed drop count falls within
       [*expected_drop_min*, *expected_drop_max*].
     - Refuses if the computed drop count exceeds *max_drop_fraction*
       (default 0.5) of the starting active fact count, even if it is
       within the absolute band above.
-    - A real run ends with ``PRAGMA integrity_check`` and an FTS5 integrity
-      check, plus ``PRAGMA wal_checkpoint(TRUNCATE)``.
+    - Plans and applies under ``BEGIN IMMEDIATE``, then runs orphan, SQLite,
+      and FTS5 integrity checks before committing.
+    - A successful real run ends with ``PRAGMA wal_checkpoint(TRUNCATE)``.
 """
 
 from __future__ import annotations
@@ -36,12 +37,15 @@ import argparse
 import os
 import re
 import sqlite3
+import sys
+from contextlib import closing
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .embed_store import EmbedStore
+from .schema import SchemaError, schema_version
 from .sqlite_vec_index import SQLiteVecIndex
 
 _SUPERSEDED_PREFIXES = ("superseded", "stale/disabled", "historical/superseded")
@@ -67,6 +71,7 @@ _STATE_WORD_GROUPS = (
     frozenset(("approved", "rejected", "accepted", "denied")),
 )
 _STATE_WORDS = frozenset().union(*_STATE_WORD_GROUPS)
+_SOURCE_FACTS_TAG_RE = re.compile(r"source_facts:([0-9]+(?:,[0-9]+)*)")
 
 
 class GuardRailError(Exception):
@@ -236,10 +241,10 @@ def build_clusters(
     whose only neighbor is themselves, are omitted (singletons aren't
     clusters).
     """
-    embed_store = EmbedStore(conn, embedding_identity=embedding_identity)
-    fact_ids_arr, matrix = embed_store._embedding_matrix(
-        _dim(conn, embedding_identity), embedding_identity=embedding_identity
-    )
+    identity = _embedding_identity(conn, embedding_identity)
+    if identity is None:
+        return []
+    fact_ids_arr, matrix = _embedding_matrix(conn, identity, _dim(conn, identity))
     active_ids = _active_fact_ids(conn)
     fact_ids = [
         fid for fid in fact_ids_arr.astype(int).tolist()
@@ -255,12 +260,20 @@ def build_clusters(
         return []
 
     uf = _UnionFind(fact_ids)
+    contents = _fact_rows(conn, fact_ids)
     n = len(fact_ids)
     sims = matrix @ matrix.T
     for i in range(n):
         row = sims[i]
         for j in range(i + 1, n):
-            if row[j] >= threshold:
+            if (
+                contents[fact_ids[i]]["scope"] == contents[fact_ids[j]]["scope"]
+                and row[j] >= threshold
+                and safe_to_merge_near_duplicate(
+                    str(contents[fact_ids[i]]["content"]),
+                    str(contents[fact_ids[j]]["content"]),
+                )
+            ):
                 uf.union(fact_ids[i], fact_ids[j])
 
     groups: Dict[int, List[int]] = {}
@@ -270,16 +283,64 @@ def build_clusters(
     return [members for members in groups.values() if len(members) >= 2]
 
 
-def _dim(conn: sqlite3.Connection, embedding_identity: Optional[str]) -> int:
-    row = conn.execute(
-        "SELECT dim FROM fact_embeddings WHERE embedding_identity = ? LIMIT 1"
-        if embedding_identity
-        else "SELECT dim FROM fact_embeddings LIMIT 1",
-        (embedding_identity,) if embedding_identity else (),
-    ).fetchone()
-    if row is None:
+def _embedding_identity(
+    conn: sqlite3.Connection, embedding_identity: Optional[str]
+) -> Optional[str]:
+    rows = conn.execute(
+        "SELECT DISTINCT embedding_identity FROM fact_embeddings "
+        "ORDER BY embedding_identity"
+    ).fetchall()
+    identities = [str(row[0]) for row in rows]
+    if embedding_identity is not None:
+        return embedding_identity
+    if not identities:
+        return None
+    if len(identities) > 1:
+        raise GuardRailError(
+            "multiple embedding identities are present; pass --embedding-identity "
+            f"with one of: {', '.join(identities)}"
+        )
+    return identities[0]
+
+
+def _dim(conn: sqlite3.Connection, embedding_identity: str) -> int:
+    rows = conn.execute(
+        "SELECT DISTINCT dim FROM fact_embeddings "
+        "WHERE embedding_identity = ? ORDER BY dim",
+        (embedding_identity,),
+    ).fetchall()
+    if not rows:
         return 0
-    return int(row[0])
+    if len(rows) > 1:
+        dimensions = ", ".join(str(int(row[0])) for row in rows)
+        raise GuardRailError(
+            f"embedding identity {embedding_identity!r} has multiple dimensions: "
+            f"{dimensions}"
+        )
+    return int(rows[0][0])
+
+
+def _embedding_matrix(
+    conn: sqlite3.Connection, embedding_identity: str, dim: int
+) -> Tuple[np.ndarray, np.ndarray]:
+    rows = conn.execute(
+        "SELECT fact_id, embedding FROM fact_embeddings "
+        "WHERE embedding_identity = ? AND dim = ? ORDER BY fact_id",
+        (embedding_identity, dim),
+    ).fetchall()
+    if not rows:
+        return np.array([], dtype=np.int64), np.empty((0, dim), dtype=np.float32)
+    fact_ids = np.array([int(row[0]) for row in rows], dtype=np.int64)
+    vectors = [np.frombuffer(row[1], dtype="<f4") for row in rows]
+    if any(vector.size != dim for vector in vectors):
+        raise GuardRailError(
+            f"stored embedding size does not match dimension {dim} for "
+            f"identity {embedding_identity!r}"
+        )
+    matrix = np.stack(vectors).astype(np.float32, copy=False)
+    row_norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    row_norms = np.where(row_norms < 1e-9, 1.0, row_norms)
+    return fact_ids, matrix / row_norms
 
 
 def _is_legacy_superseded(content: str) -> bool:
@@ -292,7 +353,12 @@ def _fact_table_cols(conn: sqlite3.Connection) -> set:
 
 def _active_fact_ids(conn: sqlite3.Connection) -> set:
     cols = _fact_table_cols(conn)
-    where = " WHERE invalid_at IS NULL" if "invalid_at" in cols else ""
+    predicates = [
+        f"{column} IS NULL"
+        for column in ("invalid_at", "superseded_by", "conflict_group")
+        if column in cols
+    ]
+    where = " WHERE " + " AND ".join(predicates) if predicates else ""
     rows = conn.execute(f"SELECT fact_id, content FROM facts{where}").fetchall()
     return {
         int(row["fact_id"])
@@ -307,12 +373,12 @@ def _active_fact_ids(conn: sqlite3.Connection) -> set:
 
 def _fact_rows(conn: sqlite3.Connection, fact_ids: Sequence[int]) -> Dict[int, sqlite3.Row]:
     placeholders = ",".join("?" * len(fact_ids))
-    invalid_at_select = (
-        "invalid_at" if "invalid_at" in _fact_table_cols(conn) else "NULL AS invalid_at"
-    )
+    columns = _fact_table_cols(conn)
+    invalid_at_select = "invalid_at" if "invalid_at" in columns else "NULL AS invalid_at"
+    scope_select = "scope" if "scope" in columns else "'private' AS scope"
     rows = conn.execute(
         f"SELECT fact_id, content, tags, trust_score, retrieval_count, "
-        f"helpful_count, created_at, {invalid_at_select} "
+        f"helpful_count, created_at, {invalid_at_select}, {scope_select} "
         f"FROM facts WHERE fact_id IN ({placeholders})",
         list(fact_ids),
     ).fetchall()
@@ -372,6 +438,8 @@ class ClusterMerge:
 
 @dataclass
 class MergePlan:
+    """Planned changes and counts over the active-fact population."""
+
     clusters: List[ClusterMerge] = field(default_factory=list)
     starting_fact_count: int = 0
 
@@ -408,13 +476,22 @@ def plan_merge(
     spot-check before trusting the merge, rather than assuming every member
     is a genuine paraphrase of the same statement.
     """
-    starting = int(conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0])
+    starting = len(_active_fact_ids(conn))
     clusters = build_clusters(conn, threshold, embedding_identity=embedding_identity)
 
     plan = MergePlan(starting_fact_count=starting)
     for members in clusters:
-        survivor, losers = choose_survivor(conn, members, flood_cutoff)
+        survivor, _ = choose_survivor(conn, members, flood_cutoff)
         rows = _fact_rows(conn, members)
+        members = [
+            fact_id for fact_id in members
+            if fact_id == survivor or safe_to_merge_near_duplicate(
+                str(rows[survivor]["content"]), str(rows[fact_id]["content"])
+            )
+        ]
+        if len(members) < 2:
+            continue
+        survivor, losers = choose_survivor(conn, members, flood_cutoff)
         merged_retrieval = sum(int(rows[fid]["retrieval_count"]) for fid in members)
         merged_helpful = sum(int(rows[fid]["helpful_count"]) for fid in members)
         merged_tags = _merge_tags(*(rows[fid]["tags"] for fid in members))
@@ -437,6 +514,8 @@ def plan_merge(
 
 @dataclass
 class MergeResult:
+    """Merge outcome whose projected and final counts cover active facts only."""
+
     dry_run: bool
     drop_count: int
     projected_final_count: int
@@ -446,12 +525,107 @@ class MergeResult:
 
 
 def _refuse_if_live_path(db_path: str) -> None:
-    literal_parts = str(db_path).replace("\\", "/").split("/")
-    resolved_parts = os.path.realpath(db_path).replace("\\", "/").split("/")
-    if ".hermes" in literal_parts or ".hermes" in resolved_parts:
+    literal = Path(db_path).expanduser()
+    resolved = literal.resolve()
+    hermes_home = Path(
+        os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))
+    ).expanduser().resolve()
+    under_hermes = (
+        ".hermes" in literal.parts
+        or ".hermes" in resolved.parts
+        or resolved == hermes_home
+        or hermes_home in resolved.parents
+    )
+    live_database = hermes_home / "memory_store.db"
+    same_as_live = False
+    if resolved.exists() and live_database.exists():
+        same_as_live = os.path.samefile(resolved, live_database)
+    if under_hermes or same_as_live:
         raise GuardRailError(
-            f"refusing to run against a path under .hermes ({db_path}); "
+            f"refusing to run against a live hermes path ({db_path}); "
             "this tool only ever runs against a copy"
+        )
+
+
+def _read_only_connection(path: str) -> sqlite3.Connection:
+    resolved = Path(path).expanduser().resolve()
+    if not resolved.is_file():
+        raise GuardRailError(f"database file does not exist ({resolved})")
+    return sqlite3.connect(f"{resolved.as_uri()}?mode=ro", uri=True)
+
+
+def _read_write_connection(path: str) -> sqlite3.Connection:
+    resolved = Path(path).expanduser().resolve()
+    if not resolved.is_file():
+        raise GuardRailError(f"database file does not exist ({resolved})")
+    return sqlite3.connect(f"{resolved.as_uri()}?mode=rw", uri=True)
+
+
+def _validate_backup(db_path: str, backup_path: str) -> None:
+    database = Path(db_path).expanduser().resolve()
+    backup = Path(backup_path).expanduser().resolve()
+    if not backup.is_file() or not os.access(backup, os.R_OK):
+        raise GuardRailError(
+            f"refusing to run: backup is not a readable file ({backup_path})"
+        )
+    if backup == database or (
+        database.exists() and os.path.samefile(database, backup)
+    ):
+        raise GuardRailError(
+            "refusing to run: backup must be distinct from the target database"
+        )
+    try:
+        with backup.open("rb") as backup_file:
+            if backup_file.read(16) != b"SQLite format 3\x00":
+                raise GuardRailError(
+                    f"refusing to run: backup is not a readable SQLite file "
+                    f"({backup_path})"
+                )
+        with closing(_read_only_connection(str(database))) as database_conn, closing(
+            _read_only_connection(str(backup))
+        ) as backup_conn:
+            rows = backup_conn.execute("PRAGMA quick_check").fetchall()
+            if schema_version(database_conn) != schema_version(backup_conn):
+                raise GuardRailError(
+                    "refusing to run: backup schema version does not match "
+                    "the target database"
+                )
+            target_rows = database_conn.execute(
+                "SELECT fact_id, content FROM facts ORDER BY fact_id LIMIT 16"
+            ).fetchall()
+            if target_rows:
+                placeholders = ",".join("?" * len(target_rows))
+                backup_rows = backup_conn.execute(
+                    f"SELECT fact_id, content FROM facts "
+                    f"WHERE fact_id IN ({placeholders})",
+                    [int(row[0]) for row in target_rows],
+                ).fetchall()
+                if dict(backup_rows) != dict(target_rows):
+                    raise GuardRailError(
+                        "refusing to run: backup facts do not match the target database"
+                    )
+            else:
+                target_schema = database_conn.execute(
+                    "SELECT type, name, sql FROM sqlite_master "
+                    "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
+                ).fetchall()
+                backup_schema = backup_conn.execute(
+                    "SELECT type, name, sql FROM sqlite_master "
+                    "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
+                ).fetchall()
+                if backup_schema != target_schema:
+                    raise GuardRailError(
+                        "refusing to run: backup schema does not match the target database"
+                    )
+    except GuardRailError:
+        raise
+    except (SchemaError, sqlite3.DatabaseError) as exc:
+        raise GuardRailError(
+            f"refusing to run: backup is not a readable SQLite file ({backup_path})"
+        ) from exc
+    if not rows or any(str(row[0]).lower() != "ok" for row in rows):
+        raise GuardRailError(
+            f"refusing to run: backup SQLite integrity check failed ({backup_path})"
         )
 
 
@@ -469,8 +643,8 @@ def execute_merge(
 ) -> MergeResult:
     """Plan and (optionally) execute the merge against *db_path*.
 
-    Always refuses a path under ``.hermes``. A non-dry-run additionally
-    requires *backup_path* to exist and the computed drop count to fall
+    Always refuses a live Hermes path. A non-dry-run additionally requires
+    *backup_path* to be a distinct, readable SQLite file and the drop count to fall
     inside [*expected_drop_min*, *expected_drop_max*] AND to not exceed
     *max_drop_fraction* of the starting active fact count (default 0.5, i.e.
     refuse a plan that would drop more than half the store even if it is
@@ -480,9 +654,21 @@ def execute_merge(
     """
     _refuse_if_live_path(db_path)
 
-    conn = sqlite3.connect(db_path)
+    if not dry_run:
+        _validate_backup(db_path, backup_path)
+
+    conn = (
+        _read_only_connection(db_path)
+        if dry_run
+        else _read_write_connection(db_path)
+    )
     conn.row_factory = sqlite3.Row
     try:
+        conn.execute("PRAGMA foreign_keys=ON")
+        if not dry_run and not bool(conn.execute("PRAGMA foreign_keys").fetchone()[0]):
+            raise GuardRailError("refusing to run: SQLite foreign keys are disabled")
+        if not dry_run:
+            conn.execute("BEGIN IMMEDIATE")
         plan = plan_merge(
             conn, threshold, flood_cutoff,
             embedding_identity=embedding_identity,
@@ -490,10 +676,6 @@ def execute_merge(
         )
 
         if not dry_run:
-            if not os.path.exists(backup_path):
-                raise GuardRailError(
-                    f"refusing to run: backup file does not exist ({backup_path})"
-                )
             if not (expected_drop_min <= plan.drop_count <= expected_drop_max):
                 raise GuardRailError(
                     f"refusing to run: drop count {plan.drop_count} is outside "
@@ -508,15 +690,26 @@ def execute_merge(
                     f"{plan.starting_fact_count} active facts"
                 )
             _apply_merge(conn, plan)
+            _check_fact_reference_orphans(conn)
             integrity_ok = _integrity_check(conn)
             fts_ok = _fts_integrity_check(conn)
+            if not integrity_ok or not fts_ok:
+                failed = []
+                if not integrity_ok:
+                    failed.append("SQLite integrity_check")
+                if not fts_ok:
+                    failed.append("FTS integrity check")
+                raise GuardRailError(
+                    "refusing to commit: " + " and ".join(failed) + " failed"
+                )
+            final_active_count = len(_active_fact_ids(conn))
+            conn.commit()
             _wal_checkpoint(conn)
-            final_count = int(conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0])
             return MergeResult(
                 dry_run=False,
                 drop_count=plan.drop_count,
                 projected_final_count=plan.projected_final_count,
-                final_fact_count=final_count,
+                final_fact_count=final_active_count,
                 integrity_ok=integrity_ok,
                 fts_integrity_ok=fts_ok,
             )
@@ -526,6 +719,10 @@ def execute_merge(
             drop_count=plan.drop_count,
             projected_final_count=plan.projected_final_count,
         )
+    except BaseException:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -544,17 +741,140 @@ def _apply_merge(conn: sqlite3.Connection, plan: MergePlan) -> None:
             ),
         )
         for loser_id in cluster.loser_ids:
-            conn.execute("DELETE FROM facts WHERE fact_id = ?", (loser_id,))
-            conn.execute("DELETE FROM fact_embeddings WHERE fact_id = ?", (loser_id,))
+            _merge_fact_references(conn, loser_id, cluster.survivor_id)
             if vector_index is not None:
                 vector_index.delete_in_transaction(loser_id)
-            conn.execute("DELETE FROM fact_entities WHERE fact_id = ?", (loser_id,))
-    conn.commit()
+            conn.execute("DELETE FROM facts WHERE fact_id = ?", (loser_id,))
+
+
+_FACT_REFERENCE_ACTIONS = (
+    ("facts", "superseded_by", "update"),
+    ("fact_entities", "fact_id", "deduplicate"),
+    ("fact_provenance", "fact_id", "deduplicate"),
+    ("memory_write_log", "fact_id", "update"),
+    ("memory_write_log", "existing_fact_id", "update"),
+    ("privacy_erasure_log", "fact_id", "update"),
+    ("embedding_jobs", "fact_id", "delete"),
+    ("fact_embeddings", "fact_id", "delete"),
+    ("fact_conflicts", "resolution_fact_id", "update"),
+    ("fact_conflict_members", "fact_id", "deduplicate"),
+    ("fact_conflict_resolutions", "resolution_fact_id", "update"),
+)
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    quoted_table = _quote_identifier(table)
+    return {
+        str(row[1])
+        for row in conn.execute(f"PRAGMA table_info({quoted_table})").fetchall()
+    }
+
+
+def _quote_identifier(identifier: str) -> str:
+    return '"' + identifier.replace('"', '""') + '"'
+
+
+def _merge_fact_references(
+    conn: sqlite3.Connection, loser_id: int, survivor_id: int
+) -> None:
+    _rewrite_reflection_source_tags(conn, loser_id, survivor_id)
+    for table, column, action in _FACT_REFERENCE_ACTIONS:
+        if column not in _table_columns(conn, table):
+            continue
+        if table == "facts" and column == "superseded_by":
+            conn.execute(
+                "UPDATE facts SET superseded_by = NULL "
+                "WHERE fact_id = ? AND superseded_by = ?",
+                (survivor_id, loser_id),
+            )
+        if action == "delete":
+            conn.execute(
+                f'DELETE FROM "{table}" WHERE "{column}" = ?', (loser_id,)
+            )
+            continue
+        prefix = "UPDATE OR IGNORE" if action == "deduplicate" else "UPDATE"
+        conn.execute(
+            f'{prefix} "{table}" SET "{column}" = ? WHERE "{column}" = ?',
+            (survivor_id, loser_id),
+        )
+        if action == "deduplicate":
+            conn.execute(
+                f'DELETE FROM "{table}" WHERE "{column}" = ?', (loser_id,)
+            )
+
+
+def _rewrite_reflection_source_tags(
+    conn: sqlite3.Connection, loser_id: int, survivor_id: int
+) -> None:
+    columns = _table_columns(conn, "facts")
+    if not {"category", "tags"} <= columns:
+        return
+    active_clause = "".join(
+        f" AND {column} IS NULL"
+        for column in ("invalid_at", "superseded_by", "conflict_group")
+        if column in columns
+    )
+    rows = conn.execute(
+        "SELECT fact_id, tags FROM facts "
+        f"WHERE category = 'insight'{active_clause} AND tags LIKE ?",
+        (f"%source_facts:%{loser_id}%",),
+    ).fetchall()
+    for row in rows:
+        tags = str(row["tags"] or "")
+
+        def replace(match: re.Match[str]) -> str:
+            cited = [int(value) for value in match.group(1).split(",")]
+            rewritten = []
+            for fact_id in cited:
+                fact_id = survivor_id if fact_id == loser_id else fact_id
+                if fact_id not in rewritten:
+                    rewritten.append(fact_id)
+            return "source_facts:" + ",".join(str(fact_id) for fact_id in rewritten)
+
+        rewritten_tags = _SOURCE_FACTS_TAG_RE.sub(replace, tags)
+        if rewritten_tags != tags:
+            conn.execute(
+                "UPDATE facts SET tags = ? WHERE fact_id = ?",
+                (rewritten_tags, int(row["fact_id"])),
+            )
+
+
+def _check_fact_reference_orphans(conn: sqlite3.Connection) -> None:
+    references = {(table, column) for table, column, _ in _FACT_REFERENCE_ACTIONS}
+    tables = [
+        str(row[0])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    ]
+    for table in tables:
+        quoted_table = _quote_identifier(table)
+        for row in conn.execute(
+            f"PRAGMA foreign_key_list({quoted_table})"
+        ).fetchall():
+            if str(row[2]) == "facts" and str(row[4]) == "fact_id":
+                references.add((table, str(row[3])))
+    for table, column in sorted(references):
+        if column not in _table_columns(conn, table):
+            continue
+        quoted_table = _quote_identifier(table)
+        quoted_column = _quote_identifier(column)
+        orphan = conn.execute(
+            f"SELECT child.{quoted_column} FROM {quoted_table} AS child "
+            f"LEFT JOIN facts AS parent ON parent.fact_id = child.{quoted_column} "
+            f"WHERE child.{quoted_column} IS NOT NULL "
+            "AND parent.fact_id IS NULL LIMIT 1"
+        ).fetchone()
+        if orphan is not None:
+            raise GuardRailError(
+                f"refusing to commit: orphaned fact reference in {table}.{column} "
+                f"({orphan[0]})"
+            )
 
 
 def _integrity_check(conn: sqlite3.Connection) -> bool:
-    row = conn.execute("PRAGMA integrity_check").fetchone()
-    return bool(row) and row[0] == "ok"
+    rows = conn.execute("PRAGMA integrity_check").fetchall()
+    return bool(rows) and all(row[0] == "ok" for row in rows)
 
 
 def _fts_integrity_check(conn: sqlite3.Connection) -> bool:
@@ -567,7 +887,6 @@ def _fts_integrity_check(conn: sqlite3.Connection) -> bool:
         return True
     try:
         conn.execute("INSERT INTO facts_fts(facts_fts) VALUES ('integrity-check')")
-        conn.commit()
         return True
     except sqlite3.DatabaseError:
         return False
@@ -592,7 +911,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--flood-cutoff", required=True,
                          help="created_at cutoff (YYYY-MM-DD HH:MM:SS) marking pre-existing vs flood facts")
     parser.add_argument("--embedding-identity", default=None,
-                         help="restrict clustering to one embedding_identity (default: any)")
+                         help="embedding_identity to cluster (required when multiple exist)")
     parser.add_argument("--backup-path", required=True,
                          help="path to a pre-existing backup of db_path (required for --execute)")
     parser.add_argument("--expected-drop-min", type=int, default=0)
@@ -603,17 +922,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                          help="actually perform the merge (default is dry-run)")
     args = parser.parse_args(argv)
 
-    result = execute_merge(
-        args.db_path,
-        threshold=args.threshold,
-        flood_cutoff=args.flood_cutoff,
-        embedding_identity=args.embedding_identity,
-        backup_path=args.backup_path,
-        expected_drop_min=args.expected_drop_min,
-        expected_drop_max=args.expected_drop_max,
-        max_drop_fraction=args.max_drop_fraction,
-        dry_run=not args.execute,
-    )
+    try:
+        result = execute_merge(
+            args.db_path,
+            threshold=args.threshold,
+            flood_cutoff=args.flood_cutoff,
+            embedding_identity=args.embedding_identity,
+            backup_path=args.backup_path,
+            expected_drop_min=args.expected_drop_min,
+            expected_drop_max=args.expected_drop_max,
+            max_drop_fraction=args.max_drop_fraction,
+            dry_run=not args.execute,
+        )
+    except (GuardRailError, OSError, sqlite3.DatabaseError, ValueError) as exc:
+        print(f"cluster merge failed: {exc}", file=sys.stderr)
+        return 1
+    if result.integrity_ok is False or result.fts_integrity_ok is False:
+        print("cluster merge failed: post-merge integrity check failed", file=sys.stderr)
+        return 1
     print(result)
     return 0
 

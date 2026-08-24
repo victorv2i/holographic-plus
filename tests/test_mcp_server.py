@@ -226,14 +226,14 @@ def test_memory_add_tags_source_and_persists(mcp_server_mod, provider):
     result = _content_json(_call(server, "memory_add", {
         "content": "Alex Rivera's team uses Skylark CI for Springfield builds",
         "category": "tool",
-        "source": "claude-code",
+        "source": "editor",
     }))
     assert result["status"] == "added"
     fact_id = result["fact_id"]
     row = provider._store._conn.execute(
         "SELECT tags FROM facts WHERE fact_id = ?", (fact_id,)
     ).fetchone()
-    assert "source:claude-code" in row["tags"]
+    assert "source:editor" in row["tags"]
 
 
 def test_memory_add_strips_spoofed_source_tags(mcp_server_mod, provider):
@@ -241,14 +241,14 @@ def test_memory_add_strips_spoofed_source_tags(mcp_server_mod, provider):
     result = _content_json(_call(server, "memory_add", {
         "content": "Alex Rivera's Springfield deploy owner is Morgan",
         "category": "tool",
-        "source": "codex",
-        "tags": "owner, source:claude-code,source:other",
+        "source": "terminal",
+        "tags": "owner, source:editor,source:other",
     }))
     assert result["status"] == "added"
     row = provider._store._conn.execute(
         "SELECT tags FROM facts WHERE fact_id = ?", (result["fact_id"],)
     ).fetchone()
-    assert row["tags"] == "owner,source:codex"
+    assert row["tags"] == "owner,source:terminal"
 
 
 def test_memory_add_rejects_invalid_args_before_provider_call(mcp_server_mod, provider):
@@ -259,14 +259,14 @@ def test_memory_add_rejects_invalid_args_before_provider_call(mcp_server_mod, pr
     server = mcp_server_mod.build_server(provider, read_only=False)
     result = _content_json(_call(server, "memory_add", {
         "content": "   ",
-        "source": "codex",
+        "source": "terminal",
     }))
     assert result["error"] == "invalid content: must not be blank"
 
     result = _content_json(_call(server, "memory_add", {
         "content": "valid content",
         "category": "x" * 129,
-        "source": "codex",
+        "source": "terminal",
     }))
     assert result["error"] == "invalid category: exceeds 128 characters"
 
@@ -275,7 +275,7 @@ def test_memory_add_rejects_invalid_source(mcp_server_mod, provider):
     server = mcp_server_mod.build_server(provider, read_only=False)
     result = _content_json(_call(server, "memory_add", {
         "content": "Alex Rivera's team uses Skylark CI for Springfield builds",
-        "source": "not-a-real-source",
+        "source": "Invalid source",
     }))
     assert "error" in result
 
@@ -305,12 +305,12 @@ def test_memory_add_routes_through_dedup_gate(mcp_provider, mcp_server_mod, tmp_
 
     server = mcp_server_mod.build_server(provider, read_only=False)
     first = _content_json(_call(server, "memory_add", {
-        "content": original, "category": "tool", "source": "codex",
+        "content": original, "category": "tool", "source": "terminal",
     }))
     assert first["status"] == "added"
 
     duplicate = _content_json(_call(server, "memory_add", {
-        "content": paraphrase, "category": "tool", "source": "codex",
+        "content": paraphrase, "category": "tool", "source": "terminal",
     }))
     assert duplicate["status"] == "deduped"
     assert duplicate["fact_id"] == first["fact_id"]
@@ -327,12 +327,12 @@ def test_memory_add_value_update_supersedes(mcp_server_mod, provider):
     first = _content_json(_call(server, "memory_add", {
         "content": "The Springfield API rate limit is 100 requests per minute",
         "category": "general",
-        "source": "claude-code",
+        "source": "editor",
     }))
     updated = _content_json(_call(server, "memory_add", {
         "content": "The Springfield API rate limit is 200 requests per minute",
         "category": "general",
-        "source": "claude-code",
+        "source": "editor",
     }))
     assert updated["status"] == "added"
     assert updated["fact_id"] != first["fact_id"]
@@ -343,6 +343,132 @@ def test_memory_add_value_update_supersedes(mcp_server_mod, provider):
     fact_ids = [h["fact_id"] for h in history["history"]]
     assert first["fact_id"] in fact_ids
     assert updated["fact_id"] in fact_ids
+
+
+def test_memory_add_reports_store_deduplication(mcp_server_mod, provider):
+    content = "Alex Rivera keeps the Springfield runbook in Skylark"
+    existing_id = provider._store.add_fact(content, category="tool")
+    server = mcp_server_mod.build_server(provider, read_only=False)
+
+    result = _content_json(_call(server, "memory_add", {
+        "content": content,
+        "category": "general",
+        "source": "other",
+    }))
+
+    assert result == {"fact_id": existing_id, "status": "deduplicated"}
+    count = provider._store._conn.execute(
+        "SELECT COUNT(*) AS c FROM facts"
+    ).fetchone()["c"]
+    assert count == 1
+
+
+def test_memory_add_reports_supersession_with_existing_fact(
+    mcp_server_mod, provider
+):
+    old_id = provider._store.add_fact(
+        "The Springfield API rate limit is 100 requests per minute",
+        category="general",
+    )
+    existing_id = provider._store.add_fact(
+        "The Springfield API rate limit is 200 requests per minute",
+        category="tool",
+    )
+    server = mcp_server_mod.build_server(provider, read_only=False)
+
+    result = _content_json(_call(server, "memory_add", {
+        "content": "The Springfield API rate limit is 200 requests per minute",
+        "category": "general",
+        "source": "other",
+    }))
+
+    assert result == {
+        "fact_id": existing_id,
+        "status": "superseded_with_existing",
+        "superseded": old_id,
+    }
+    rows = provider._store._conn.execute(
+        "SELECT fact_id, invalid_at, superseded_by FROM facts ORDER BY fact_id"
+    ).fetchall()
+    assert len(rows) == 2
+    assert rows[0]["invalid_at"] is not None
+    assert rows[0]["superseded_by"] == existing_id
+    assert rows[1]["invalid_at"] is None
+
+
+def test_memory_add_rolls_back_and_reports_failed_supersession(mcp_server_mod, provider):
+    server = mcp_server_mod.build_server(provider, read_only=False)
+    first = _content_json(_call(server, "memory_add", {
+        "content": "The Springfield API rate limit is 100 requests per minute",
+        "category": "general",
+        "source": "other",
+    }))
+    # Take the store lock: the async embed pool writes on this connection, and
+    # unlocked DDL/commits here can interleave with its savepoint transaction.
+    with provider._store._lock:
+        provider._store._conn.execute(
+            f"""
+            CREATE TRIGGER force_implicit_supersede_failure AFTER INSERT ON facts
+            WHEN NEW.content = 'The Springfield API rate limit is 200 requests per minute'
+            BEGIN
+                UPDATE facts SET invalid_at = CURRENT_TIMESTAMP
+                 WHERE fact_id = {first["fact_id"]};
+            END
+            """
+        )
+        if provider._store._conn.in_transaction:
+            provider._store._conn.commit()
+
+    result = _content_json(_call(server, "memory_add", {
+        "content": "The Springfield API rate limit is 200 requests per minute",
+        "category": "general",
+        "source": "other",
+    }))
+
+    assert result == {
+        "status": "failed",
+        "superseded": first["fact_id"],
+        "error": "supersede failed: existing fact was not updated",
+    }
+    rows = provider._store._conn.execute(
+        "SELECT fact_id, content, invalid_at FROM facts ORDER BY fact_id"
+    ).fetchall()
+    assert [(row["fact_id"], row["content"], row["invalid_at"]) for row in rows] == [
+        (first["fact_id"], "The Springfield API rate limit is 100 requests per minute", None)
+    ]
+
+
+def test_memory_add_rejects_historical_replacement_id(mcp_server_mod, provider):
+    server = mcp_server_mod.build_server(provider, read_only=False)
+    historical = _content_json(_call(server, "memory_add", {
+        "content": "The Springfield API rate limit is 200 requests per minute",
+        "category": "general",
+        "source": "other",
+    }))
+    current = _content_json(_call(server, "memory_supersede", {
+        "old_fact_id": historical["fact_id"],
+        "new_content": "The Springfield API rate limit is 100 requests per minute",
+        "source": "other",
+    }))
+
+    result = _content_json(_call(server, "memory_add", {
+        "content": "The Springfield API rate limit is 200 requests per minute",
+        "category": "general",
+        "source": "other",
+    }))
+
+    assert result == {
+        "status": "failed",
+        "superseded": current["fact_id"],
+        "error": "supersede failed: replacement fact is not distinct and active",
+    }
+    rows = provider._store._conn.execute(
+        "SELECT fact_id, invalid_at, superseded_by FROM facts ORDER BY fact_id"
+    ).fetchall()
+    assert rows[0]["invalid_at"] is not None
+    assert rows[0]["superseded_by"] == current["fact_id"]
+    assert rows[1]["invalid_at"] is None
+    assert rows[1]["superseded_by"] is None
 
 
 def test_memory_supersede_tool(mcp_server_mod, provider):
@@ -369,6 +495,102 @@ def test_memory_supersede_tool(mcp_server_mod, provider):
     active_ids = {r["fact_id"] for r in active}
     assert first["fact_id"] not in active_ids
     assert new_id in active_ids
+
+
+def test_memory_supersede_reports_reused_existing_fact(mcp_server_mod, provider):
+    old_id = provider._store.add_fact(
+        "Alex Rivera's Springfield office is on the third floor"
+    )
+    existing_id = provider._store.add_fact(
+        "Alex Rivera's Springfield office is on the fifth floor"
+    )
+    server = mcp_server_mod.build_server(provider, read_only=False)
+
+    result = _content_json(_call(server, "memory_supersede", {
+        "old_fact_id": old_id,
+        "new_content": "Alex Rivera's Springfield office is on the fifth floor",
+        "source": "other",
+    }))
+
+    assert result == {
+        "fact_id": existing_id,
+        "status": "superseded_with_existing",
+        "superseded": old_id,
+    }
+    rows = provider._store._conn.execute(
+        "SELECT fact_id, invalid_at, superseded_by FROM facts ORDER BY fact_id"
+    ).fetchall()
+    assert len(rows) == 2
+    assert rows[0]["invalid_at"] is not None
+    assert rows[0]["superseded_by"] == existing_id
+    assert rows[1]["invalid_at"] is None
+
+
+def test_memory_supersede_rolls_back_insert_on_zero_rowcount(mcp_server_mod, provider):
+    server = mcp_server_mod.build_server(provider, read_only=False)
+    first = _content_json(_call(server, "memory_add", {
+        "content": "Alex Rivera's Springfield office is on the third floor",
+        "category": "general",
+        "source": "other",
+    }))
+    # Take the store lock: the async embed pool writes on this connection, and
+    # unlocked DDL/commits here can interleave with its savepoint transaction.
+    with provider._store._lock:
+        provider._store._conn.execute(
+            f"""
+            CREATE TRIGGER force_explicit_supersede_failure AFTER INSERT ON facts
+            WHEN NEW.content = 'Alex Rivera''s Springfield office is on the ninth floor'
+            BEGIN
+                UPDATE facts SET invalid_at = CURRENT_TIMESTAMP
+                 WHERE fact_id = {first["fact_id"]};
+            END
+            """
+        )
+        if provider._store._conn.in_transaction:
+            provider._store._conn.commit()
+
+    result = _content_json(_call(server, "memory_supersede", {
+        "old_fact_id": first["fact_id"],
+        "new_content": "Alex Rivera's Springfield office is on the ninth floor",
+        "source": "other",
+    }))
+
+    assert result == {
+        "status": "failed",
+        "error": "supersede failed: old fact was not updated",
+    }
+    rows = provider._store._conn.execute(
+        "SELECT fact_id, content, invalid_at FROM facts ORDER BY fact_id"
+    ).fetchall()
+    assert [(row["fact_id"], row["content"], row["invalid_at"]) for row in rows] == [
+        (first["fact_id"], "Alex Rivera's Springfield office is on the third floor", None)
+    ]
+
+
+def test_memory_supersede_rejects_self_replacement_id(mcp_server_mod, provider):
+    server = mcp_server_mod.build_server(provider, read_only=False)
+    first = _content_json(_call(server, "memory_add", {
+        "content": "Alex Rivera's Springfield office is on the third floor",
+        "category": "general",
+        "source": "other",
+    }))
+
+    result = _content_json(_call(server, "memory_supersede", {
+        "old_fact_id": first["fact_id"],
+        "new_content": "Alex Rivera's Springfield office is on the third floor",
+        "source": "other",
+    }))
+
+    assert result == {
+        "status": "failed",
+        "error": "supersede failed: replacement fact is not distinct and active",
+    }
+    row = provider._store._conn.execute(
+        "SELECT invalid_at, superseded_by FROM facts WHERE fact_id = ?",
+        (first["fact_id"],),
+    ).fetchone()
+    assert row["invalid_at"] is None
+    assert row["superseded_by"] is None
 
 
 def test_memory_supersede_rejects_unknown_old_fact_before_insert(mcp_server_mod, provider):
@@ -444,7 +666,7 @@ def test_readonly_server_rejects_write_tool_call(mcp_server_mod, provider):
     with pytest.raises(Exception):
         _call(server, "memory_add", {
             "content": "Alex Rivera's Springfield office is remote-first",
-            "source": "codex",
+            "source": "terminal",
         })
 
 

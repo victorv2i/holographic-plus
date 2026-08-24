@@ -1,19 +1,39 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 from pathlib import Path
 import socket
 import sqlite3
+import stat
+import sys
+import threading
 import time
 
 import numpy as np
 import pytest
 
-from enfold.client import ClientConfig, EnfoldClient
+from enfold.client import (
+    ClientConfig,
+    EnfoldClient,
+    EnfoldHandshakeError,
+    EnfoldRemoteError,
+)
 from enfold.embeddings import embedding_to_bytes
-from enfold.extraction_processor import ExtractedMemory
+from enfold.extraction_processor import EvidenceVerification, ExtractedMemory
+from enfold.extraction_spans import transcript_spans
+from enfold.extractor_artifact import bundled_ollama_components
+from enfold.host_extractor import HostExtractorConfig
 from enfold.ollama_artifact import ArtifactAttestation, ArtifactAttestationError
-from enfold.protocol import ClientContext
+from enfold.protocol import (
+    ClientContext,
+    Handshake,
+    Request,
+    Response,
+    decode_frame,
+    encode_frame,
+)
 from enfold.schema import migrate
 from enfold.server import (
     DatabaseOwnershipError,
@@ -26,6 +46,7 @@ from enfold.server import (
 
 
 _ARTIFACT_DIGEST = "sha256:" + "a" * 64
+_EXTRACTION_MODEL_DIGEST = "sha256:" + "b" * 64
 
 
 class FakeArtifactAttestor:
@@ -111,6 +132,50 @@ def test_application_composes_service_health_and_write_in_temp_directory(tmp_pat
     assert not config.socket_path.exists()
 
 
+def test_protocol_health_rejects_ungranted_client_context(tmp_path):
+    config = load_config(_config(tmp_path))
+    context = ClientContext(
+        client_id="ungranted-health-client",
+        surface="operator-health",
+        agent_id="operator-health",
+        session_id="ungranted-health",
+        access_scopes=("secret",),
+    )
+    client = EnfoldClient(ClientConfig(config.socket_path, context))
+    with ServerApplication(config) as application:
+        application.daemon.start()
+
+        with pytest.raises(EnfoldRemoteError) as denied:
+            client.request("health")
+
+    assert denied.value.code == "access_denied"
+    assert denied.value.message == "memory client is not authorized"
+
+
+def test_protocol_health_degrades_after_process_local_vector_fallback(tmp_path):
+    config = load_config(_config(tmp_path))
+    with ServerApplication(config) as application:
+        application.vector_fallback_telemetry.record("sqlite_vec_query_error")
+
+        health = application.daemon._health(
+            ClientContext(
+                client_id="client-a-install",
+                surface="client-a",
+                agent_id="client-a",
+                session_id="vector-fallback-health",
+                access_scopes=("private",),
+            )
+        )
+
+        assert health["status"] == "degraded"
+        assert health["retrieval"]["vector_fallback_active"] is True
+        assert health["retrieval"]["vector_fallback_count"] == 1
+        assert (
+            health["retrieval"]["vector_last_fallback_reason"]
+            == "sqlite_vec_query_error"
+        )
+
+
 def test_database_sidecar_refuses_second_server_and_allows_clean_reacquire(tmp_path):
     config = load_config(_config(tmp_path))
     first = ServerApplication(config)
@@ -151,6 +216,114 @@ def test_check_reports_version_schema_and_grants_without_binding(tmp_path, capsy
     assert report["retrieval"]["embedder_production_ready"] is False
 
 
+def test_health_command_queries_the_live_protocol(tmp_path, capsys):
+    config_path = _config(tmp_path)
+    config = load_config(config_path)
+    with ServerApplication(config) as application:
+        application.daemon.start()
+
+        assert main([
+            "--config", str(config_path), "health",
+            "--client-id", "client-a-install",
+            "--surface", "operator-health",
+            "--agent-id", "operator-health",
+            "--access-scope", "private",
+        ]) == 0
+
+    report = json.loads(capsys.readouterr().out)
+    assert report["status"] == "ok"
+    assert report["service_version"] == "0.8.0"
+    assert report["schema_version"] == 1
+
+
+def test_health_readiness_accepts_configured_healthcheck_public_grant(
+    tmp_path, capsys
+):
+    config_path = _config(
+        tmp_path,
+        grants={"healthcheck-install": ["public"]},
+    )
+    config = load_config(config_path)
+    with ServerApplication(config) as application:
+        application.daemon.start()
+
+        assert main([
+            "--config", str(config_path), "health", "--readiness",
+        ]) == 0
+
+    report = json.loads(capsys.readouterr().out)
+    assert report["status"] == "ok"
+    assert report["service_version"] == "0.8.0"
+    assert report["schema_version"] == 1
+
+
+def test_health_command_reports_transport_failure_without_traceback(tmp_path, capsys):
+    config_path = _config(tmp_path)
+
+    assert main([
+        "--config", str(config_path), "health",
+        "--client-id", "client-a-install",
+        "--access-scope", "private",
+    ]) == 1
+
+    report = json.loads(capsys.readouterr().out)
+    assert report == {
+        "error": "enfold_client_error",
+        "ok": False,
+        "problems": ["daemon_unavailable_or_protocol_error"],
+        "status": "unavailable",
+    }
+
+
+def test_health_readiness_accepts_authenticated_degraded_response(tmp_path, capsys):
+    config_path = _config(tmp_path)
+    config = load_config(config_path)
+    command = [
+        "--config", str(config_path), "health",
+        "--client-id", "client-a-install",
+        "--access-scope", "private",
+    ]
+    with ServerApplication(config) as application:
+        application.vector_fallback_telemetry.record("sqlite_vec_query_error")
+        application.daemon.start()
+
+        assert main(command) == 1
+        assert json.loads(capsys.readouterr().out)["status"] == "degraded"
+        assert main([*command, "--readiness"]) == 0
+
+    assert json.loads(capsys.readouterr().out)["status"] == "degraded"
+
+
+def test_status_reports_stale_socket_unhealthy_and_exits_nonzero(tmp_path, capsys):
+    config_path = _config(tmp_path, cleanup_stale_socket=True)
+    config = load_config(config_path)
+    stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    stale.bind(os.fspath(config.socket_path))
+    stale.close()
+
+    assert main(["--config", str(config_path), "status"]) == 2
+    report = json.loads(capsys.readouterr().out)
+    assert report["status"] == "blocked"
+    assert report["socket"] == "stale-or-unreachable"
+    assert (
+        report["activation_blocker"]
+        == "configured socket is stale or unreachable"
+    )
+
+
+def test_server_with_explicit_cleanup_recovers_stale_socket(tmp_path):
+    config = load_config(_config(tmp_path, cleanup_stale_socket=True))
+    stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    stale.bind(os.fspath(config.socket_path))
+    stale.close()
+
+    with ServerApplication(config) as application:
+        application.daemon.start()
+        assert _client(config.socket_path).request("health")["status"] == "ok"
+
+    assert not config.socket_path.exists()
+
+
 def test_privileged_memory_actions_require_named_granted_clients(tmp_path):
     config = load_config(
         _config(
@@ -167,6 +340,56 @@ def test_privileged_memory_actions_require_named_granted_clients(tmp_path):
             _config(
                 tmp_path,
                 correction_authorities=["self-claimed-client"],
+            )
+        )
+
+
+def test_server_client_credentials_prevent_same_uid_grant_impersonation(tmp_path):
+    token = "secure-client-token-with-at-least-32-characters"
+    digest = "sha256:" + hashlib.sha256(token.encode()).hexdigest()
+    client_b_digest = "sha256:" + hashlib.sha256(b"client-b-distinct-token").hexdigest()
+    hermes_digest = "sha256:" + hashlib.sha256(b"hermes-distinct-token").hexdigest()
+    config = load_config(
+        _config(
+            tmp_path,
+            client_credentials={
+                "client-a-install": digest,
+                "client-b-install": client_b_digest,
+                "hermes-install": hermes_digest,
+            },
+        )
+    )
+    assert config.client_credentials["client-a-install"] == digest
+
+    with ServerApplication(config) as application:
+        application.daemon.start()
+        context = ClientContext(
+            client_id="client-a-install",
+            surface="forged-surface",
+            agent_id="forged-agent",
+            session_id="forged-session",
+            access_scopes=("private", "work"),
+        )
+        with pytest.raises(EnfoldHandshakeError) as denied:
+            EnfoldClient(
+                ClientConfig(config.socket_path, context, credential="wrong-token")
+            ).request("health")
+        assert denied.value.code == "invalid_client_credentials"
+
+        health = EnfoldClient(
+            ClientConfig(config.socket_path, context, credential=token)
+        ).request("health")
+        assert health["identity_authentication"] == "client-credential"
+
+    with pytest.raises(ServerConfigError, match="unique per client"):
+        load_config(
+            _config(
+                tmp_path,
+                client_credentials={
+                    "client-a-install": digest,
+                    "client-b-install": digest,
+                    "hermes-install": hermes_digest,
+                },
             )
         )
 
@@ -197,6 +420,14 @@ def test_live_paths_require_explicit_allow_live():
         load_config(path)
 
 
+def test_live_paths_through_symlinked_ancestor_require_allow_live(tmp_path):
+    alias = tmp_path / "apparently-safe"
+    alias.symlink_to(Path.home() / ".hermes", target_is_directory=True)
+
+    with pytest.raises(ServerConfigError, match="--allow-live"):
+        load_config(alias / "enfold-server.json")
+
+
 def test_config_and_socket_parent_permissions_fail_closed(tmp_path):
     config_path = _config(tmp_path)
     config_path.chmod(0o622)
@@ -211,6 +442,130 @@ def test_config_and_socket_parent_permissions_fail_closed(tmp_path):
             ServerApplication(config)
     finally:
         tmp_path.chmod(0o700)
+
+
+@pytest.mark.parametrize(
+    ("unsafe_target", "message"),
+    [
+        ("database", "database must not be group/world writable"),
+        ("parent", "database parent must not be group/world writable"),
+    ],
+)
+def test_database_permissions_fail_before_writer_lock(
+    tmp_path, unsafe_target, message
+):
+    database_parent = tmp_path / "database"
+    database_parent.mkdir(mode=0o700)
+    database = _database(database_parent / "memory.db")
+    config = load_config(_config(tmp_path, database_path=str(database)))
+    target = database if unsafe_target == "database" else database_parent
+    original_mode = stat.S_IMODE(target.stat().st_mode)
+    target.chmod(original_mode | 0o022)
+    lock_path = database.with_name(database.name + ".enfold.lock")
+    try:
+        with pytest.raises(ServerConfigError, match=message):
+            ServerApplication(config)
+        assert not lock_path.exists()
+    finally:
+        target.chmod(original_mode)
+
+
+@pytest.mark.parametrize(
+    ("replacement", "message"),
+    [
+        ('"client_timeout": NaN', "non-finite JSON number"),
+        ('"client_timeout": Infinity', "non-finite JSON number"),
+        ('"client_timeout": 1e309', "client_timeout must be a positive number"),
+    ],
+)
+def test_config_rejects_non_finite_numbers(tmp_path, replacement, message):
+    path = _config(tmp_path)
+    text = path.read_text(encoding="utf-8").replace(
+        '"client_timeout": 0.5', replacement
+    )
+    path.write_text(text, encoding="utf-8")
+
+    with pytest.raises(ServerConfigError, match=message):
+        load_config(path)
+
+
+def test_config_rejects_duplicate_json_keys(tmp_path):
+    path = _config(tmp_path)
+    text = path.read_text(encoding="utf-8").replace(
+        '"client_timeout": 0.5',
+        '"client_timeout": 0.5, "client_timeout": 0.6',
+    )
+    path.write_text(text, encoding="utf-8")
+
+    with pytest.raises(ServerConfigError, match="duplicate JSON object key"):
+        load_config(path)
+
+
+def test_config_normalizes_grant_ids_and_rejects_normalized_collisions(tmp_path):
+    config = load_config(_config(tmp_path, grants={" client-a ": ["private"]}))
+    assert config.grants == {"client-a": ("private",)}
+
+    with pytest.raises(ServerConfigError, match="unique after whitespace"):
+        load_config(
+            _config(
+                tmp_path,
+                grants={" client-a ": ["private"], "client-a": ["work"]},
+            )
+        )
+
+
+def test_config_reads_and_validates_one_open_descriptor(tmp_path, monkeypatch):
+    path = _config(tmp_path)
+    real_fdopen = os.fdopen
+    real_read_text = Path.read_text
+    replaced = False
+
+    def replace_path():
+        nonlocal replaced
+        if replaced:
+            return
+        replaced = True
+        path.unlink()
+        path.write_text("{not valid JSON", encoding="utf-8")
+        path.chmod(0o600)
+
+    def racing_fdopen(descriptor, *args, **kwargs):
+        replace_path()
+        return real_fdopen(descriptor, *args, **kwargs)
+
+    def racing_read_text(candidate, *args, **kwargs):
+        if candidate == path:
+            replace_path()
+        return real_read_text(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(os, "fdopen", racing_fdopen)
+    monkeypatch.setattr(Path, "read_text", racing_read_text)
+
+    config = load_config(path)
+    assert replaced is True
+    assert "client-a-install" in config.grants
+
+
+@pytest.mark.parametrize(
+    ("digits", "message"),
+    [
+        (4000, "client_timeout must be a positive number"),
+        (5000, "cannot read config JSON"),
+    ],
+)
+def test_huge_json_integers_use_config_error_path(
+    tmp_path, capsys, digits, message
+):
+    path = _config(tmp_path)
+    text = path.read_text(encoding="utf-8").replace(
+        '"client_timeout": 0.5', f'"client_timeout": {"9" * digits}'
+    )
+    path.write_text(text, encoding="utf-8")
+
+    with pytest.raises(ServerConfigError, match=message):
+        load_config(path)
+    assert main(["--config", str(path), "check"]) == 2
+    assert message in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(
@@ -413,7 +768,12 @@ def test_stored_processor_numeric_configuration_fails_early(tmp_path, field, val
         "prefix_policy": "none",
         "processor": {"mode": "daemon-supervised", field: value},
     }
-    with pytest.raises(ServerConfigError, match=f"processor.{field}"):
+    message = (
+        "non-finite JSON number"
+        if field == "heartbeat_stale_seconds"
+        else f"processor.{field}"
+    )
+    with pytest.raises(ServerConfigError, match=message):
         load_config(_config(tmp_path, retrieval=retrieval))
 
 
@@ -431,41 +791,124 @@ def test_stored_fastembed_is_blocked_until_worker_process_isolation(tmp_path):
         load_config(_config(tmp_path, retrieval=retrieval))
 
 
-def test_close_is_retryable_when_worker_join_temporarily_fails(tmp_path):
+def test_close_finishes_cleanup_when_a_worker_stop_fails(tmp_path):
     application = ServerApplication(load_config(_config(tmp_path)))
 
-    class FlakyWorker:
-        calls = 0
+    class FailingWorker:
+        def __init__(self):
+            self.calls = 0
 
         def stop(self, _timeout):
             self.calls += 1
-            if self.calls == 1:
-                raise RuntimeError("join timeout")
+            raise RuntimeError("join timeout")
 
-    worker = FlakyWorker()
-    application.embedding_worker = worker
-    with pytest.raises(RuntimeError, match="join timeout"):
+    class RecordingWorker:
+        def __init__(self):
+            self.calls = 0
+
+        def stop(self, _timeout):
+            self.calls += 1
+
+    extraction_worker = FailingWorker()
+    embedding_worker = RecordingWorker()
+    application.extraction_worker = extraction_worker
+    application.embedding_worker = embedding_worker
+    with pytest.raises(ExceptionGroup, match="server cleanup failed") as raised:
         application.close()
-    assert application._closed is False
-    assert application.ownership._fd is not None
+    assert "join timeout" in str(raised.value.exceptions[0])
+    assert application._closed is True
+    assert application.ownership._fd is None
+    assert extraction_worker.calls == 1
+    assert embedding_worker.calls == 1
+    with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+        application.connection.execute("SELECT 1")
 
     application.close()
+    assert extraction_worker.calls == 1
+    assert embedding_worker.calls == 1
+
+
+@pytest.mark.parametrize("live_thread_owner", ["daemon", "worker"])
+def test_close_preserves_shared_state_while_a_thread_is_alive(
+    tmp_path, live_thread_owner
+):
+    application = ServerApplication(
+        load_config(_config(tmp_path, shutdown_timeout=0.01))
+    )
+    release = threading.Event()
+    thread = threading.Thread(target=release.wait, name="blocked-enfold-thread")
+    thread.start()
+
+    class BlockingWorker:
+        def __init__(self, worker_thread):
+            self._thread = worker_thread
+
+        def stop(self, timeout):
+            self._thread.join(timeout)
+            if self._thread.is_alive():
+                raise RuntimeError("worker did not stop cleanly")
+
+    if live_thread_owner == "daemon":
+        application.daemon._client_threads.add(thread)
+    else:
+        application.extraction_worker = BlockingWorker(thread)
+
+    try:
+        with pytest.raises(BaseExceptionGroup, match="server cleanup failed"):
+            application.close()
+        assert application._closed is False
+        assert application._close_degraded is True
+        assert application.ownership._fd is not None
+        assert application.connection.execute("SELECT 1").fetchone()[0] == 1
+        with pytest.raises(DatabaseOwnershipError, match="another Enfold server"):
+            ServerApplication(application.config)
+    finally:
+        release.set()
+        thread.join(1.0)
+        application.close()
+
     assert application._closed is True
-    assert worker.calls == 2
+    assert application._close_degraded is False
+    assert application.ownership._fd is None
+    with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+        application.connection.execute("SELECT 1")
 
 
 def _extraction_config(**changes):
     host = {
         "type": "subprocess",
-        "argv": ["/usr/bin/enfold-extractor-fixture"],
-        "model_identity": "fixture-model",
-        "prompt_identity": "fixture-prompt-v1",
+        "argv": [
+            sys.executable,
+            "-m", "enfold.ollama_extractor_child",
+            "--model", "fixture-model:latest",
+            "--model-identity", "ollama:fixture-model",
+            "--prompt-identity", "durable-memory-v3",
+        ],
+        "model_identity": "ollama:fixture-model",
+        "prompt_identity": "durable-memory-v3",
         "timeout_seconds": 0.2,
         "terminate_grace_seconds": 0.1,
     }
+    host_config = HostExtractorConfig(
+        argv=tuple(host["argv"]),
+        model_identity=host["model_identity"],
+        prompt_identity=host["prompt_identity"],
+        timeout_seconds=host["timeout_seconds"],
+        terminate_grace_seconds=host["terminate_grace_seconds"],
+    )
+    recipe = host_config.inference_recipe(
+        model_artifact_digest=_EXTRACTION_MODEL_DIGEST,
+        **bundled_ollama_components(sys.executable),
+    )
     config = {
         "mode": "daemon-supervised",
         "host": host,
+        "artifact": {
+            "provider": "ollama",
+            "model": "fixture-model:latest",
+            "model_digest": _EXTRACTION_MODEL_DIGEST,
+            "recipe_digest": recipe.digest,
+        },
         "poll_seconds": 0.01,
         "lease_seconds": 1.0,
         "heartbeat_seconds": 0.1,
@@ -482,9 +925,25 @@ class FakeExtractionAdapter:
     def __init__(self):
         self.calls = 0
 
-    def extract(self, _envelope):
+    def extract(self, envelope):
         self.calls += 1
-        return [ExtractedMemory("Victor uses supervised shared memory.")]
+        return [
+            ExtractedMemory(
+                "Avery uses supervised shared memory.",
+                evidence_excerpt="Avery uses supervised shared memory.",
+                metadata={
+                    "evidence_span_id": transcript_spans(envelope.transcript)[0].span_id,
+                },
+            )
+        ]
+
+
+class VerifiedTestEvidence:
+    identity = "test-evidence-v1"
+
+    def verify(self, _proposal, *, evidence_excerpt, envelope):
+        assert evidence_excerpt in envelope.transcript
+        return EvidenceVerification("verified", self.identity)
 
 
 def test_supervised_extraction_uses_dedicated_connection_and_reports_health(tmp_path):
@@ -496,7 +955,12 @@ def test_supervised_extraction_uses_dedicated_connection_and_reports_health(tmp_
         return adapter
 
     config = load_config(_config(tmp_path, extraction=_extraction_config()))
-    with ServerApplication(config, extraction_extractor_factory=factory) as application:
+    with ServerApplication(
+        config,
+        extraction_extractor_factory=factory,
+        extraction_artifact_attestor=FakeArtifactAttestor(),
+        extraction_evidence_verifier=VerifiedTestEvidence(),
+    ) as application:
         assert application.extraction_connection is not application.connection
         assert factory_calls == [config.extraction.host]
         application.extraction_worker.start()
@@ -505,7 +969,7 @@ def test_supervised_extraction_uses_dedicated_connection_and_reports_health(tmp_
         queued = client.request(
             "memory.extraction.enqueue",
             {
-                "transcript": "Victor uses supervised shared memory.",
+                "transcript": "Avery uses supervised shared memory.",
                 "source": "integration_test",
             },
         )
@@ -525,6 +989,11 @@ def test_supervised_extraction_uses_dedicated_connection_and_reports_health(tmp_
                 break
             time.sleep(0.01)
         assert health["status"] == "ok"
+        assert health["extraction_artifact_attestation"] == {
+            "provider": "ollama",
+            "status": "verified",
+            "recipe_version": 1,
+        }
         extraction = health["automatic_llm_extraction"]
         assert extraction["status"] == "ready"
         assert extraction["worker"]["last_error"] is None
@@ -532,10 +1001,253 @@ def test_supervised_extraction_uses_dedicated_connection_and_reports_health(tmp_
             "pending": 0,
             "processing": 0,
             "dead": 0,
+            "acknowledged": 0,
             "oldest_active_age_seconds": None,
             "pending_stale": False,
         }
         assert adapter.calls == 1
+
+
+def test_supervised_extraction_without_evidence_verifier_is_degraded_and_quarantines(
+    tmp_path,
+):
+    config = load_config(_config(tmp_path, extraction=_extraction_config()))
+    with ServerApplication(
+        config,
+        extraction_extractor_factory=lambda _config: FakeExtractionAdapter(),
+        extraction_artifact_attestor=FakeArtifactAttestor(),
+    ) as application:
+        application.extraction_worker.start()
+        application.daemon.start()
+        client = _client(config.socket_path)
+        queued = client.request(
+            "memory.extraction.enqueue",
+            {
+                "transcript": "Avery uses supervised shared memory.",
+                "source": "integration_test",
+            },
+        )
+        assert queued["outcome"] == "queued"
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            health = client.request("health")
+            queue = health["automatic_llm_extraction"].get("queue", {})
+            if queue.get("dead") == 1:
+                break
+            time.sleep(0.01)
+
+        extraction = health["automatic_llm_extraction"]
+        assert health["status"] == "degraded"
+        assert extraction["status"] == "degraded"
+        assert extraction["evidence_verifier"] == {
+            "configured": False,
+            "verifier_id": "unconfigured",
+        }
+        assert extraction["queue"]["dead"] == 1
+        assert application.connection.execute("SELECT count(*) FROM facts").fetchone()[0] == 0
+
+
+def test_oversized_extraction_enqueue_is_invalid_params(tmp_path):
+    config = load_config(_config(tmp_path, extraction=_extraction_config()))
+    with ServerApplication(
+        config,
+        extraction_extractor_factory=lambda _config: FakeExtractionAdapter(),
+        extraction_artifact_attestor=FakeArtifactAttestor(),
+        extraction_evidence_verifier=VerifiedTestEvidence(),
+    ) as application:
+        enqueuer = application.service._extraction_enqueuer
+
+        def enqueue_directly(context, request):
+            return enqueuer.enqueue_after_commit(
+                context,
+                request.params["transcript"],
+                source=request.params["source"],
+            )
+
+        application.daemon._handler = enqueue_directly
+
+        class RecordingClient:
+            def __init__(self):
+                self.frames = []
+
+            def sendall(self, frame):
+                self.frames.append(frame)
+
+        context = ClientContext(
+            client_id="client-a-install",
+            surface="client-a",
+            agent_id="client-a",
+            session_id="oversized-extraction",
+            access_scopes=("private",),
+        )
+        client = RecordingClient()
+        keep_open, connection = application.daemon._handle_frame(
+            client, encode_frame(Handshake(context)), None
+        )
+        assert keep_open is True
+
+        application.daemon._handle_frame(
+            client,
+            encode_frame(Request(
+                "oversized",
+                "memory.extraction.enqueue",
+                {"transcript": "x" * 13000, "source": "integration_test"},
+            )),
+            connection,
+        )
+
+        response = decode_frame(client.frames[-1])
+        assert isinstance(response, Response)
+        assert response.error.code == "invalid_params"
+        assert "size limit" in response.error.message
+
+
+def test_periodic_attestation_keeps_previous_state_during_recheck(tmp_path):
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockingAttestor(FakeArtifactAttestor):
+        def attest(self, *, model, expected_digest):
+            if self.calls:
+                entered.set()
+                release.wait(1.0)
+            return super().attest(model=model, expected_digest=expected_digest)
+
+    attestor = BlockingAttestor()
+    config = load_config(_config(tmp_path, extraction=_extraction_config()))
+    with ServerApplication(
+        config,
+        extraction_extractor_factory=lambda _config: FakeExtractionAdapter(),
+        extraction_artifact_attestor=attestor,
+    ) as application:
+        thread = threading.Thread(
+            target=application.extraction_worker._prerequisites_ready
+        )
+        thread.start()
+        assert entered.wait(1.0)
+        try:
+            assert application.extraction_artifact_attestation is not None
+        finally:
+            release.set()
+            thread.join(1.0)
+        assert not thread.is_alive()
+
+
+def test_health_degrades_when_required_attestation_is_unverified(
+    tmp_path, monkeypatch
+):
+    config = load_config(_config(tmp_path, extraction=_extraction_config()))
+    with ServerApplication(
+        config,
+        extraction_extractor_factory=lambda _config: FakeExtractionAdapter(),
+        extraction_artifact_attestor=FakeArtifactAttestor(),
+        extraction_evidence_verifier=VerifiedTestEvidence(),
+    ) as application:
+        monkeypatch.setattr(
+            application.extraction_worker,
+            "health",
+            lambda **_kwargs: {
+                "running": True,
+                "stopping": False,
+                "heartbeat_age_seconds": 0.0,
+                "heartbeat_stale": False,
+                "last_success_age_seconds": None,
+                "last_error": None,
+            },
+        )
+        application.extraction_artifact_attestation = None
+        health = application.daemon._health(
+            ClientContext(
+                client_id="client-a-install",
+                surface="client-a",
+                agent_id="client-a",
+                session_id="unverified-attestation",
+                access_scopes=("private",),
+            )
+        )
+
+        assert health["automatic_llm_extraction"]["status"] == "ready"
+        assert health["extraction_artifact_attestation"]["status"] == "unverified"
+        assert health["status"] == "degraded"
+
+
+def test_health_reports_acknowledged_extraction_without_degrading(
+    tmp_path, monkeypatch
+):
+    config = load_config(_config(tmp_path, extraction=_extraction_config()))
+    with ServerApplication(
+        config,
+        extraction_extractor_factory=lambda _config: FakeExtractionAdapter(),
+        extraction_artifact_attestor=FakeArtifactAttestor(),
+        extraction_evidence_verifier=VerifiedTestEvidence(),
+    ) as application:
+        monkeypatch.setattr(
+            application.extraction_worker,
+            "health",
+            lambda **_kwargs: {
+                "running": True,
+                "stopping": False,
+                "heartbeat_age_seconds": 0.0,
+                "heartbeat_stale": False,
+                "last_success_age_seconds": None,
+                "last_error": None,
+            },
+        )
+        application.connection.execute(
+            "INSERT INTO extract_queue(payload, payload_hash, status, attempts, "
+            "last_error) VALUES ('reviewed', ?, 'acknowledged', 3, 'adapter_exit')",
+            ("a" * 64,),
+        )
+        application.connection.commit()
+
+        health = application.daemon._health(
+            ClientContext(
+                client_id="client-a-install",
+                surface="client-a",
+                agent_id="client-a",
+                session_id="acknowledged-extraction",
+                access_scopes=("private",),
+            )
+        )
+
+        assert health["status"] == "ok"
+        extraction = health["automatic_llm_extraction"]
+        assert extraction["status"] == "ready"
+        assert extraction["queue"]["acknowledged"] == 1
+        assert extraction["queue"]["dead"] == 0
+
+
+def test_failed_periodic_attestation_replaces_startup_verified_health(tmp_path):
+    attestor = FakeArtifactAttestor()
+    config = load_config(_config(tmp_path, extraction=_extraction_config()))
+    with ServerApplication(
+        config,
+        extraction_extractor_factory=lambda _config: FakeExtractionAdapter(),
+        extraction_artifact_attestor=attestor,
+    ) as application:
+        attestor.failure = ArtifactAttestationError("mutable tag drifted")
+
+        assert application.extraction_worker._prerequisites_ready() is False
+        health = application.daemon._health(
+            ClientContext(
+                client_id="client-a-install",
+                surface="client-a",
+                agent_id="client-a",
+                session_id="attestation-drift",
+                access_scopes=("private",),
+            )
+        )
+
+        assert health["extraction_artifact_attestation"] == {
+            "provider": "ollama",
+            "status": "verified",
+            "recipe_version": 1,
+        }
+        assert health["status"] == "degraded"
+        assert health["automatic_llm_extraction"]["worker"]["last_error"] == (
+            "worker_prerequisite_failed"
+        )
+        assert len(attestor.calls) == 2
 
 
 @pytest.mark.parametrize(
@@ -563,7 +1275,60 @@ def test_extraction_configuration_fails_closed(tmp_path, extraction, message):
 
 def test_check_reports_configured_extraction_without_starting_adapter(tmp_path):
     config = load_config(_config(tmp_path, extraction=_extraction_config()))
-    report = inspect_config(config)
+    report = inspect_config(
+        config, extraction_artifact_attestor=FakeArtifactAttestor()
+    )
     assert report["automatic_llm_extraction"] == {
         "status": "configured-ready-to-start"
     }
+    assert report["extraction_artifact_attestation"] == {
+        "provider": "ollama",
+        "status": "verified",
+        "recipe_version": 1,
+    }
+
+
+def test_supervised_extraction_requires_immutable_artifact_pins(tmp_path):
+    extraction = _extraction_config()
+    extraction.pop("artifact")
+
+    with pytest.raises(ServerConfigError, match="immutable artifact pins"):
+        load_config(_config(tmp_path, extraction=extraction))
+
+
+def test_extraction_model_tag_must_match_immutable_digest_before_database_open(
+    tmp_path, monkeypatch
+):
+    config = load_config(_config(tmp_path, extraction=_extraction_config()))
+    opened = False
+
+    def must_not_open(*_args, **_kwargs):
+        nonlocal opened
+        opened = True
+        raise AssertionError("database opened before extraction attestation")
+
+    monkeypatch.setattr("enfold.server._open_existing_v1", must_not_open)
+    attestor = FakeArtifactAttestor(
+        failure=ArtifactAttestationError("mutable tag drifted")
+    )
+
+    with pytest.raises(
+        ServerConfigError, match="automatic extraction artifact attestation failed"
+    ):
+        ServerApplication(config, extraction_artifact_attestor=attestor)
+
+    assert opened is False
+    assert attestor.calls == [("fixture-model:latest", _EXTRACTION_MODEL_DIGEST)]
+
+
+def test_extraction_recipe_change_fails_attestation_without_exposing_digest(tmp_path):
+    extraction = _extraction_config()
+    extraction["artifact"]["recipe_digest"] = "sha256:" + "0" * 64
+    config = load_config(_config(tmp_path, extraction=extraction))
+
+    with pytest.raises(
+        ServerConfigError, match="automatic extraction artifact attestation failed"
+    ):
+        inspect_config(
+            config, extraction_artifact_attestor=FakeArtifactAttestor()
+        )

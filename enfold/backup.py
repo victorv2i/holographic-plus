@@ -24,6 +24,8 @@ from pathlib import Path
 from typing import Iterator, TypeAlias
 from urllib.parse import quote
 
+from .sqlite_vec_index import SQLiteVecError, load_sqlite_vec
+
 
 Database: TypeAlias = sqlite3.Connection | str | os.PathLike[str]
 
@@ -214,11 +216,33 @@ def _fts5_tables(conn: sqlite3.Connection) -> tuple[str, ...]:
     )
 
 
+def _load_verification_extensions(conn: sqlite3.Connection) -> None:
+    """Load only extensions required by virtual tables in this database."""
+
+    rows = conn.execute(
+        "SELECT COALESCE(sql, '') FROM sqlite_master "
+        "WHERE type = 'table' AND sql IS NOT NULL"
+    ).fetchall()
+    requires_vec0 = any(
+        "USING VEC0" in " ".join(str(row[0]).upper().split())
+        for row in rows
+    )
+    if not requires_vec0:
+        return
+    try:
+        load_sqlite_vec(conn)
+    except SQLiteVecError as exc:
+        raise BackupError(
+            "database requires sqlite-vec for complete verification"
+        ) from exc
+
+
 def verify_database(
     conn: sqlite3.Connection, *, check_fts: bool = True
 ) -> VerificationReport:
     """Collect integrity, FK, FTS5, and row-count evidence from ``conn``."""
 
+    _load_verification_extensions(conn)
     integrity = tuple(str(row[0]) for row in conn.execute("PRAGMA integrity_check"))
     foreign_keys = tuple(tuple(row) for row in conn.execute("PRAGMA foreign_key_check"))
     tables = _visible_tables(conn)

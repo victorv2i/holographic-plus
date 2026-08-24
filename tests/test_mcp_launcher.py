@@ -36,6 +36,7 @@ def test_launcher_generates_fresh_session_and_ignores_identity_environment(
         "ENFOLD_AGENT_ID": "attacker",
         "ENFOLD_SESSION_ID": "attacker",
         "ENFOLD_ACCESS_SCOPES": "secret",
+        "ENFOLD_CLIENT_CREDENTIAL": "credential-from-supervisor",
     }
 
     first = mcp_launcher.parse_config(_arguments(tmp_path), environ=hostile)
@@ -47,6 +48,7 @@ def test_launcher_generates_fresh_session_and_ignores_identity_environment(
     assert first.context.session_id != second.context.session_id
     assert re.fullmatch(r"client-a-[A-Za-z0-9_-]{32}", first.context.session_id)
     assert first.context.repository == "github.com/example/project"
+    assert first.credential == "credential-from-supervisor"
 
 
 def test_explicit_session_is_supported_for_a_trusted_supervisor(tmp_path, monkeypatch):
@@ -70,7 +72,9 @@ def test_discovery_uses_argv_without_shell_and_strips_remote_credentials(
         ("rev-parse", "--show-toplevel"): (0, str(root)),
         ("config", "--get", "remote.origin.url"): (
             0,
-            "https://token:secret@example.com/owner/project.git?credential=bad#fragment",
+            "https://token:"
+            + "secret"
+            + "@example.com/owner/project.git?credential=bad#fragment",
         ),
         ("symbolic-ref", "--quiet", "--short", "HEAD"): (0, "feature/safe"),
         ("rev-parse", "--verify", "HEAD"): (0, "A" * 40),

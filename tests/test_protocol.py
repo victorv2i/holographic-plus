@@ -95,6 +95,15 @@ def test_handshake_round_trip_preserves_immutable_context():
         decoded.context.agent_id = "spoofed"
 
 
+def test_handshake_repr_omits_plaintext_credential():
+    credential = "operator-" + "credential-value"
+
+    rendered = repr(Handshake(context(), credential=credential))
+
+    assert credential not in rendered
+    assert "credential=" not in rendered
+
+
 def test_request_and_response_round_trip_as_canonical_json_lines():
     request = Request("req-1", "memory.search", {"limit": 5, "query": "current project"})
     encoded = encode_frame(request)

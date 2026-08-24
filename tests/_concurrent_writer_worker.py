@@ -43,7 +43,7 @@ def main() -> int:
         for i in range(n_facts):
             content = f"Alex Rivera fact thread{thread_id} item{i} about Springfield build {thread_id}-{i}"
             blocks, structured = await server.call_tool("memory_add", {
-                "content": content, "category": "general", "source": "codex",
+                "content": content, "category": "general", "source": "terminal",
             })
             result = structured.get("result", structured) if isinstance(structured, dict) else json.loads(blocks[0].text)
             if "error" in result:

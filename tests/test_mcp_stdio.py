@@ -139,14 +139,14 @@ def test_write_forwards_memory_fields_but_not_connection_identity(harness):
         "client-a:thread-7:1",
         "Enfold uses one daemon",
         "agent_report",
-        asserted_by="Victor",
+        asserted_by="Avery",
         state={"subject_key": "enfold", "predicate_key": "architecture"},
     )
 
     method, params, _ = transport.calls[0]
     assert method == "memory.write"
     assert params["idempotency_key"] == "client-a:thread-7:1"
-    assert params["asserted_by"] == "Victor"
+    assert params["asserted_by"] == "Avery"
     assert params["state"]["subject_key"] == "enfold"
     assert "agent_id" not in params
     assert "session_id" not in params
@@ -182,8 +182,8 @@ def test_write_forwards_memory_fields_but_not_connection_identity(harness):
         ),
         (
             "memory_timeline",
-            ("Victor",),
-            ("memory.timeline", {"subject_or_query": "Victor", "limit": 100}),
+            ("Avery",),
+            ("memory.timeline", {"subject_or_query": "Avery", "limit": 100}),
         ),
         (
             "memory_entities",
@@ -192,8 +192,8 @@ def test_write_forwards_memory_fields_but_not_connection_identity(harness):
         ),
         (
             "memory_entity",
-            ("Victor",),
-            ("memory.entity", {"name": "Victor", "limit": 100}),
+            ("Avery",),
+            ("memory.entity", {"name": "Avery", "limit": 100}),
         ),
     ],
 )
@@ -205,13 +205,13 @@ def test_read_tools_forward_to_proxy(harness, name, args, expected):
 
 def test_resolve_conflict_forwards_audited_decision(harness):
     server, transport = harness
-    server.tools["memory_resolve_conflict"]("conflict-1", 9, "Victor confirmed it")
+    server.tools["memory_resolve_conflict"]("conflict-1", 9, "Avery confirmed it")
     assert transport.calls[-1][:2] == (
         "memory.resolve_conflict",
         {
             "conflict_id": "conflict-1",
             "resolution_fact_id": 9,
-            "reason": "Victor confirmed it",
+            "reason": "Avery confirmed it",
         },
     )
 
@@ -219,14 +219,14 @@ def test_resolve_conflict_forwards_audited_decision(harness):
 def test_extraction_enqueue_is_explicit_scoped_model_free_protocol_call(harness):
     server, transport = harness
     server.tools["memory_extraction_enqueue"](
-        "USER: Victor prefers concise responses.",
+        "USER: Avery prefers concise responses.",
         "session_end",
         metadata={"hook": "session_end"},
     )
     assert transport.calls[-1][:2] == (
         "memory.extraction.enqueue",
         {
-            "transcript": "USER: Victor prefers concise responses.",
+            "transcript": "USER: Avery prefers concise responses.",
             "source": "session_end",
             "scope": "private",
             "metadata": {"hook": "session_end"},
@@ -283,12 +283,14 @@ def test_parse_config_uses_explicit_environment_identity(tmp_path):
             "ENFOLD_AGENT_ID": "client-b",
             "ENFOLD_SESSION_ID": "session-9",
             "ENFOLD_ACCESS_SCOPES": "private,work",
+            "ENFOLD_CLIENT_CREDENTIAL": "credential-from-supervisor",
         },
     )
 
     assert config.socket_path == tmp_path / "enfold.sock"
     assert config.context.surface == "client-b"
     assert config.context.access_scopes == ("private", "work")
+    assert config.credential == "credential-from-supervisor"
     assert "health" not in config.capabilities
     assert "memory.extraction.enqueue" in config.capabilities
 

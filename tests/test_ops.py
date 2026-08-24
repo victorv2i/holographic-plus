@@ -1,6 +1,8 @@
 import json
 import sqlite3
 import hashlib
+import os
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -150,7 +152,7 @@ def test_erase_fact_is_explicit_audited_maintenance(tmp_path, capsys):
 
     assert main([
         "erase-fact", str(database), "1",
-        "--requested-by", "victor",
+        "--requested-by", "avery",
         "--reason", "privacy request",
     ]) == 0
 
@@ -163,7 +165,7 @@ def test_erase_fact_is_explicit_audited_maintenance(tmp_path, capsys):
         )
         assert conn.execute(
             "SELECT requested_by, reason FROM privacy_erasure_log"
-        ).fetchone() == ("victor", "privacy request")
+        ).fetchone() == ("avery", "privacy request")
 
 
 def test_rehearse_command_uses_only_explicit_offline_snapshot(tmp_path, capsys):
@@ -203,6 +205,169 @@ def test_rebuild_vector_index_command_is_explicit_and_idempotent(tmp_path, capsy
 
     assert first["report"]["indexed_count"] == 1
     assert second["report"] == first["report"]
+
+
+def test_extraction_dead_status_is_read_only_and_redacts_unsafe_errors(
+    tmp_path, capsys
+):
+    database = tmp_path / "memory.db"
+    _database(database)
+    assert main(["migrate", str(database)]) == 0
+    capsys.readouterr()
+    with sqlite3.connect(database) as conn:
+        conn.executemany(
+            "INSERT INTO extract_queue(payload, payload_hash, status, attempts, "
+            "last_error) VALUES (?, ?, 'dead', ?, ?)",
+            [
+                ("private transcript one", "a" * 64, 3, "adapter_exit"),
+                ("private transcript two", "b" * 64, 1, "unsafe raw detail"),
+            ],
+        )
+        conn.commit()
+
+    assert main(["extraction-dead-status", str(database)]) == 0
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["dead"] == 2
+    assert output["read_only"] is True
+    assert [row["error_code"] for row in output["rows"]] == [
+        "adapter_exit",
+        "redacted",
+    ]
+    assert "private transcript" not in json.dumps(output)
+    with sqlite3.connect(database) as conn:
+        assert conn.execute(
+            "SELECT count(*) FROM extract_queue WHERE status = 'dead'"
+        ).fetchone()[0] == 2
+
+
+def test_revive_extraction_dead_requires_exact_ids_and_error(tmp_path, capsys):
+    database = tmp_path / "memory.db"
+    _database(database)
+    assert main(["migrate", str(database)]) == 0
+    capsys.readouterr()
+    with sqlite3.connect(database) as conn:
+        conn.executemany(
+            "INSERT INTO extract_queue(payload, payload_hash, status, attempts, "
+            "last_error, lease_owner, lease_until, lease_token) "
+            "VALUES (?, ?, 'dead', 3, ?, 'old-worker', 123, 'old-token')",
+            [
+                ("one", "a" * 64, "adapter_exit"),
+                ("two", "b" * 64, "invalid_proposal"),
+            ],
+        )
+        conn.commit()
+        ids = [
+            int(row[0])
+            for row in conn.execute("SELECT id FROM extract_queue ORDER BY id")
+        ]
+
+    wrong = [
+        "revive-extraction-dead", str(database),
+        "--id", str(ids[0]), "--id", str(ids[1]),
+        "--expected-error", "adapter_exit",
+    ]
+    assert main(wrong) == 2
+    assert "expected error" in capsys.readouterr().err
+    with sqlite3.connect(database) as conn:
+        assert conn.execute(
+            "SELECT count(*) FROM extract_queue WHERE status = 'dead'"
+        ).fetchone()[0] == 2
+
+    command = [
+        "revive-extraction-dead", str(database),
+        "--id", str(ids[0]), "--expected-error", "adapter_exit",
+    ]
+    assert main(command) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["revived"] == [ids[0]]
+    with sqlite3.connect(database) as conn:
+        assert tuple(conn.execute(
+            "SELECT status, attempts, not_before, lease_owner, lease_until, "
+            "lease_token, last_error FROM extract_queue WHERE id = ?",
+            (ids[0],),
+        ).fetchone()) == (
+            "pending", 0, None, None, None, None, "adapter_exit"
+        )
+
+
+def test_acknowledge_extraction_dead_requires_exact_ids_and_error(tmp_path, capsys):
+    database = tmp_path / "memory.db"
+    _database(database)
+    assert main(["migrate", str(database)]) == 0
+    capsys.readouterr()
+    with sqlite3.connect(database) as conn:
+        conn.executemany(
+            "INSERT INTO extract_queue(payload, payload_hash, status, attempts, "
+            "last_error) VALUES (?, ?, 'dead', 3, ?)",
+            [
+                ("one", "a" * 64, "adapter_exit"),
+                ("two", "b" * 64, "invalid_proposal"),
+            ],
+        )
+        conn.commit()
+        ids = [
+            int(row[0])
+            for row in conn.execute("SELECT id FROM extract_queue ORDER BY id")
+        ]
+
+    wrong = [
+        "acknowledge-extraction-dead", str(database),
+        "--id", str(ids[0]), "--id", str(ids[1]),
+        "--expected-error", "adapter_exit",
+    ]
+    assert main(wrong) == 2
+    assert "expected error" in capsys.readouterr().err
+
+    command = [
+        "acknowledge-extraction-dead", str(database),
+        "--id", str(ids[0]), "--expected-error", "adapter_exit",
+    ]
+    assert main(command) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["acknowledged"] == [ids[0]]
+    with sqlite3.connect(database) as conn:
+        assert tuple(conn.execute(
+            "SELECT status, attempts, last_error FROM extract_queue WHERE id = ?",
+            (ids[0],),
+        ).fetchone()) == ("acknowledged", 3, "adapter_exit")
+        assert conn.execute(
+            "SELECT status FROM extract_queue WHERE id = ?", (ids[1],)
+        ).fetchone()[0] == "dead"
+
+
+def test_revive_acknowledged_extraction_requires_explicit_source_status(
+    tmp_path, capsys
+):
+    database = tmp_path / "memory.db"
+    _database(database)
+    assert main(["migrate", str(database)]) == 0
+    capsys.readouterr()
+    with sqlite3.connect(database) as conn:
+        cursor = conn.execute(
+            "INSERT INTO extract_queue(payload, payload_hash, status, attempts, "
+            "last_error) VALUES ('one', ?, 'acknowledged', 3, 'adapter_exit')",
+            ("a" * 64,),
+        )
+        row_id = int(cursor.lastrowid)
+        conn.commit()
+
+    command = [
+        "revive-extraction-dead", str(database),
+        "--id", str(row_id), "--expected-error", "adapter_exit",
+    ]
+    assert main(command) == 2
+    assert "not dead" in capsys.readouterr().err
+
+    assert main([*command, "--from-status", "acknowledged"]) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["revived"] == [row_id]
+    assert output["from_status"] == "acknowledged"
+    with sqlite3.connect(database) as conn:
+        assert tuple(conn.execute(
+            "SELECT status, attempts, last_error FROM extract_queue WHERE id = ?",
+            (row_id,),
+        ).fetchone()) == ("pending", 0, "adapter_exit")
 
 
 def test_mutating_maintenance_refuses_daemon_owned_database(tmp_path, capsys):
@@ -257,3 +422,200 @@ def test_browse_snapshot_is_policy_filtered_read_only_and_idempotent(tmp_path, c
     assert main(["browse-snapshot", str(config), "--destination", str(destination)]) == 0
     capsys.readouterr()
     assert hashlib.sha256(destination.read_bytes()).hexdigest() == first_digest
+
+
+@pytest.mark.parametrize(
+    ("database_name", "destination_name", "symlink", "message"),
+    [
+        ("memory.db", "memory.db", False, "collides with live database path"),
+        ("memory.db", "memory.db-wal", False, "collides with live database path"),
+        ("memory.db", "memory.db-shm", False, "collides with live database path"),
+        ("memory.db", "memory.db.enfold.lock", False, "collides with live database path"),
+        ("memory.db", "memory.db.mcp-write.lock", False, "collides with live database path"),
+        ("metadata.json", "browse-snapshot.db", False, "collides with live database path"),
+        ("browse-snapshot.db-wal", "browse-snapshot.db", False, "collides with live database path"),
+        ("browse-snapshot.db-shm", "browse-snapshot.db", False, "collides with live database path"),
+        ("memory.db", "database-link.db", True, "must not be a symlink"),
+    ],
+)
+def test_browse_snapshot_refuses_live_database_path_collisions(
+    tmp_path, capsys, database_name, destination_name, symlink, message
+):
+    database = tmp_path / database_name
+    with sqlite3.connect(database) as conn:
+        migrate(conn)
+        insert_fact(conn, "Live fact", scope="private")
+    config = tmp_path / "server.json"
+    config.write_text(json.dumps({
+        "database_path": str(database),
+        "socket_path": str(tmp_path / "enfold.sock"),
+        "grants": {"browser": ["private"]},
+        "browse_scopes": ["private"],
+        "retrieval": {"mode": "ci", "allow_nonproduction": True, "dimensions": 64},
+    }), encoding="utf-8")
+    config.chmod(0o600)
+    destination = tmp_path / destination_name
+    if symlink:
+        destination.symlink_to(database)
+
+    assert main([
+        "browse-snapshot", str(config),
+        "--destination", str(destination),
+    ]) == 2
+
+    assert message in capsys.readouterr().err
+    with sqlite3.connect(database) as conn:
+        assert conn.execute("SELECT content FROM facts").fetchall() == [
+            ("Live fact",)
+        ]
+
+
+def test_browse_snapshot_refuses_unrelated_existing_sqlite(tmp_path, capsys):
+    database = tmp_path / "memory.db"
+    with sqlite3.connect(database) as conn:
+        migrate(conn)
+        insert_fact(conn, "Live fact", scope="private")
+    config = tmp_path / "server.json"
+    config.write_text(json.dumps({
+        "database_path": str(database),
+        "socket_path": str(tmp_path / "enfold.sock"),
+        "grants": {"browser": ["private"]},
+        "browse_scopes": ["private"],
+        "retrieval": {"mode": "ci", "allow_nonproduction": True, "dimensions": 64},
+    }), encoding="utf-8")
+    config.chmod(0o600)
+    destination = tmp_path / "unrelated.db"
+    _database(destination)
+
+    assert main([
+        "browse-snapshot", str(config), "--destination", str(destination)
+    ]) == 2
+
+    assert "is not an Enfold browse snapshot" in capsys.readouterr().err
+    with sqlite3.connect(destination) as conn:
+        assert conn.execute("SELECT content FROM facts").fetchall() == [
+            ("shared memory",)
+        ]
+
+
+def test_browse_snapshot_refuses_unrelated_existing_metadata(tmp_path, capsys):
+    database = tmp_path / "memory.db"
+    with sqlite3.connect(database) as conn:
+        migrate(conn)
+        insert_fact(conn, "Live fact", scope="private")
+    config = tmp_path / "server.json"
+    config.write_text(json.dumps({
+        "database_path": str(database),
+        "socket_path": str(tmp_path / "enfold.sock"),
+        "grants": {"browser": ["private"]},
+        "browse_scopes": ["private"],
+        "retrieval": {"mode": "ci", "allow_nonproduction": True, "dimensions": 64},
+    }), encoding="utf-8")
+    config.chmod(0o600)
+    destination = tmp_path / "browse" / "browse-snapshot.db"
+    destination.parent.mkdir()
+    metadata = destination.parent / "metadata.json"
+    unrelated = {"title": "Unrelated Datasette configuration"}
+    metadata.write_text(json.dumps(unrelated), encoding="utf-8")
+
+    assert main([
+        "browse-snapshot", str(config), "--destination", str(destination)
+    ]) == 2
+
+    assert "is not Enfold browse snapshot metadata" in capsys.readouterr().err
+    assert json.loads(metadata.read_text(encoding="utf-8")) == unrelated
+    assert not destination.exists()
+
+
+def test_browse_snapshot_refuses_metadata_filename_destination(tmp_path, capsys):
+    database = tmp_path / "memory.db"
+    with sqlite3.connect(database) as conn:
+        migrate(conn)
+        insert_fact(conn, "Live fact", scope="private")
+    config = tmp_path / "server.json"
+    config.write_text(json.dumps({
+        "database_path": str(database),
+        "socket_path": str(tmp_path / "enfold.sock"),
+        "grants": {"browser": ["private"]},
+        "browse_scopes": ["private"],
+        "retrieval": {"mode": "ci", "allow_nonproduction": True, "dimensions": 64},
+    }), encoding="utf-8")
+    config.chmod(0o600)
+    destination = tmp_path / "browse" / "metadata.json"
+
+    assert main([
+        "browse-snapshot", str(config), "--destination", str(destination)
+    ]) == 2
+
+    assert "must differ from its metadata path" in capsys.readouterr().err
+    assert not destination.exists()
+
+
+def test_browse_snapshot_rechecks_destination_before_replace(
+    tmp_path, capsys, monkeypatch
+):
+    database = tmp_path / "memory.db"
+    with sqlite3.connect(database) as conn:
+        migrate(conn)
+        insert_fact(conn, "Live fact", scope="private")
+    config = tmp_path / "server.json"
+    config.write_text(json.dumps({
+        "database_path": str(database),
+        "socket_path": str(tmp_path / "enfold.sock"),
+        "grants": {"browser": ["private"]},
+        "browse_scopes": ["private"],
+        "retrieval": {"mode": "ci", "allow_nonproduction": True, "dimensions": 64},
+    }), encoding="utf-8")
+    config.chmod(0o600)
+    destination = tmp_path / "browse" / "browse-snapshot.db"
+    real_chmod = os.chmod
+
+    def collide(path, mode):
+        real_chmod(path, mode)
+        if Path(path).name.startswith(f".{destination.name}."):
+            destination.write_text("concurrent owner", encoding="utf-8")
+
+    monkeypatch.setattr("enfold.ops.os.chmod", collide)
+
+    assert main([
+        "browse-snapshot", str(config), "--destination", str(destination)
+    ]) == 2
+
+    assert "is not an Enfold browse snapshot" in capsys.readouterr().err
+    assert destination.read_text(encoding="utf-8") == "concurrent owner"
+
+
+def test_browse_snapshot_rechecks_metadata_before_replace(
+    tmp_path, capsys, monkeypatch
+):
+    database = tmp_path / "memory.db"
+    with sqlite3.connect(database) as conn:
+        migrate(conn)
+        insert_fact(conn, "Live fact", scope="private")
+    config = tmp_path / "server.json"
+    config.write_text(json.dumps({
+        "database_path": str(database),
+        "socket_path": str(tmp_path / "enfold.sock"),
+        "grants": {"browser": ["private"]},
+        "browse_scopes": ["private"],
+        "retrieval": {"mode": "ci", "allow_nonproduction": True, "dimensions": 64},
+    }), encoding="utf-8")
+    config.chmod(0o600)
+    destination = tmp_path / "browse" / "browse-snapshot.db"
+    metadata = destination.with_name("metadata.json")
+    unrelated = {"title": "concurrent owner"}
+    real_dump = json.dump
+
+    def collide(value, handle, *args, **kwargs):
+        result = real_dump(value, handle, *args, **kwargs)
+        metadata.write_text(json.dumps(unrelated), encoding="utf-8")
+        return result
+
+    monkeypatch.setattr("enfold.ops.json.dump", collide)
+
+    assert main([
+        "browse-snapshot", str(config), "--destination", str(destination)
+    ]) == 2
+
+    assert "is not Enfold browse snapshot metadata" in capsys.readouterr().err
+    assert json.loads(metadata.read_text(encoding="utf-8")) == unrelated
