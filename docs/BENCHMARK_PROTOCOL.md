@@ -68,7 +68,8 @@ temporal-reasoning, multi-session, knowledge-update, abstention.
 - Packed-fact token budget: 256. Reader sees at most 10 facts.
 
 Every report pins dataset digest, embedder identity, extractor identity,
-reader identity, judge identity, k, token budget, and git SHA.
+reader identity, judge identity, k, token budget, and a public git
+identity (a release tag or a commit on the public remote).
 
 ## Metrics
 

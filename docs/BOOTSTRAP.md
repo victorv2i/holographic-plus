@@ -22,6 +22,8 @@ not use or modify the live store.
 typed writes produce a conflict receipt, a human authority resolves it, and
 history plus evidence remain. It does not touch `~/.hermes/memory_store.db`.
 Host instruction snippets are in `integrations/{claude-code,codex,cursor,hermes}/SKILL.md`.
+Ranking defaults, backup, rehearsal, and browse commands live in
+[OPERATOR.md](OPERATOR.md).
 
 `enfold init` remains the explicit "create files only" command. It does not
 start a daemon or register a client.

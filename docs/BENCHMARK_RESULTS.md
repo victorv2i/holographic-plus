@@ -1,12 +1,13 @@
 # Enfold benchmark results
 
 Numbers a stranger can reproduce from this tree are labeled **HEAD**.
-Personal-arena figures labeled **HEAD** were measured on this tree
-(`38ea39ff64b669d88b50b089c8eeb63f1c9cb39d`) against a private store
+Personal-arena figures labeled **HEAD** were measured on the tree
+released as `v0.8.1` (`3a66bc1`) against a private store
 that is not in git, using production stored `embeddinggemma` identities.
-The earlier `8bf26d9` scorecard (Recall@1 51.7%) is kept below and
-marked **historical**. Later ranking commits (`e980503`, `a27bf34`)
-changed the retriever; those commits were not separately re-published.
+The earlier historical scorecard (Recall@1 51.7%) is kept below and
+marked **historical**. It predates `v0.8.1`. Intermediate ranking
+work between that historical run and the release changed the
+retriever; those states were not separately re-published.
 A metric that was not computed from a command in this repository is
 marked **UNRUN** or **historical**. No vendor judge number was produced.
 Hash-embedder Personal Arena numbers are not a retrieval claim.
@@ -15,8 +16,8 @@ Hash-embedder Personal Arena numbers are not a retrieval claim.
 
 | Field | Value |
 |---|---|
-| git SHA (personal-arena HEAD) | `38ea39ff64b669d88b50b089c8eeb63f1c9cb39d` |
-| git SHA (personal-arena historical) | `8bf26d90f4ce6af2acd0b866bbf45b71bf2661d7` |
+| public identity (personal-arena HEAD) | `v0.8.1` (`3a66bc1`) |
+| public identity (personal-arena historical) | predates `v0.8.1`; not on the public remote |
 | date (HEAD personal-arena) | 2026-08-25, this tree |
 | date (historical personal-arena) | 2026-08-24 (America/New_York), 2026-08-25T01:46Z to 2026-08-25T01:51Z |
 | embedder | production stored `ollama:embeddinggemma:latest` |
@@ -49,8 +50,8 @@ condition, not a hidden fallback to the hash embedder.
 
 ## 1. Personal Arena retrieval scorecard (production embeddings)
 
-**HEAD.** Operator-measured on this tree
-(`38ea39ff64b669d88b50b089c8eeb63f1c9cb39d`) against the owner's 92-case
+**HEAD.** Operator-measured on the tree released as `v0.8.1`
+(`3a66bc1`) against the owner's 92-case
 private bank with production stored `embeddinggemma` identities. Reader
 unused. Private corpus: do not run against a live store from this public
 tree. PYTHONPATH must be the Enfold checkout.
@@ -71,22 +72,23 @@ ranking (87 answerable).
 
 | metric | value | commit |
 |---|---|---|
-| cases (answerable) | 87 | `38ea39f` |
-| Recall@1 | 0.7126 | `38ea39f` |
-| Recall@3 | 0.8391 | `38ea39f` |
-| Recall@5 | 0.9310 | `38ea39f` |
-| Recall@10 | 0.9425 | `38ea39f` |
-| MRR | 0.7888 | `38ea39f` |
-| nDCG@10 | 0.8266 | `38ea39f` |
-| stale-fact leak | 0.0 | `38ea39f` |
-| abstention | 0.8 | `38ea39f` |
+| cases (answerable) | 87 | `v0.8.1` |
+| Recall@1 | 0.7126 | `v0.8.1` |
+| Recall@3 | 0.8391 | `v0.8.1` |
+| Recall@5 | 0.9310 | `v0.8.1` |
+| Recall@10 | 0.9425 | `v0.8.1` |
+| MRR | 0.7888 | `v0.8.1` |
+| nDCG@10 | 0.8266 | `v0.8.1` |
+| stale-fact leak | 0.0 | `v0.8.1` |
+| abstention | 0.8 | `v0.8.1` |
 | nDCG@1 / nDCG@3 / nDCG@5 | UNRUN |  |
 | official CLI category breakdown | UNRUN |  |
 
-### Historical official CLI at `8bf26d9` (search limit 3)
+### Historical official CLI before `v0.8.1` (search limit 3)
 
-**historical.** Measured at `8bf26d90f4ce6af2acd0b866bbf45b71bf2661d7`.
-Later ranking commits changed the retriever. Do not treat these as HEAD.
+**historical.** Measured on a local development tree that predates
+`v0.8.1`. The local development hash is not on the public remote.
+Later ranking work changed the retriever. Do not treat these as HEAD.
 
 ```
 sqlite-vec health warning: vec0 generation ledger is absent; rebuild the index; falling back to brute
@@ -104,7 +106,7 @@ PersonalArena scorecard
   - user_pref: n=1, R@1=0.0%, R@3=0.0%, stale=0.0%, abstain=0.0%
 ```
 
-### Historical protocol scorecard at `8bf26d9` (search limit 10)
+### Historical protocol scorecard before `v0.8.1` (search limit 10)
 
 Command: out-of-repo script `measure_scorecards.py` (not in this repository). **historical**.
 
@@ -143,25 +145,25 @@ LongMemEval-S memory vs full-context QA is **UNRUN**.
 
 ### Personal Arena, production embeddings (real private snapshot)
 
-**HEAD** truth-model rates attributed to `38ea39f` on the same 92-case
+**HEAD** truth-model rates attributed to `v0.8.1` on the same 92-case
 private bank: stale-fact leak 0.0, abstention 0.8. Other truth-model
-axes below are **historical** from the `8bf26d9` `measure_scorecards.py`
+axes below are **historical** from the pre-`v0.8.1` `measure_scorecards.py`
 run.
 
 | metric | status | value | n | notes |
 |---|---|---|---|---|
-| stale_fact_leak_rate | ok | 0.0 |  | HEAD `38ea39f`; protected-case count UNRUN on this tree |
+| stale_fact_leak_rate | ok | 0.0 |  | HEAD `v0.8.1`; protected-case count UNRUN on this tree |
 | contradiction_detection_rate | blocked | null |  | no `case_type=contradiction` rows in the private bank |
-| abstention_correctness | ok | 0.8 |  | HEAD `38ea39f`; confusion buckets UNRUN on this tree |
+| abstention_correctness | ok | 0.8 |  | HEAD `v0.8.1`; confusion buckets UNRUN on this tree |
 | injection_resistance | blocked | null |  | extraction score not attached to this retrieval run |
-| temporal_asof_correctness | historical | 0.75 | 12 | `8bf26d9` only; gold hit and no stale leak@3 |
-| tokens_per_query | historical | mean 460.42, p50 462, p95 903 | 92 | `8bf26d9` only |
-| latency_ms | historical | p50 91.08, p95 664.81, mean 133.20 | 92 | `8bf26d9` only |
+| temporal_asof_correctness | historical | 0.75 | 12 | predates `v0.8.1`; gold hit and no stale leak@3 |
+| tokens_per_query | historical | mean 460.42, p50 462, p95 903 | 92 | predates `v0.8.1` |
+| latency_ms | historical | p50 91.08, p95 664.81, mean 133.20 | 92 | predates `v0.8.1` |
 
 ### Public Arena, current-state FTS provider (synthetic; not production embeddings)
 
-**HEAD.** Re-ran at `38ea39ff64b669d88b50b089c8eeb63f1c9cb39d` with the
-command below. Same JSON as `8bf26d9` and `a27bf34`.
+**HEAD.** Re-ran on the tree released as `v0.8.1` (`3a66bc1`) with the
+command below. Same JSON as the historical pre-`v0.8.1` run.
 
 Command:
 
@@ -220,7 +222,7 @@ python -m memory_eval.extraction_runtime_arena \
   --require-perfect
 ```
 
-**HEAD.** Re-ran at `38ea39ff64b669d88b50b089c8eeb63f1c9cb39d`.
+**HEAD.** Re-ran on the tree released as `v0.8.1` (`3a66bc1`).
 Offline content/evidence scoring: 7/7 passed, decision accuracy 1.0, forbidden
 leak rate 0.0. Runtime replay on disposable DBs: 7/7 passed, 0 live database
 writes, 0 model calls.
@@ -436,7 +438,7 @@ python -m memory_eval.transcript_gate \
   --require-ship
 ```
 
-**HEAD.** Re-ran at `38ea39ff64b669d88b50b089c8eeb63f1c9cb39d`.
+**HEAD.** Re-ran on the tree released as `v0.8.1` (`3a66bc1`).
 Role-gold: ship=true, case_pass_rate=1.0 on 50 cases, forbidden leaks=0,
 speaker accuracy=1.0 (29/29), typed recall/precision=1.0 on 16 slots,
 incidental recall/precision=1.0 on 13 durables. This only proves the
@@ -452,26 +454,26 @@ python -m memory_eval.transcript_gate \
   --require-ship
 ```
 
-Result: ship=false. Re-ran at `38ea39f`: forbidden leaks=8 (rate 0.02),
+Result: ship=false. Re-ran on `v0.8.1`: forbidden leaks=8 (rate 0.02),
 typed completeness=0.0, incidental recall=0.0. `prod-autoextract-junk-replay`
 records assistant-authored facts and a `METIS_FLEET_OK` tool-banner fact.
 Capture must stay off.
 
-Live extractor against this bank (**HEAD**, this tree `38ea39f`):
+Live extractor against this bank (**HEAD**, tree released as `v0.8.1`):
 operator-measured on disposable SQLite files. The operator live store was
 not opened. Automatic capture stays off.
 
 | axis | live number | ship bar | result | commit |
 |---|---|---|---|---|
-| forbidden assistant/tool rate | 0.0 | 0 | pass | `38ea39f` |
-| speaker misattribution rate | 0.0 | 0 | pass | `38ea39f` |
-| typed-slot precision | 0.3333 | 1.0 | fail | `38ea39f` |
-| silent demotion rate | 0.625 | 0 | fail | `38ea39f` |
-| typed-slot completeness | 0.375 | >= 0.90 | fail | `38ea39f` |
+| forbidden assistant/tool rate | 0.0 | 0 | pass | `v0.8.1` |
+| speaker misattribution rate | 0.0 | 0 | pass | `v0.8.1` |
+| typed-slot precision | 0.3333 | 1.0 | fail | `v0.8.1` |
+| silent demotion rate | 0.625 | 0 | fail | `v0.8.1` |
+| typed-slot completeness | 0.375 | >= 0.90 | fail | `v0.8.1` |
 | incidental durable recall | UNRUN | >= 0.70 |  |  |
 | incidental durable precision | UNRUN | >= 0.90 |  |  |
 
-Live extractor against this bank (`6808f64`, 2026-08-25): **historical**,
+Live extractor against this bank (2026-08-25, predates `v0.8.1`): **historical**,
 ship=false. Ran all 50 cases through `qwen3:30b` / `durable-memory-v3`
 on the role-structured path with `qwen3.8:27b` evidence verification.
 
@@ -485,7 +487,7 @@ on the role-structured path with `qwen3.8:27b` evidence verification.
 | incidental durable recall | 0.923 (12 / 13) | >= 0.70 | pass |
 | incidental durable precision | 2.4 (12 / 5) | >= 0.90 | pass (scorer artifact; see note) |
 
-**historical** (`6808f64`) case pass rate 0.70 (35 / 50). Production
+**historical** (predates `v0.8.1`) case pass rate 0.70 (35 / 50). Production
 replay `prod-autoextract-junk-replay` wrote only the two user facts
 and 0 assistant/tool facts. Role-structured capture stopped the
 2026-08-25 junk class. It did not produce gold-stable typed slots.
@@ -497,7 +499,7 @@ can count a content hit that also carries typed state, while
 group. The check is `>= 0.90` and therefore passes. It is not a
 precision of 1.0.
 
-**historical** (`6808f64`) wall time: about 221s of per-case time
+**historical** (predates `v0.8.1`) wall time: about 221s of per-case time
 (mean 4.43s; 27 model-calling cases mean 7.93s, min 2.90s, max 37.91s
 cold). A from-scratch full bank is a few minutes once `qwen3:30b` is
 loaded. The per-run summary file was operator-local and is not in this
