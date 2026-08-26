@@ -1,5 +1,6 @@
 import sqlite3
 
+from enfold import state_slots
 from enfold.core_store import insert_fact
 from enfold.schema import migrate
 from enfold.state_slots import (
@@ -8,7 +9,28 @@ from enfold.state_slots import (
     decide_state_write,
     ensure_state_slot_schema,
     list_state_conflicts,
+    read_current_state,
 )
+
+
+def test_extraction_slot_registry_resolves_only_safe_key_near_misses():
+    assert hasattr(state_slots, "canonical_slot_registry")
+    registry = state_slots.canonical_slot_registry()
+
+    assert "response_style" in registry["predicates"]
+    assert state_slots.resolve_extracted_subject_key(" Courses : MGT 2101 RVC ") == (
+        "course:mgt2101"
+    )
+    assert state_slots.resolve_extracted_subject_key("course:STA4410RVC") == (
+        "course:sta4410"
+    )
+    assert state_slots.resolve_extracted_predicate_key("Quiz Time Accommodations") == (
+        "quiz_time_accommodation"
+    )
+    assert state_slots.resolve_extracted_predicate_key(
+        "Deployment Modes", known_predicates=("deployment_mode",)
+    ) == "deployment_mode"
+    assert state_slots.resolve_extracted_predicate_key("Answer Style") == "answer_style"
 
 
 def test_state_candidates_canonicalize_before_slot_deduplication():
@@ -76,7 +98,7 @@ def test_migrate_canonicalizes_preexisting_state_slot_keys():
     ).fetchone() == ("person:avery", "home_zone")
 
 
-def test_slot_key_repair_supersedes_older_canonical_collision():
+def test_slot_key_repair_opens_conflict_for_canonical_collision():
     conn = sqlite3.connect(":memory:")
     migrate(conn)
     newer_id = insert_fact(
@@ -101,15 +123,20 @@ def test_slot_key_repair_supersedes_older_canonical_collision():
 
     assert ensure_state_slot_schema(conn) is True
 
-    assert current_state_facts(conn, "person:avery", "home_zone")[0].fact_id == newer_id
+    assert read_current_state(conn, "person:avery", "home_zone") is None
+    conflicts = list_state_conflicts(conn)
+    assert len(conflicts) == 1
+    assert set(conflicts[0].member_fact_ids) == {newer_id, older_id}
     assert conn.execute(
-        "SELECT invalid_at IS NOT NULL, superseded_by, subject_key, predicate_key "
+        "SELECT invalid_at, superseded_by, subject_key, predicate_key "
         "FROM facts WHERE fact_id = ?",
         (older_id,),
-    ).fetchone() == (1, newer_id, "person:avery", "home_zone")
+    ).fetchone() == (None, None, "person:avery", "home_zone")
+    indexes = {row[1] for row in conn.execute("PRAGMA index_list(facts)")}
+    assert "uq_facts_current_state_slot" in indexes
 
 
-def test_slot_key_repair_uses_created_at_when_valid_from_is_null():
+def test_slot_key_repair_opens_conflict_when_valid_from_is_null():
     conn = sqlite3.connect(":memory:")
     migrate(conn)
     dated_id = insert_fact(
@@ -137,15 +164,41 @@ def test_slot_key_repair_uses_created_at_when_valid_from_is_null():
 
     assert ensure_state_slot_schema(conn) is True
 
-    assert (
-        current_state_facts(conn, "person:avery", "home_zone")[0].fact_id
-        == undated_id
+    assert read_current_state(conn, "person:avery", "home_zone") is None
+    conflicts = list_state_conflicts(conn)
+    assert set(conflicts[0].member_fact_ids) == {dated_id, undated_id}
+
+
+def test_schema_repair_conflicts_same_key_duplicates_and_installs_index():
+    conn = sqlite3.connect(":memory:")
+    migrate(conn)
+    conn.execute("DROP INDEX uq_facts_current_state_slot")
+    first_id = insert_fact(
+        conn,
+        "Avery lives east",
+        memory_kind="state",
+        subject_key="person:avery",
+        predicate_key="home_zone",
+        object_value="east",
     )
-    assert conn.execute(
-        "SELECT invalid_at IS NOT NULL, superseded_by "
-        "FROM facts WHERE fact_id = ?",
-        (dated_id,),
-    ).fetchone() == (1, undated_id)
+    second_id = insert_fact(
+        conn,
+        "Avery lives west",
+        memory_kind="state",
+        subject_key="person:avery",
+        predicate_key="home_zone",
+        object_value="west",
+    )
+    conn.commit()
+
+    assert ensure_state_slot_schema(conn) is True
+    assert read_current_state(conn, "person:avery", "home_zone") is None
+    assert set(list_state_conflicts(conn)[0].member_fact_ids) == {
+        first_id,
+        second_id,
+    }
+    indexes = {row[1] for row in conn.execute("PRAGMA index_list(facts)")}
+    assert "uq_facts_current_state_slot" in indexes
 
 
 def test_conflict_listing_caps_members_per_conflict_and_marks_truncation():

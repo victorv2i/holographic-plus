@@ -105,7 +105,7 @@ def inspect_memory_schema(
         "sota_gates": {
             "embedding_coverage_complete": fact_count > 0 and embedding_count == fact_count,
             "extract_queue_empty": queue_pending == 0,
-            "provenance_tables": True,
+            "provenance_tables": not missing_provenance_tables,
             "temporal_supersession": temporal_ok,
         },
         "missing": {

@@ -453,7 +453,8 @@ def invalidate_insights_citing(conn: sqlite3.Connection, source_fact_id: int) ->
     invalidate-not-delete mechanism as ``temporal.supersede`` (no
     ``superseded_by`` link, since there is no replacement insight, just
     ``invalid_at``), so the stale insight stays queryable via history.
-    Returns the number of insights marked stale.
+    Returns the number of insights marked stale. Does not commit: the caller
+    owns the transaction so daemon supersession can cascade in the same write.
     """
     rows = conn.execute(
         "SELECT fact_id, tags FROM facts WHERE category = 'insight' AND invalid_at IS NULL"
@@ -468,7 +469,6 @@ def invalidate_insights_citing(conn: sqlite3.Connection, source_fact_id: int) ->
         f"UPDATE facts SET invalid_at = CURRENT_TIMESTAMP WHERE fact_id IN ({placeholders})",
         stale_ids,
     )
-    conn.commit()
     return len(stale_ids)
 
 

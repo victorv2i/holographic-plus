@@ -119,6 +119,13 @@ def _event_rows(
             FROM fact_conflicts c
             JOIN facts f ON f.fact_id = c.resolution_fact_id
             WHERE {visibility_sql} AND c.resolved_at IS NOT NULL
+            UNION ALL
+            SELECT 'conflicted', c.detected_at, MIN(f.fact_id)
+            FROM fact_conflicts c
+            JOIN fact_conflict_members m ON m.conflict_id = c.conflict_id
+            JOIN facts f ON f.fact_id = m.fact_id
+            WHERE {visibility_sql} AND c.resolved_at IS NULL
+            GROUP BY c.conflict_id, c.detected_at
         ), newest_events AS (
             SELECT e.kind, e.changed_at, {selected}
             FROM fact_events e
@@ -128,7 +135,8 @@ def _event_rows(
                      CASE e.kind
                          WHEN 'created' THEN 0
                          WHEN 'superseded' THEN 1
-                         ELSE 2
+                         WHEN 'conflicted' THEN 2
+                         ELSE 3
                      END DESC,
                      f.fact_id DESC
             LIMIT ?
@@ -138,11 +146,13 @@ def _event_rows(
                  CASE kind
                      WHEN 'created' THEN 0
                      WHEN 'superseded' THEN 1
-                     ELSE 2
+                     WHEN 'conflicted' THEN 2
+                     ELSE 3
                  END,
                  fact_id
         """,
         (
+            *visibility_params,
             *visibility_params,
             *visibility_params,
             *visibility_params,

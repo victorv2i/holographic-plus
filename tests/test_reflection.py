@@ -663,6 +663,26 @@ def test_invalidate_insights_citing_marks_stale(tmp_path):
     assert row["invalid_at"] is not None
 
 
+def test_invalidate_insights_citing_does_not_commit_caller_transaction(tmp_path):
+    conn = _conn(tmp_path)
+    a = _add_fact(conn, "Alex Rivera moved to Springfield in March.")
+    b = _add_fact(conn, "Alex Rivera started a new job at Skylark.")
+    insight_id = _add_fact(
+        conn,
+        "Alex Rivera relocated to Springfield around the same time as starting at Skylark.",
+        category="insight", tags=f"source_facts:{a},{b}",
+    )
+
+    conn.execute("BEGIN")
+    invalidate_insights_citing(conn, a)
+    conn.rollback()
+
+    row = conn.execute(
+        "SELECT invalid_at FROM facts WHERE fact_id = ?", (insight_id,)
+    ).fetchone()
+    assert row["invalid_at"] is None
+
+
 def test_invalidate_insights_citing_ignores_unrelated_insights(tmp_path):
     conn = _conn(tmp_path)
     a = _add_fact(conn, "Alex Rivera moved to Springfield in March.")

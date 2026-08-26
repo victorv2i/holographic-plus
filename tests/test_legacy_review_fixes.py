@@ -243,7 +243,9 @@ def test_malformed_extraction_marks_queue_row_retryable(
     )
     _stop_provider_worker(provider)
     aux_module.call_llm = lambda **_kwargs: _llm_response('{"content": "not a list"}')
-    row_id = provider._extract_queue.enqueue("USER: durable but malformed extraction")
+    row_id = provider._extract_queue.enqueue(
+        [{"role": "user", "content": "durable but malformed extraction"}]
+    )
     stop = threading.Event()
     original_mark_failed = provider._extract_queue.mark_failed
 
@@ -290,7 +292,9 @@ def test_partial_insert_retry_replays_saved_proposals_without_model_recall(
         return original_add(content, **kwargs)
 
     provider._store.add_fact = flaky_add
-    row_id = provider._extract_queue.enqueue("USER: two durable replay facts")
+    row_id = provider._extract_queue.enqueue(
+        [{"role": "user", "content": "two durable replay facts"}]
+    )
     stop = threading.Event()
     original_mark_failed = provider._extract_queue.mark_failed
 
@@ -373,7 +377,9 @@ def test_legacy_dead_letter_snapshot_omits_credential_proposals(tmp_path):
     conn.close()
 
 
-def test_extraction_supersede_failure_is_counted_and_retried(make_provider, caplog):
+def test_extraction_value_update_is_skipped_and_existing_fact_stays_current(
+    make_provider, caplog
+):
     provider = make_provider()
     old_id = provider._store.add_fact(
         "The Skylark dashboard port is 3100.", category="project"
@@ -398,9 +404,11 @@ def test_extraction_supersede_failure_is_counted_and_retried(make_provider, capl
         update_check=provider._find_update_target,
         supersede=supersede_once,
     )
-    assert first.inserted == 1
-    assert first.failed == 1
-    assert "reported failure" in caplog.text
+    assert first.inserted == 0
+    assert first.skipped == 1
+    assert first.failed == 0
+    assert calls == []
+    assert "reported failure" not in caplog.text
 
     second = insert_facts(
         provider._store,
@@ -411,10 +419,11 @@ def test_extraction_supersede_failure_is_counted_and_retried(make_provider, capl
     )
     assert second.failed == 0
     assert second.skipped == 1
+    assert calls == []
     old = provider._store._conn.execute(
         "SELECT superseded_by FROM facts WHERE fact_id = ?", (old_id,)
     ).fetchone()
-    assert old["superseded_by"] is not None
+    assert old["superseded_by"] is None
 
 
 @pytest.mark.parametrize("method", ["mark_failed", "mark_quota_failed"])

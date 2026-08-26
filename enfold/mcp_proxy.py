@@ -62,6 +62,9 @@ class MemoryMCPProxy:
     def enqueue_extraction(self, params: Mapping[str, Any]) -> Any:
         return self._call("memory.extraction.enqueue", params)
 
+    def promote(self, params: Mapping[str, Any]) -> Any:
+        return self._call("memory.promote", params)
+
     def _call(self, method: str, params: Mapping[str, Any]) -> Any:
         if not isinstance(params, Mapping):
             raise TypeError("tool params must be a mapping")

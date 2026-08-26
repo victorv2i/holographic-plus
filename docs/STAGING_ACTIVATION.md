@@ -1,6 +1,9 @@
 # Enfold v1 staging and activation boundary
 
-The repository now contains a concrete Hermes provider bridge at
+`integrations/hermes_enfold_v1` is a staging artifact. Enfold does not
+install it. Read that directory's `README.md` first.
+
+The repository contains a concrete Hermes provider bridge at
 `integrations/hermes_enfold_v1`. It is deliberately separate from the legacy
 `enfold` Hermes provider. Repository tests may import it, but nothing copies,
 registers, starts, or connects it to live memory.

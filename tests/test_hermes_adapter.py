@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import get_type_hints
 
 import pytest
 
@@ -10,9 +11,11 @@ from enfold.hermes_adapter import (
     HERMES_CLIENT_ID,
     DegradedReadResult,
     HermesAdapterConfig,
+    HermesMemorySession,
     HermesProtocolAdapter,
     HermesSessionContext,
 )
+from enfold.extraction_spans import TranscriptInput
 
 
 class RecordingTransport:
@@ -210,6 +213,24 @@ def test_all_read_operations_map_to_proxy(tmp_path):
     ]
 
 
+def test_promote_maps_to_retry_stable_protocol_call(tmp_path):
+    memory = adapter(tmp_path).open_session(
+        HermesSessionContext("avery", "s-1", ("private",))
+    )
+    memory.promote(12, event_id="promote-1", target_scope="work")
+    assert RecordingTransport.instances[0].calls == [
+        (
+            "memory.promote",
+            {
+                "fact_id": 12,
+                "idempotency_key": memory.idempotency_key("promote-1"),
+                "target_scope": "work",
+            },
+            None,
+        )
+    ]
+
+
 def test_conflict_resolution_maps_to_authoritative_write(tmp_path):
     memory = adapter(tmp_path).open_session(
         HermesSessionContext("avery", "s-1", ("private",))
@@ -247,6 +268,12 @@ def test_extraction_enqueue_maps_to_attributed_daemon_surface(tmp_path):
             None,
         )
     ]
+
+
+def test_extraction_enqueue_contract_accepts_role_structured_turns():
+    annotation = get_type_hints(HermesMemorySession.enqueue_extraction)["transcript"]
+
+    assert annotation == TranscriptInput
 
 
 def test_offline_write_fails_explicitly_and_never_uses_read_fallback(tmp_path):

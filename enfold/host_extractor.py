@@ -296,12 +296,15 @@ class SubprocessHostExtractor:
                 "context": envelope.context.to_dict(),
                 "scope": envelope.scope,
                 "source": envelope.source,
-                "transcript": envelope.transcript,
             },
             "model_identity": self._config.model_identity,
             "prompt_identity": self._config.prompt_identity,
             "version": 1,
         }
+        if envelope.turns is None:
+            request["envelope"]["transcript"] = envelope.transcript
+        else:
+            request["envelope"]["turns"] = list(envelope.turns)
         try:
             encoded = json.dumps(
                 request,

@@ -8,23 +8,167 @@ import hashlib
 import json
 import sqlite3
 from typing import Callable, Optional, Sequence
+import urllib.error
 import uuid
 
 import numpy as np
 
 from .cluster_merge import NearDuplicateCandidate, find_write_near_duplicates
-from .policy import MemoryPolicy, PolicyDecision
+from .hybrid_retrieval import StoredEmbeddingError
+from .policy import MemoryPolicy, PolicyDecision, scope_authorized
 from .provenance import ConnectionContext, WriteOutcome, WriteRequest
 from .state_slots import (
     SlotDecision,
     StateCandidate,
     add_conflict_member,
+    add_untyped_conflict_member,
     decide_state_write,
+    normalize_predicate_key,
+    normalize_subject_key,
     open_state_conflict,
+    open_untyped_conflict,
+    resolve_state_conflict,
+)
+from .temporal import (
+    _content_tokens,
+    _has_negation_mismatch,
+    _has_opposing_state_words,
+    _has_subjectish_overlap,
+    _is_value_update,
+    _norm_token_sequence,
+    _subjectish_tokens,
 )
 
 
 _UNSET = object()
+_UNTYPED_CONTRADICTION_PREFIX = 2
+_UNTYPED_RESIDUE_NEGATION = frozenset(("never", "without"))
+_STATE_FRAME_WORDS = frozenset(
+    "is are was were uses use used using prefers prefer preferred "
+    "runs run running".split()
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _UntypedContradiction:
+    fact_id: int
+    content: str
+    subject_key: str
+    predicate_key: str
+
+
+def _canonical_shared_token(token: str, subjectish: set[str]) -> str | None:
+    if token in subjectish:
+        return token
+    for suffix in ("ation", "ing", "ed", "ic", "ion", "s"):
+        if token.endswith(suffix) and len(token) > len(suffix) + 2:
+            stem = token[: -len(suffix)]
+            if stem in subjectish:
+                return stem
+    return None
+
+
+def guess_untyped_conflict_slot(left: str, right: str) -> tuple[str, str]:
+    """Label a dispute from shared subject-like tokens, never from a lone word."""
+
+    right_subjectish = _subjectish_tokens(right)
+    shared: list[str] = []
+    seen: set[str] = set()
+    for token in _norm_token_sequence(left):
+        canonical = _canonical_shared_token(token, right_subjectish)
+        if canonical is None or canonical in seen:
+            continue
+        seen.add(canonical)
+        shared.append(canonical)
+    if len(shared) >= 2:
+        subject = ".".join(shared[:-1])
+        predicate = shared[-1]
+    elif shared:
+        subject = shared[0]
+        predicate = "claim"
+    else:
+        subject = "untyped"
+        predicate = "claim"
+    if len(subject) > 128:
+        subject = subject[:128]
+    if len(predicate) > 64:
+        predicate = predicate[:64]
+    return normalize_subject_key(subject), normalize_predicate_key(predicate)
+
+
+def _is_suffix_value_substitution(left: str, right: str) -> bool:
+    """True when two claims share a prefix frame and replace the trailing value."""
+
+    if not _has_subjectish_overlap(left, right):
+        return False
+    left_seq = _norm_token_sequence(left)
+    right_seq = _norm_token_sequence(right)
+    prefix = 0
+    limit = min(len(left_seq), len(right_seq))
+    while prefix < limit and left_seq[prefix] == right_seq[prefix]:
+        prefix += 1
+    if prefix < _UNTYPED_CONTRADICTION_PREFIX:
+        return False
+    left_tail = left_seq[prefix:]
+    right_tail = right_seq[prefix:]
+    if not left_tail or not right_tail:
+        return False
+    if set(left_tail) & set(right_tail):
+        return False
+    if set(left_tail) & _STATE_FRAME_WORDS or set(right_tail) & _STATE_FRAME_WORDS:
+        return False
+    left_values = all(any(char.isdigit() for char in token) for token in left_tail)
+    right_values = all(any(char.isdigit() for char in token) for token in right_tail)
+    shared_noncopular_frame = (
+        set(left_seq[:prefix]) & _STATE_FRAME_WORDS
+    ) - {"is", "are", "was", "were"}
+    return (
+        prefix >= 3
+        or bool(shared_noncopular_frame)
+        or (left_values and right_values)
+    )
+
+
+def _has_state_frame(text: str) -> bool:
+    return bool(set(_norm_token_sequence(text)) & _STATE_FRAME_WORDS)
+
+
+def _untyped_claim_residue(text: str) -> set[str]:
+    """Subject-like tokens after polarity words, collapsed to shared stems."""
+
+    pool = _subjectish_tokens(text) - _UNTYPED_RESIDUE_NEGATION
+    residue: set[str] = set()
+    for token in pool:
+        collapsed = token
+        for suffix in ("ation", "ing", "ed", "ic", "ion", "s"):
+            if token.endswith(suffix) and len(token) > len(suffix) + 2:
+                stem = token[: -len(suffix)]
+                if stem in pool:
+                    collapsed = stem
+                    break
+        residue.add(collapsed)
+    return residue
+
+
+def untyped_contents_contradict(left: str, right: str) -> bool:
+    """Reuse the existing polarity detectors; value swaps need a state frame.
+
+    Numbered event series such as "load memory 1" / "load memory 2" share a
+    frame and differ by a value token, but they are not a single-valued slot.
+    Those stay additive. A copula or use/prefer verb is required before a
+    value substitution is treated as a contradiction.
+
+    Polarity alone is not enough: the remaining claim tokens must match, so
+    unrelated properties of the same subject stay additive.
+    """
+
+    if _has_opposing_state_words(left, right) or _has_negation_mismatch(left, right):
+        left_residue = _untyped_claim_residue(left)
+        right_residue = _untyped_claim_residue(right)
+        return bool(left_residue) and left_residue == right_residue
+    if not (_has_state_frame(left) and _has_state_frame(right)):
+        return False
+    return _is_value_update(left, right) or _is_suffix_value_substitution(left, right)
 
 
 class IdempotencyConflict(ValueError):
@@ -130,16 +274,20 @@ def _request_sha256(
     request: WriteRequest,
     state_candidate: Optional[StateCandidate] = None,
 ) -> str:
-    # Session identity affects the observation and therefore belongs to the
-    # replay contract.  Volatile repository context does not: adapters may
-    # learn it after a retry without changing the requested write itself.
+    # Session identity is provenance on the log row, not part of the replay
+    # contract.  A reconnect mints a new session_id for the same client and
+    # the same request body; that retry must hash as the original write.
+    state_payload = (
+        asdict(state_candidate) if state_candidate is not None else None
+    )
+    if isinstance(state_payload, dict) and state_payload.get("valid_to") is None:
+        state_payload = {
+            key: value for key, value in state_payload.items() if key != "valid_to"
+        }
     payload = {
         "client_id": context.client_id,
-        "session_id": context.session_id,
         "request": asdict(request),
-        "state_candidate": (
-            asdict(state_candidate) if state_candidate is not None else None
-        ),
+        "state_candidate": state_payload,
     }
     encoded = json.dumps(
         payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
@@ -167,6 +315,38 @@ def _observation_sha256(context: ConnectionContext, request: WriteRequest) -> st
         payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+_ENVIRONMENTAL_REJECTION_REASONS = frozenset(
+    {
+        "requested write scope is not server-authorized",
+        "sensitive durable write is not authorized",
+    }
+)
+
+
+def _factless_decision_is_durable(decision: PolicyDecision) -> bool:
+    """Persist only rejections that are a function of the request body."""
+
+    return (
+        decision.outcome == "rejected"
+        and decision.reason not in _ENVIRONMENTAL_REJECTION_REASONS
+    )
+
+
+def _ephemeral_factless_outcome(decision: PolicyDecision) -> WriteOutcome:
+    """Return a factless decision without consuming the idempotency key."""
+
+    return WriteOutcome(
+        write_id=str(uuid.uuid4()),
+        outcome=decision.outcome,
+        fact_id=None,
+        detail_json=json.dumps(
+            {"policy_reason": decision.reason},
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+    )
 
 
 class MemoryWriteService:
@@ -263,7 +443,9 @@ class MemoryWriteService:
                 client_id=context.client_id,
                 sensitive_fields=sensitive_fields,
             )
-            if decision is None and request.scope not in context.access_scopes:
+            if decision is None and not scope_authorized(
+                request.scope, context.access_scopes
+            ):
                 decision = PolicyDecision(
                     "rejected", "requested write scope is not server-authorized"
                 )
@@ -285,16 +467,80 @@ class MemoryWriteService:
             if (
                 effective_candidate is not None
                 and effective_candidate.valid_from is None
+                and request.observed_at
+                and request.source_type != "automatic_extraction"
             ):
                 effective_candidate = replace(
                     effective_candidate,
-                    valid_from=request.observed_at or recorded_at,
+                    valid_from=request.observed_at,
                 )
             state_decision = (
                 decide_state_write(self._conn, effective_candidate)
                 if decision is None and state_candidate is not None
                 else None
             )
+            candidate_is_human = (
+                request.source_type == "human_correction"
+                or request.relation == "corrects"
+                or request.correction_status
+                in {"human_corrected", "human_confirmed"}
+            )
+            can_resolve_conflicts = self._policy.can_resolve_conflicts(
+                context.client_id
+            )
+            if (
+                decision is None
+                and state_decision is not None
+                and state_decision.action == "conflict"
+                and candidate_is_human
+                and can_resolve_conflicts
+            ):
+                placeholders = ",".join(
+                    "?" for _ in state_decision.current_fact_ids
+                )
+                groups = {
+                    row[0]
+                    for row in self._conn.execute(
+                        f"SELECT conflict_group FROM facts "
+                        f"WHERE fact_id IN ({placeholders})",
+                        state_decision.current_fact_ids,
+                    ).fetchall()
+                    if row[0] is not None
+                }
+                if len(groups) == 1:
+                    state_decision = replace(
+                        state_decision,
+                        action="supersede",
+                        target_fact_id=None,
+                        reason="explicit human correction resolves open conflict",
+                    )
+            if (
+                state_decision is not None
+                and state_decision.action == "supersede"
+                and state_decision.target_fact_id is None
+                and not can_resolve_conflicts
+            ):
+                state_decision = replace(
+                    state_decision,
+                    action="conflict",
+                    reason="client is not authorized to resolve open conflict",
+                )
+            if (
+                decision is None
+                and state_decision is not None
+                and state_decision.action == "supersede"
+                and state_decision.target_fact_id is None
+                and not candidate_is_human
+                and effective_candidate is not None
+            ):
+                for fact_id in state_decision.current_fact_ids:
+                    decision = self._supersession_policy(
+                        request,
+                        target_id=fact_id,
+                        candidate_authority=effective_candidate.source_authority,
+                    )
+                    if decision is not None:
+                        break
             if (
                 decision is None
                 and state_decision is not None
@@ -306,9 +552,12 @@ class MemoryWriteService:
                     candidate_authority=effective_candidate.source_authority,
                 )
             if decision is not None:
-                outcome = self._record_factless_decision(
-                    context, request, request_hash, recorded_at, decision
-                )
+                if _factless_decision_is_durable(decision):
+                    outcome = self._record_factless_decision(
+                        context, request, request_hash, recorded_at, decision
+                    )
+                else:
+                    outcome = _ephemeral_factless_outcome(decision)
                 if _manage_transaction:
                     self._conn.commit()
                 return outcome
@@ -319,14 +568,30 @@ class MemoryWriteService:
                 if state_candidate is None
                 else None
             )
-            near_duplicate = (
-                self._find_untyped_near_duplicate(request, near_dedup_query)
+            untyped_contradiction = (
+                self._find_untyped_contradiction(request)
                 if state_candidate is None
                 and extracted_typed is None
                 and request.supersede_fact_id is None
                 and untyped_duplicate is None
                 else None
             )
+            near_duplicate = (
+                self._find_untyped_near_duplicate(request, near_dedup_query)
+                if state_candidate is None
+                and extracted_typed is None
+                and request.supersede_fact_id is None
+                and untyped_duplicate is None
+                and untyped_contradiction is None
+                else None
+            )
+            if near_duplicate is not None:
+                converted = self._contradiction_from_near_duplicate(
+                    request, near_duplicate
+                )
+                if converted is not None:
+                    untyped_contradiction = converted
+                    near_duplicate = None
             enqueue_fact_id: Optional[int] = None
             if (
                 state_decision is not None
@@ -353,7 +618,13 @@ class MemoryWriteService:
             else:
                 if state_decision is not None:
                     conflict_id = self._prepare_state_mutation(
-                        state_decision, recorded_at
+                        state_decision,
+                        recorded_at,
+                        close_valid_to=(
+                            effective_candidate.valid_from
+                            if effective_candidate is not None
+                            else None
+                        ),
                     )
                 fact_result = self._fact_writer(self._conn, request, observation_id)
                 if near_duplicate is not None:
@@ -362,6 +633,19 @@ class MemoryWriteService:
                     )
                 else:
                     enqueue_fact_id = fact_result.fact_id
+                if untyped_contradiction is not None:
+                    conflict_id = self._open_untyped_write_conflict(
+                        untyped_contradiction,
+                        fact_result.fact_id,
+                        request,
+                        recorded_at,
+                    )
+                    fact_result = FactWriteResult(
+                        fact_result.fact_id,
+                        outcome="conflict",
+                        existing_fact_id=untyped_contradiction.fact_id,
+                        detail_json=fact_result.detail_json,
+                    )
                 if effective_candidate is not None and state_decision is not None:
                     self._persist_state_candidate(
                         fact_result,
@@ -374,9 +658,29 @@ class MemoryWriteService:
                         ),
                     )
                     if state_decision.action == "supersede":
-                        self._finish_state_supersession(
-                            state_decision.target_fact_id, fact_result.fact_id
-                        )
+                        if conflict_id is None:
+                            self._finish_state_supersession(
+                                state_decision.target_fact_id, fact_result.fact_id
+                            )
+                        else:
+                            add_conflict_member(
+                                self._conn, conflict_id, fact_result.fact_id
+                            )
+                            resolve_state_conflict(
+                                self._conn,
+                                conflict_id,
+                                fact_result.fact_id,
+                                resolved_by=(
+                                    request.asserted_by
+                                    or request.performed_by
+                                    or context.agent_id
+                                ),
+                                reason=state_decision.reason,
+                                resolved_at=recorded_at,
+                                resolver_client_id=context.client_id,
+                                resolver_session_id=context.session_id,
+                                resolver_agent_id=context.agent_id,
+                            )
                     elif state_decision.action == "conflict":
                         if conflict_id is None:
                             raise RuntimeError(
@@ -427,6 +731,16 @@ class MemoryWriteService:
                     detail["superseded_fact_id"] = state_decision.target_fact_id
                 if conflict_id is not None:
                     detail["conflict_id"] = conflict_id
+            elif untyped_contradiction is not None and conflict_id is not None:
+                detail["conflict_id"] = conflict_id
+                detail["member_fact_ids"] = sorted(
+                    {untyped_contradiction.fact_id, fact_result.fact_id}
+                )
+                detail["conflict_slot"] = {
+                    "scope": request.scope,
+                    "subject_key": untyped_contradiction.subject_key,
+                    "predicate_key": untyped_contradiction.predicate_key,
+                }
             detail_json = json.dumps(detail, sort_keys=True, separators=(",", ":"))
             write_id = str(uuid.uuid4())
             self._conn.execute(
@@ -630,19 +944,49 @@ class MemoryWriteService:
         return fields
 
     def _prepare_state_mutation(
-        self, decision: SlotDecision, now: str
+        self,
+        decision: SlotDecision,
+        now: str,
+        *,
+        close_valid_to: Optional[str] = None,
     ) -> Optional[str]:
         if decision.action == "supersede":
             if decision.target_fact_id is None:
-                raise RuntimeError("supersession decision has no target")
+                placeholders = ",".join("?" for _ in decision.current_fact_ids)
+                groups = {
+                    row[0]
+                    for row in self._conn.execute(
+                        f"SELECT conflict_group FROM facts "
+                        f"WHERE fact_id IN ({placeholders})",
+                        decision.current_fact_ids,
+                    ).fetchall()
+                    if row[0] is not None
+                }
+                if len(groups) != 1:
+                    raise RuntimeError(
+                        "conflict resolution must target one unresolved conflict"
+                    )
+                return str(next(iter(groups)))
+            columns = {
+                str(row[1]) for row in self._conn.execute("PRAGMA table_info(facts)")
+            }
+            assignments = ["invalid_at = ?"]
+            values: list[object] = [now]
+            if "expired_at" in columns:
+                assignments.append("expired_at = ?")
+                values.append(now)
+            if close_valid_to is not None and "valid_to" in columns:
+                assignments.append("valid_to = COALESCE(valid_to, ?)")
+                values.append(close_valid_to)
+            values.extend([decision.target_fact_id, decision.scope])
             cursor = self._conn.execute(
-                """
-                UPDATE facts SET invalid_at = ?
+                f"""
+                UPDATE facts SET {", ".join(assignments)}
                 WHERE fact_id = ? AND scope = ?
                   AND invalid_at IS NULL AND superseded_by IS NULL
                   AND conflict_group IS NULL
                 """,
-                (now, decision.target_fact_id, decision.scope),
+                values,
             )
             if cursor.rowcount != 1:
                 raise RuntimeError("state supersession target is no longer current")
@@ -689,25 +1033,44 @@ class MemoryWriteService:
             raise RuntimeError(
                 "typed state creation requires the fact writer to insert a new fact"
             )
+        columns = {
+            str(row[1]) for row in self._conn.execute("PRAGMA table_info(facts)")
+        }
+        assignments = [
+            "memory_kind = 'state'",
+            "subject_key = ?",
+            "predicate_key = ?",
+            "object_value = ?",
+            "source_authority = ?",
+            "valid_from = ?",
+            "scope = ?",
+            "conflict_group = ?",
+            "confidence = ?",
+        ]
+        values: list[object] = [
+            candidate.subject_key,
+            candidate.predicate_key,
+            candidate.object_value,
+            candidate.source_authority,
+            candidate.valid_from,
+            candidate.scope,
+            conflict_id,
+            confidence,
+        ]
+        if "valid_to" in columns:
+            assignments.append("valid_to = ?")
+            values.append(candidate.valid_to)
+            if candidate.valid_to is not None:
+                assignments.append("invalid_at = ?")
+                values.append(_now())
+        values.append(result.fact_id)
         cursor = self._conn.execute(
-            """
+            f"""
             UPDATE facts
-            SET memory_kind = 'state', subject_key = ?, predicate_key = ?,
-                object_value = ?, source_authority = ?, valid_from = ?,
-                scope = ?, conflict_group = ?, confidence = ?
+            SET {", ".join(assignments)}
             WHERE fact_id = ? AND invalid_at IS NULL AND superseded_by IS NULL
             """,
-            (
-                candidate.subject_key,
-                candidate.predicate_key,
-                candidate.object_value,
-                candidate.source_authority,
-                candidate.valid_from,
-                candidate.scope,
-                conflict_id,
-                confidence,
-                result.fact_id,
-            ),
+            values,
         )
         if cursor.rowcount != 1:
             raise RuntimeError("fact writer returned an unusable state fact")
@@ -899,6 +1262,132 @@ class MemoryWriteService:
         ).fetchone()
         return int(row[0]) if row is not None else None
 
+    def _untyped_conflict_schema_ready(self) -> bool:
+        tables = {
+            str(row[0])
+            for row in self._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        if "fact_conflicts" not in tables or "fact_conflict_members" not in tables:
+            return False
+        columns = {str(row[1]) for row in self._conn.execute("PRAGMA table_info(facts)")}
+        return {"scope", "invalid_at", "superseded_by", "conflict_group"}.issubset(
+            columns
+        )
+
+    def _load_untyped_current_facts(self, scope: str) -> list[tuple[int, str]]:
+        columns = {str(row[1]) for row in self._conn.execute("PRAGMA table_info(facts)")}
+        kind_pred = ""
+        if "memory_kind" in columns:
+            kind_pred = "AND (memory_kind IS NULL OR memory_kind != 'state')"
+        rows = self._conn.execute(
+            f"""
+            SELECT fact_id, content FROM facts
+            WHERE scope = ?
+              AND invalid_at IS NULL AND superseded_by IS NULL
+              AND conflict_group IS NULL
+              {kind_pred}
+            ORDER BY fact_id
+            """,
+            (scope,),
+        ).fetchall()
+        return [(int(row[0]), str(row[1])) for row in rows]
+
+    def _find_untyped_contradiction(
+        self, request: WriteRequest
+    ) -> Optional[_UntypedContradiction]:
+        if not self._untyped_conflict_schema_ready():
+            return None
+        matches: list[_UntypedContradiction] = []
+        for fact_id, content in self._load_untyped_current_facts(request.scope):
+            if content == request.content:
+                continue
+            if not untyped_contents_contradict(request.content, content):
+                continue
+            try:
+                subject_key, predicate_key = guess_untyped_conflict_slot(
+                    request.content, content
+                )
+            except ValueError:
+                continue
+            matches.append(
+                _UntypedContradiction(fact_id, content, subject_key, predicate_key)
+            )
+        if not matches:
+            return None
+        return max(
+            matches,
+            key=lambda item: (
+                len(_content_tokens(request.content) & _content_tokens(item.content)),
+                -item.fact_id,
+            ),
+        )
+
+    def _contradiction_from_near_duplicate(
+        self, request: WriteRequest, candidate: NearDuplicateCandidate
+    ) -> Optional[_UntypedContradiction]:
+        if not self._untyped_conflict_schema_ready():
+            return None
+        row = self._conn.execute(
+            "SELECT content FROM facts WHERE fact_id = ?",
+            (candidate.fact_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        content = str(row[0])
+        if not untyped_contents_contradict(request.content, content):
+            return None
+        try:
+            subject_key, predicate_key = guess_untyped_conflict_slot(
+                request.content, content
+            )
+        except ValueError:
+            return None
+        return _UntypedContradiction(
+            candidate.fact_id, content, subject_key, predicate_key
+        )
+
+    def _open_untyped_write_conflict(
+        self,
+        match: _UntypedContradiction,
+        new_fact_id: int,
+        request: WriteRequest,
+        recorded_at: str,
+    ) -> str:
+        conflict = open_untyped_conflict(
+            self._conn,
+            (match.fact_id,),
+            scope=request.scope,
+            subject_key=match.subject_key,
+            predicate_key=match.predicate_key,
+            detected_at=recorded_at,
+            detail_json=json.dumps({"reason": "untyped contradiction"}),
+        )
+        columns = {str(row[1]) for row in self._conn.execute("PRAGMA table_info(facts)")}
+        assignments = ["conflict_group = ?"]
+        values: list[object] = [conflict.conflict_id]
+        if "subject_key" in columns:
+            assignments.append("subject_key = COALESCE(subject_key, ?)")
+            values.append(match.subject_key)
+        if "predicate_key" in columns:
+            assignments.append("predicate_key = COALESCE(predicate_key, ?)")
+            values.append(match.predicate_key)
+        values.extend([new_fact_id, request.scope])
+        cursor = self._conn.execute(
+            f"""
+            UPDATE facts SET {", ".join(assignments)}
+            WHERE fact_id = ? AND scope = ?
+              AND invalid_at IS NULL AND superseded_by IS NULL
+              AND conflict_group IS NULL
+            """,
+            values,
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError("untyped conflict member is no longer current")
+        add_untyped_conflict_member(self._conn, conflict.conflict_id, new_fact_id)
+        return conflict.conflict_id
+
     def _prepare_near_dedup_query(
         self,
         context: ConnectionContext,
@@ -914,7 +1403,7 @@ class MemoryWriteService:
             state_candidate is not None
             or request.supersede_fact_id is not None
             or policy_decision is not None
-            or request.scope not in context.access_scopes
+            or not scope_authorized(request.scope, context.access_scopes)
             or (
                 request.sensitivity == "sensitive"
                 and "sensitive" not in context.access_scopes
@@ -925,11 +1414,20 @@ class MemoryWriteService:
             or self._near_dedup.embedding_identity is None
             or self._load_prior(context.client_id, request.idempotency_key) is not None
             or self._find_untyped_exact_duplicate(request) is not None
+            or request.correction_status == "unreviewed"
         ):
             return None
         try:
             return np.asarray(self._query_embedder(request.content), dtype=np.float32)
-        except (TypeError, ValueError, sqlite3.DatabaseError):
+        except (
+            TypeError,
+            ValueError,
+            sqlite3.DatabaseError,
+            StoredEmbeddingError,
+            urllib.error.URLError,
+            TimeoutError,
+            OSError,
+        ):
             return None
 
     def _find_untyped_near_duplicate(
@@ -1020,6 +1518,7 @@ class MemoryWriteService:
         selected.append(
             "source_authority" if "source_authority" in columns else "NULL"
         )
+        selected.append("memory_kind" if "memory_kind" in columns else "NULL")
         row = self._conn.execute(
             f"SELECT {', '.join(selected)} FROM facts "
             "WHERE fact_id = ? AND invalid_at IS NULL AND superseded_by IS NULL",
@@ -1027,7 +1526,7 @@ class MemoryWriteService:
         ).fetchone()
         if row is None:
             raise RuntimeError("near-duplicate candidate is no longer active")
-        if row[1] == "human_corrected":
+        if row[3] == "state" or row[1] in {"human_corrected", "human_confirmed"}:
             return True
         try:
             candidate_authority = float(row[2]) if row[2] is not None else 0.0
@@ -1039,12 +1538,19 @@ class MemoryWriteService:
     def _supersede_near_duplicate(
         self, loser_id: int, survivor_id: int, recorded_at: str
     ) -> None:
+        columns = {row[1] for row in self._conn.execute("PRAGMA table_info(facts)")}
+        expired_assignment = ", expired_at = ?" if "expired_at" in columns else ""
+        values = (
+            (recorded_at, recorded_at, survivor_id, loser_id)
+            if expired_assignment
+            else (recorded_at, survivor_id, loser_id)
+        )
         cursor = self._conn.execute(
-            """
-            UPDATE facts SET invalid_at = ?, superseded_by = ?
+            f"""
+            UPDATE facts SET invalid_at = ?{expired_assignment}, superseded_by = ?
             WHERE fact_id = ? AND invalid_at IS NULL AND superseded_by IS NULL
             """,
-            (recorded_at, survivor_id, loser_id),
+            values,
         )
         if cursor.rowcount != 1:
             raise RuntimeError("near-duplicate candidate is no longer active")
@@ -1255,14 +1761,20 @@ class MemoryWriteService:
             raise ValueError(
                 "typed or conflicted facts require their dedicated resolution path"
             )
+        expired_assignment = ", expired_at = ?" if "expired_at" in columns else ""
+        values = (
+            (now, now, new_fact_id, old_fact_id, request_scope)
+            if expired_assignment
+            else (now, new_fact_id, old_fact_id, request_scope)
+        )
         cursor = self._conn.execute(
-            """
+            f"""
             UPDATE facts
-            SET invalid_at = ?, superseded_by = ?
+            SET invalid_at = ?{expired_assignment}, superseded_by = ?
             WHERE fact_id = ? AND scope = ?
               AND invalid_at IS NULL AND superseded_by IS NULL
             """,
-            (now, new_fact_id, old_fact_id, request_scope),
+            values,
         )
         if cursor.rowcount != 1:
             raise ValueError("superseded fact is unavailable or no longer current")

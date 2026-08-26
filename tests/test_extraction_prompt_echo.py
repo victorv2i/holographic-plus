@@ -63,3 +63,20 @@ def test_normalize_drops_echoes_ignoring_case_and_punctuation() -> None:
     }
     normalized = normalize_proposal_document(document, spans)
     assert normalized["proposals"] == []
+
+
+def test_normalize_still_keeps_prompt_example_paraphrases() -> None:
+    """Commit 8e84240 only drops the three verbatim example sentences.
+
+    A near-echo that a small model actually emits is stored by the contract
+    normalizer. The processor must apply the real echo check.
+    """
+    spans = transcript_spans("A friend of the user moved to Queens for a new job.")
+    span_id = spans[0].span_id
+    document = {
+        "proposals": [_proposal("Dana currently works at Northwind.", span_id)]
+    }
+    normalized = normalize_proposal_document(document, spans)
+    assert [item["content"] for item in normalized["proposals"]] == [
+        "Dana currently works at Northwind."
+    ]

@@ -40,6 +40,24 @@ _MONTH_ALIASES = {
     "nov": "november",
     "dec": "december",
 }
+_MONTH_WORDS = frozenset(
+    {
+        "january",
+        "february",
+        "march",
+        "april",
+        "may",
+        "june",
+        "july",
+        "august",
+        "september",
+        "october",
+        "november",
+        "december",
+        *_MONTH_ALIASES.keys(),
+        *_MONTH_ALIASES.values(),
+    }
+)
 _SENTENCE_OPENERS = frozenset(
     {
         "A",
@@ -83,6 +101,13 @@ _SENTENCE_OPENERS = frozenset(
     }
 )
 _LEADING_REQUEST_VERBS = frozenset({"Find", "Give", "Show", "Tell"})
+_GENERIC_TITLE_WORDS = frozenset({"project"})
+_RRF_K = 60.0
+_DENSE_LIST_MIN = 0.1
+_ENTITY_GRAPH_SEED_LIMIT = 5
+_ENTITY_HUB_DEGREE_LIMIT = 25
+_ENTITY_MAX_HOPS = 2
+_ENTITY_HOP_PRIOR = 0.85
 _CANDIDATE_COLUMNS = (
     "fact_id",
     "content",
@@ -151,12 +176,17 @@ class VectorFallbackTelemetry:
 class RankingConfig:
     """All score weights and confidence gates for hybrid retrieval.
 
-    With the defaults, ``score = 0.90 * (0.35*fts + 0.25*jaccard +
-    0.40*cosine) + 0.05*trust + 0.02*memory_kind + 0.03*recency``.  Trust is in
-    ``[0, 1]``; state, insight, untyped, and event kind priors are respectively
-    1.0, 0.75, 0.5, and 0.25.  Recency decays exponentially from 1.0 with the
-    configured half-life and is capped in ``[0, 1]`` so it cannot dominate
-    semantic relevance.
+    With the defaults, lexical and dense lists are joined by weighted
+    reciprocal rank fusion (``k=60``), then ``score = 0.76 * fusion +
+    0.05*trust + 0.02*memory_kind + 0.03*recency + 0.08*review +
+    0.06*named_subject``.  Trust is in ``[0, 1]``; state, insight, untyped,
+    and event kind priors are respectively 1.0, 0.75, 0.5, and 0.25.
+    Recency decays exponentially from 1.0 with the configured half-life
+    for events and untyped rows; state and insight use ``valid_from`` or
+    stay current so a later ``updated_at`` touch cannot bury them.
+    Review and named-subject priors keep person-name queries from ranking
+    another subject's short mention above a reviewed fact about the named
+    person.
     """
 
     fts_weight: float = 0.35
@@ -166,6 +196,8 @@ class RankingConfig:
     trust_weight: float = 0.05
     memory_kind_weight: float = 0.02
     recency_weight: float = 0.03
+    review_weight: float = 0.08
+    named_subject_weight: float = 0.06
     recency_half_life_days: float = 365.0
     state_kind_score: float = 1.0
     insight_kind_score: float = 0.75
@@ -176,7 +208,13 @@ class RankingConfig:
 
     def __post_init__(self) -> None:
         relevance = (self.fts_weight, self.jaccard_weight, self.dense_weight)
-        priors = (self.trust_weight, self.memory_kind_weight, self.recency_weight)
+        priors = (
+            self.trust_weight,
+            self.memory_kind_weight,
+            self.recency_weight,
+            self.review_weight,
+            self.named_subject_weight,
+        )
         kind_scores = (
             self.state_kind_score,
             self.insight_kind_score,
@@ -220,10 +258,22 @@ class RankingConfig:
 
     @property
     def relevance_weight(self) -> float:
-        return 1.0 - self.trust_weight - self.memory_kind_weight - self.recency_weight
+        return (
+            1.0
+            - self.trust_weight
+            - self.memory_kind_weight
+            - self.recency_weight
+            - self.review_weight
+            - self.named_subject_weight
+        )
 
 
 DEFAULT_RANKING_CONFIG = RankingConfig()
+LEXICAL_RANKING_CONFIG = RankingConfig(
+    fts_weight=0.35 / 0.60,
+    jaccard_weight=0.25 / 0.60,
+    dense_weight=0.0,
+)
 
 
 class DenseEmbedder(Protocol):
@@ -393,7 +443,7 @@ class SQLiteVersionedEmbeddingBackend:
             "embedding_dimensions": self.dimensions,
             "stored_embedding_coverage": "strict-all-candidates",
             "missing_embedding_behavior": "fail-closed",
-            "queued_embedding_behavior": "lexical-only-zero-dense-until-processed",
+            "queued_embedding_behavior": "lexical-only-until-processed",
             "candidate_vector_source": "sqlite-fact_embeddings",
         }
 
@@ -475,8 +525,7 @@ class SQLiteVersionedEmbeddingBackend:
                     f"missing {len(uncovered)} required stored candidate embedding(s) "
                     f"without a viable exact-identity job: {preview}{suffix}"
                 )
-            zero = tuple(0.0 for _ in range(self.dimensions))
-            loaded.update((fact_id, zero) for fact_id in missing)
+            loaded.update((fact_id, None) for fact_id in missing)
         return tuple(loaded[fact_id] for fact_id in fact_ids)
 
 
@@ -665,6 +714,8 @@ class VersionedStoredEmbeddingAdapter:
         if len(vectors) != len(documents):
             raise ValueError("embedding backend returned the wrong number of vectors")
         for vector in vectors:
+            if vector is None:
+                continue
             self._validate_vector(vector, "document")
         return vectors
 
@@ -706,6 +757,47 @@ def deterministic_retriever_factory(
         )
 
     return build
+
+
+def lexical_retriever_factory(
+    *,
+    ranking_config: RankingConfig = LEXICAL_RANKING_CONFIG,
+    now: datetime | None = None,
+    vector_fallback_telemetry: VectorFallbackTelemetry | None = None,
+    entity_expansion: bool = False,
+) -> RetrieverFactory:
+    """Return the production-honest offline lexical default retriever."""
+
+    def build(conn: sqlite3.Connection, scopes: Sequence[str]) -> HybridRetriever:
+        return HybridRetriever(
+            conn,
+            DisabledDenseEmbedder(),
+            allowed_scopes=scopes,
+            ranking_config=ranking_config,
+            now=now,
+            vector_backend="brute",
+            vector_fallback_telemetry=vector_fallback_telemetry,
+            entity_expansion=entity_expansion,
+        )
+
+    return build
+
+
+class DisabledDenseEmbedder:
+    """Refuse dense scoring so lexical mode cannot fake embeddings."""
+
+    identity = "local-lexical-v1"
+    production_ready = True
+    metadata = {
+        "dense_scoring": "disabled",
+        "paraphrase_matching": "lexical-overlap-only",
+    }
+
+    def embed_query(self, text: str) -> Sequence[float]:
+        raise RuntimeError("local-lexical retrieval disables dense scoring")
+
+    def embed_documents(self, texts: Sequence[str]) -> Sequence[Sequence[float]]:
+        raise RuntimeError("local-lexical retrieval disables dense scoring")
 
 
 class DeterministicFeatureHashEmbedder:
@@ -763,6 +855,8 @@ def named_anchor_tokens(text: str) -> frozenset[str]:
     for index, word in enumerate(words):
         if word.isdigit() or not word[0].isupper() or word == "I":
             continue
+        if word.lower() in _MONTH_WORDS:
+            continue
         if index == 0 and word in _SENTENCE_OPENERS:
             continue
         if not anchors and word in _LEADING_REQUEST_VERBS:
@@ -775,6 +869,42 @@ def named_anchor_tokens(text: str) -> frozenset[str]:
             for token in _tokens(part)
         )
     return frozenset(anchors)
+
+
+def select_named_anchor_matches(
+    items: Sequence[Any],
+    anchors: frozenset[str],
+    text_of: Callable[[Any], str],
+) -> list[Any]:
+    """Keep exact named-anchor hits, or the best cluster of at least one.
+
+    A query that names one project must still fail closed when that name is
+    absent. A query that piles extra proper nouns on top of a real name
+    should not erase the facts that match the strongest shared cluster.
+    """
+
+    if not anchors:
+        return list(items)
+    scored = [
+        (len(anchors & _anchor_match_tokens(text_of(item))), item) for item in items
+    ]
+    exact = [item for hit, item in scored if hit == len(anchors)]
+    if exact:
+        return exact
+    distinctive = anchors - _GENERIC_TITLE_WORDS
+    if distinctive and distinctive != anchors:
+        distinctive_scored = [
+            (len(distinctive & _anchor_match_tokens(text_of(item))), item)
+            for item in items
+        ]
+        distinctive_max = max((hit for hit, _item in distinctive_scored), default=0)
+        if distinctive_max == 0:
+            return []
+        return [item for hit, item in distinctive_scored if hit == distinctive_max]
+    max_hit = max((hit for hit, _item in scored), default=0)
+    if max_hit >= 1:
+        return [item for hit, item in scored if hit == max_hit]
+    return []
 
 
 def _tokens(text: str) -> frozenset[str]:
@@ -805,10 +935,35 @@ def _jaccard(left: frozenset[str], right: frozenset[str]) -> float:
     return len(left & right) / len(left | right)
 
 
+def _weighted_rrf(
+    lexical_rank: int | None,
+    dense_rank: int | None,
+    lexical_weight: float,
+    dense_weight: float,
+    k: float = _RRF_K,
+) -> float:
+    """Normalize weighted RRF so rank 1 on both lists scores 1.0."""
+
+    score = 0.0
+    if lexical_rank is not None:
+        score += lexical_weight / (k + lexical_rank)
+    if dense_rank is not None:
+        score += dense_weight / (k + dense_rank)
+    return score * (k + 1.0)
+
+
 def _query_coverage(query: frozenset[str], document: frozenset[str]) -> float:
     if not query:
         return 0.0
     return len(query & document) / len(query)
+
+
+def _is_absent_vector(vector: Sequence[float] | None) -> bool:
+    """A zero vector is missing coverage, not a valid embedding at cosine 0."""
+
+    if vector is None:
+        return True
+    return not any(float(value) != 0.0 for value in vector)
 
 
 def _cosine(left: Sequence[float], right: Sequence[float]) -> float:
@@ -849,11 +1004,95 @@ def _as_utc(value: Any) -> datetime | None:
 def _recency_score(
     row: Mapping[str, Any], now: datetime, half_life_days: float
 ) -> float:
-    timestamp = _as_utc(row.get("updated_at")) or _as_utc(row.get("created_at"))
-    if timestamp is None:
-        return 0.0
+    kind = row.get("memory_kind")
+    if kind in {"state", "insight"}:
+        timestamp = _as_utc(row.get("valid_from"))
+        if timestamp is None:
+            return 1.0
+    else:
+        timestamp = _as_utc(row.get("updated_at")) or _as_utc(row.get("created_at"))
+        if timestamp is None:
+            return 0.0
     age_days = max(0.0, (now - timestamp).total_seconds() / 86_400.0)
     return math.exp(-math.log(2.0) * age_days / half_life_days)
+
+
+_LEADING_PERSON_RE = re.compile(
+    r"^\s*((?:[A-Z][A-Za-z0-9'-]+(?:/[A-Z][A-Za-z0-9'-]+)*)"
+    r"(?:\s+[A-Z][A-Za-z0-9'-]+(?:/[A-Z][A-Za-z0-9'-]+)*){0,3})"
+)
+_IMPORTED_TOPIC_RE = re.compile(
+    r"^\s*Claude Code memory topic `(?P<title>[^\r\n]*)` \([^)]*\):\s*"
+)
+_AS_OF_DATE_RE = re.compile(r"^\s*As of \d{4}-\d{2}-\d{2},\s*")
+_REVIEWED_STATUSES = frozenset({"human_confirmed", "human_corrected"})
+
+
+def leading_person_tokens(text: str) -> frozenset[str]:
+    """Return the opening proper-name run, skipping sentence openers."""
+
+    remaining = text.strip()
+    imported_topic = _IMPORTED_TOPIC_RE.match(remaining)
+    if imported_topic is not None:
+        remaining = remaining[imported_topic.end() :]
+    as_of_date = _AS_OF_DATE_RE.match(remaining)
+    if as_of_date is not None:
+        remaining = remaining[as_of_date.end() :]
+    while remaining:
+        match = _LEADING_PERSON_RE.match(remaining)
+        if match is None:
+            return frozenset()
+        words = match.group(1).split()
+        if words[0] in _SENTENCE_OPENERS or words[0] in _LEADING_REQUEST_VERBS:
+            remaining = remaining[match.end() :].lstrip()
+            continue
+        return frozenset(token for word in words for token in _tokens(word))
+    return frozenset()
+
+
+def named_subject_score(anchors: frozenset[str], content: str) -> float:
+    """Score whether the query names the fact's subject, not a later mention."""
+
+    if not anchors:
+        return 0.0
+    subjects = [leading_person_tokens(content)]
+    imported_topic = _IMPORTED_TOPIC_RE.match(content)
+    if imported_topic is not None:
+        subjects.append(
+            _tokens(imported_topic.group("title")) - _GENERIC_TITLE_WORDS
+        )
+    scores = []
+    for subject in subjects:
+        if not subject:
+            scores.append(0.5)
+        elif subject <= anchors or anchors <= subject:
+            scores.append(1.0)
+        elif anchors.isdisjoint(subject) and len(subject) >= 2:
+            scores.append(0.0)
+        else:
+            scores.append(0.5)
+    return max(scores)
+
+
+def _contradicting_state_slots(
+    left: Mapping[str, Any], right: Mapping[str, Any]
+) -> bool:
+    if left.get("memory_kind") != "state" or right.get("memory_kind") != "state":
+        return False
+    subject = left.get("subject_key")
+    predicate = left.get("predicate_key")
+    if not subject or not predicate:
+        return False
+    return (
+        left.get("scope") == right.get("scope")
+        and right.get("subject_key") == subject
+        and right.get("predicate_key") == predicate
+        and left.get("object_value") != right.get("object_value")
+    )
+
+
+def _review_score(status: Any) -> float:
+    return 1.0 if status in _REVIEWED_STATUSES else 0.0
 
 
 def _memory_kind_score(kind: Any, config: RankingConfig) -> float:
@@ -882,6 +1121,7 @@ class HybridRetriever:
         ranking_config: RankingConfig = DEFAULT_RANKING_CONFIG,
         now: datetime | None = None,
         vector_fallback_telemetry: VectorFallbackTelemetry | None = None,
+        entity_expansion: bool = False,
     ):
         relevance_weights = (
             ranking_config.fts_weight if fts_weight is None else fts_weight,
@@ -910,12 +1150,16 @@ class HybridRetriever:
         self._ranking = ranking_config
         self._min_score = min_score
         self._candidate_limit = candidate_limit
+        self._entity_expansion = entity_expansion
         self._vector_fallback_telemetry = (
             vector_fallback_telemetry or VectorFallbackTelemetry()
         )
         self._vector_index: SQLiteVecIndex | None = None
-        if vector_backend != "brute" and isinstance(
-            embedder, VersionedStoredEmbeddingAdapter
+        dense_disabled = relevance_weights[2] == 0.0
+        if (
+            not dense_disabled
+            and vector_backend != "brute"
+            and isinstance(embedder, VersionedStoredEmbeddingAdapter)
         ):
             backend = embedder.backend
             document_identity = getattr(backend, "document_identity", None)
@@ -935,21 +1179,46 @@ class HybridRetriever:
             raise ValueError("now must be a datetime")
         self._now = _as_utc(clock)
         assert self._now is not None
+        if dense_disabled:
+            retrieval_stack = "standalone_core_fts+jaccard+priors"
+            vector_backend_name = "disabled"
+            dense_coverage = "disabled"
+            candidate_generation = "lexical"
+            score_formula = (
+                "relevance_weight*rrf(lexical_list)+"
+                "trust_weight*trust+memory_kind_weight*memory_kind+"
+                "recency_weight*recency+review_weight*review+"
+                "named_subject_weight*named_subject"
+            )
+        else:
+            retrieval_stack = "standalone_core_fts+jaccard+pluggable_dense"
+            vector_backend_name = "sqlite-vec" if self._vector_index else "brute"
+            dense_coverage = (
+                "global" if self._vector_index is not None else "bounded"
+            )
+            candidate_generation = (
+                "global-index-plus-lexical"
+                if self._vector_index is not None
+                else "recent-plus-lexical"
+            )
+            score_formula = (
+                "relevance_weight*rrf(lexical_list, dense_list)+"
+                "trust_weight*trust+memory_kind_weight*memory_kind+"
+                "recency_weight*recency+review_weight*review+"
+                "named_subject_weight*named_subject"
+            )
         self.metadata = {
-            "retrieval_stack": "standalone_core_fts+jaccard+pluggable_dense",
+            "retrieval_stack": retrieval_stack,
             "embedder_identity": str(embedder.identity),
             "embedder_production_ready": bool(
                 getattr(embedder, "production_ready", True)
             ),
+            "dense_scoring": "disabled" if dense_disabled else "enabled",
             "filter_before_dense_ranking": True,
             "explicit_named_anchor_abstention": True,
             "natural_language_query_parser": "quoted_token_or_v1",
             "stored_embedding_contract": "versioned-candidate-id-v1",
-            "score_formula": (
-                "relevance_weight*(fts_weight*fts+jaccard_weight*jaccard+"
-                "dense_weight*cosine)+trust_weight*trust+"
-                "memory_kind_weight*memory_kind+recency_weight*recency"
-            ),
+            "score_formula": score_formula,
             "fts_score_formula": (
                 "(1-query_coverage_weight)*reciprocal_bm25_rank+"
                 "query_coverage_weight*distinct_query_token_coverage"
@@ -963,20 +1232,16 @@ class HybridRetriever:
                 "trust": ranking_config.trust_weight,
                 "memory_kind": ranking_config.memory_kind_weight,
                 "recency": ranking_config.recency_weight,
+                "review": ranking_config.review_weight,
+                "named_subject": ranking_config.named_subject_weight,
             },
             "score_floor": min_score,
             "ambiguity_margin": ranking_config.ambiguity_margin,
             "recency_half_life_days": ranking_config.recency_half_life_days,
-            "vector_backend_config": vector_backend,
-            "vector_backend": "sqlite-vec" if self._vector_index else "brute",
-            "dense_candidate_coverage": (
-                "global" if self._vector_index is not None else "bounded"
-            ),
-            "candidate_generation": (
-                "global-index-plus-lexical"
-                if self._vector_index is not None
-                else "recent-plus-lexical"
-            ),
+            "vector_backend_config": "disabled" if dense_disabled else vector_backend,
+            "vector_backend": vector_backend_name,
+            "dense_candidate_coverage": dense_coverage,
+            "candidate_generation": candidate_generation,
             **self._vector_fallback_telemetry.snapshot(),
         }
         self.metadata.update(dict(getattr(embedder, "metadata", {})))
@@ -1020,7 +1285,112 @@ class HybridRetriever:
                     continue
                 if len(vector) == dimensions:
                     loaded[int(row[0])] = tuple(float(value) for value in vector)
+        if any(fact_id not in loaded for fact_id in fact_ids):
+            return {}
         return loaded
+
+    def _expand_via_entities(
+        self,
+        seed_fact_ids: Sequence[int],
+        excluded_fact_ids: set[int],
+        selected_columns: Sequence[str],
+        active_predicates: Sequence[str],
+        active_params: Sequence[Any],
+    ) -> list[dict[str, Any]]:
+        """Return eligible facts within two non-hub entity hops of the seeds."""
+
+        frontier = list(dict.fromkeys(int(fact_id) for fact_id in seed_fact_ids))
+        if not frontier:
+            return []
+        visited = set(frontier)
+        expanded: list[dict[str, Any]] = []
+        destination_rows_loaded = 0
+        selected_sql = ", ".join(f"f.{name}" for name in selected_columns)
+        eligibility_sql = " AND ".join(active_predicates)
+
+        try:
+            for hop_distance in range(1, _ENTITY_MAX_HOPS + 1):
+                entity_ids: set[int] = set()
+                for offset in range(0, len(frontier), 400):
+                    batch = frontier[offset : offset + 400]
+                    placeholders = ",".join("?" for _ in batch)
+                    rows = self._conn.execute(
+                        f"SELECT DISTINCT fe.entity_id FROM fact_entities AS fe "
+                        "JOIN facts AS f ON f.fact_id = fe.fact_id "
+                        f"WHERE fe.fact_id IN ({placeholders}) AND {eligibility_sql}",
+                        (*batch, *active_params),
+                    ).fetchall()
+                    entity_ids.update(int(row[0]) for row in rows)
+                if not entity_ids:
+                    break
+
+                expandable: list[int] = []
+                ordered_entity_ids = sorted(entity_ids)
+                for offset in range(0, len(ordered_entity_ids), 400):
+                    batch = ordered_entity_ids[offset : offset + 400]
+                    placeholders = ",".join("?" for _ in batch)
+                    rows = self._conn.execute(
+                        "SELECT fe.entity_id, COUNT(*) AS degree "
+                        "FROM fact_entities AS fe "
+                        "JOIN facts AS f ON f.fact_id = fe.fact_id "
+                        f"WHERE fe.entity_id IN ({placeholders}) "
+                        f"AND {eligibility_sql} GROUP BY fe.entity_id",
+                        (*batch, *active_params),
+                    ).fetchall()
+                    expandable.extend(
+                        int(row[0])
+                        for row in rows
+                        if int(row[1]) <= _ENTITY_HUB_DEGREE_LIMIT
+                    )
+                if not expandable:
+                    break
+
+                next_frontier: list[int] = []
+                for offset in range(0, len(expandable), 400):
+                    remaining_load = self._candidate_limit - destination_rows_loaded
+                    if remaining_load <= 0:
+                        return expanded
+                    batch = expandable[offset : offset + 400]
+                    placeholders = ",".join("?" for _ in batch)
+                    rows = self._conn.execute(
+                        f"SELECT {selected_sql}, e.name AS via_entity "
+                        "FROM fact_entities AS fe "
+                        "JOIN entities AS e ON e.entity_id = fe.entity_id "
+                        "JOIN facts AS f ON f.fact_id = fe.fact_id "
+                        f"WHERE fe.entity_id IN ({placeholders}) "
+                        f"AND {eligibility_sql} ORDER BY f.fact_id, fe.entity_id "
+                        "LIMIT ?",
+                        (*batch, *active_params, remaining_load),
+                    ).fetchall()
+                    destination_rows_loaded += len(rows)
+                    for row in rows:
+                        fact_id = int(row["fact_id"])
+                        if fact_id in visited:
+                            continue
+                        via_entity = str(row["via_entity"])
+                        via_tokens = _tokens(via_entity) - _GENERIC_TITLE_WORDS
+                        subject_tokens = leading_person_tokens(str(row["content"]))
+                        if not via_tokens or not subject_tokens or not (
+                            via_tokens <= subject_tokens
+                            or subject_tokens <= via_tokens
+                        ):
+                            continue
+                        visited.add(fact_id)
+                        next_frontier.append(fact_id)
+                        if fact_id in excluded_fact_ids:
+                            continue
+                        fact = dict(row)
+                        fact["expanded_from_entity"] = fact.pop("via_entity")
+                        fact["hop_distance"] = hop_distance
+                        expanded.append(fact)
+                        if len(expanded) >= self._candidate_limit:
+                            return expanded
+                frontier = next_frontier
+                if not frontier:
+                    break
+        except sqlite3.OperationalError:
+            return []
+        return expanded
 
     def search(
         self,
@@ -1030,6 +1400,7 @@ class HybridRetriever:
         min_trust: float = 0.3,
         limit: int = 10,
         bump: bool = False,
+        include_unreviewed: bool = False,
     ) -> list[dict[str, Any]]:
         del bump
         query = query.strip()
@@ -1057,6 +1428,10 @@ class HybridRetriever:
             active_params.append(category)
         active_predicates.append("trust_score >= ?")
         active_params.append(min_trust)
+        if "correction_status" in columns and not include_unreviewed:
+            # IS NOT keeps NULL agent writes; != would silently drop them.
+            active_predicates.append("correction_status IS NOT ?")
+            active_params.append("unreviewed")
 
         fts_scores: dict[int, float] = {}
         fts_ids: list[int] = []
@@ -1083,6 +1458,9 @@ class HybridRetriever:
                 fts_params.append(category)
             fts_predicates.append("f.trust_score >= ?")
             fts_params.append(min_trust)
+            if "correction_status" in columns and not include_unreviewed:
+                fts_predicates.append("f.correction_status IS NOT ?")
+                fts_params.append("unreviewed")
             fts_limit_sql = ""
             if not global_index_mode:
                 fts_limit_sql = "LIMIT ?"
@@ -1103,10 +1481,11 @@ class HybridRetriever:
                 fts_ids.append(fact_id)
                 fts_scores[fact_id] = 1.0 / (rank + 1.0)
 
+        dense_disabled = self._weights[2] == 0.0
         query_vector: Sequence[float] | None = None
         dense_scores: dict[int, float] | None = None
         dense_ids: list[int] = []
-        if self._vector_index is not None:
+        if not dense_disabled and self._vector_index is not None:
             # sqlite-vec holds every canonical vector, while authorization and
             # lifecycle state live in ``facts``. Score the complete eligible
             # set exactly, then take the global dense window. This removes the
@@ -1124,12 +1503,12 @@ class HybridRetriever:
                 ),
             ).fetchall()
             anchors = named_anchor_tokens(query)
-            eligible_ids = [
-                int(row["fact_id"])
-                for row in eligible_rows
-                if not anchors
-                or anchors <= _anchor_match_tokens(f"{row['content']} {row['tags']}")
-            ]
+            eligible_rows = select_named_anchor_matches(
+                eligible_rows,
+                anchors,
+                lambda row: f"{row['content']} {row['tags']}",
+            )
+            eligible_ids = [int(row["fact_id"]) for row in eligible_rows]
             if eligible_ids:
                 query_vector = self._embedder.embed_query(query)
                 try:
@@ -1153,7 +1532,7 @@ class HybridRetriever:
                     dense_scores = None
                     fts_ids = fts_ids[: self._candidate_limit]
                     fts_scores = {fact_id: fts_scores[fact_id] for fact_id in fts_ids}
-        if dense_scores is None:
+        if not dense_disabled and dense_scores is None:
             dense_ids = [
                 int(row[0])
                 for row in self._conn.execute(
@@ -1183,21 +1562,17 @@ class HybridRetriever:
         # Trust, lifecycle, and scope filtering happened before document text
         # reaches the dense embedder. Named anchors fail closed at the same boundary.
         anchors = named_anchor_tokens(query)
-        if anchors:
-            candidates = [
-                row
-                for row in candidates
-                if anchors
-                <= _anchor_match_tokens(
-                    f"{row.get('content', '')} {row.get('tags', '')}"
-                )
-            ]
+        candidates = select_named_anchor_matches(
+            candidates,
+            anchors,
+            lambda row: f"{row.get('content', '')} {row.get('tags', '')}",
+        )
         if not candidates:
             return []
 
-        if query_vector is None:
+        if not dense_disabled and query_vector is None:
             query_vector = self._embedder.embed_query(query)
-        if dense_scores is None and self._vector_index is not None:
+        if not dense_disabled and dense_scores is None and self._vector_index is not None:
             try:
                 dense_scores = self._vector_index.scores(
                     query_vector, tuple(int(row["fact_id"]) for row in candidates)
@@ -1217,7 +1592,7 @@ class HybridRetriever:
                 self._vector_fallback_telemetry.record("sqlite_vec_query_error")
                 self.metadata.update(self._vector_fallback_telemetry.snapshot())
         document_vectors: Sequence[Sequence[float]] = ()
-        if dense_scores is None:
+        if not dense_disabled and dense_scores is None:
             candidate_embedder = getattr(self._embedder, "embed_candidates", None)
             if callable(candidate_embedder):
                 document_vectors = candidate_embedder(candidates)
@@ -1232,82 +1607,238 @@ class HybridRetriever:
 
         query_tokens = _tokens(query)
         fts_weight, jaccard_weight, dense_weight = self._weights
+        lexical_weight = fts_weight + jaccard_weight
         ranking = self._ranking
-        ranked: list[tuple[float, int, dict[str, Any]]] = []
-        for position, row in enumerate(candidates):
-            fact_id = int(row["fact_id"])
-            # Tags can broaden FTS candidate recall, but only terms asserted in
-            # the fact content count as evidence that the question is covered.
-            # This keeps descriptive metadata from inflating lexical relevance.
-            document_tokens = _tokens(str(row["content"]))
-            fts_score = (
-                (
-                    (1.0 - ranking.fts_query_coverage_weight) * fts_scores[fact_id]
-                    + ranking.fts_query_coverage_weight
-                    * _query_coverage(query_tokens, document_tokens)
+
+        def prepare_rows(
+            rows: Sequence[dict[str, Any]],
+            vectors: Sequence[Sequence[float]] = (),
+        ) -> list[dict[str, Any]]:
+            prepared_rows: list[dict[str, Any]] = []
+            for position, row in enumerate(rows):
+                fact_id = int(row["fact_id"])
+                # Tags can broaden FTS recall, but only content terms count as
+                # evidence that the question itself is covered.
+                document_tokens = _tokens(str(row["content"]))
+                fts_score = (
+                    (
+                        (1.0 - ranking.fts_query_coverage_weight)
+                        * fts_scores[fact_id]
+                        + ranking.fts_query_coverage_weight
+                        * _query_coverage(query_tokens, document_tokens)
+                    )
+                    if fact_id in fts_scores
+                    else 0.0
                 )
-                if fact_id in fts_scores
-                else 0.0
+                jaccard_score = _jaccard(query_tokens, document_tokens)
+                document_vector = vectors[position] if vectors else None
+                if dense_disabled:
+                    has_dense = False
+                    dense_score = 0.0
+                elif dense_scores is not None:
+                    has_dense = fact_id in dense_scores
+                    dense_score = dense_scores[fact_id] if has_dense else 0.0
+                elif _is_absent_vector(document_vector):
+                    has_dense = False
+                    dense_score = 0.0
+                else:
+                    has_dense = True
+                    dense_score = max(
+                        0.0, _cosine(query_vector, document_vector)
+                    )
+                vector = (
+                    tuple(float(value) for value in document_vector)
+                    if document_vector is not None
+                    and not _is_absent_vector(document_vector)
+                    else None
+                )
+                prepared_rows.append(
+                    {
+                        "row": row,
+                        "fact_id": fact_id,
+                        "fts_score": fts_score,
+                        "jaccard_score": jaccard_score,
+                        "dense_score": dense_score,
+                        "lexical_score": (
+                            fts_weight * fts_score + jaccard_weight * jaccard_score
+                        ),
+                        "has_dense": has_dense and dense_score >= _DENSE_LIST_MIN,
+                        "vector": vector,
+                        "hop_distance": int(row.get("hop_distance") or 0),
+                    }
+                )
+            return prepared_rows
+
+        prepared = prepare_rows(candidates, document_vectors)
+
+        def rank_prepared(
+            items: Sequence[dict[str, Any]],
+        ) -> list[tuple[float, int, dict[str, Any]]]:
+            lexical_order = sorted(
+                (item for item in items if item["lexical_score"] > 0.0),
+                key=lambda item: (-item["lexical_score"], item["fact_id"]),
             )
-            jaccard_score = _jaccard(query_tokens, document_tokens)
-            dense_score = (
-                dense_scores.get(fact_id, 0.0)
-                if dense_scores is not None
-                else max(0.0, _cosine(query_vector, document_vectors[position]))
+            dense_order = sorted(
+                (item for item in items if item["has_dense"]),
+                key=lambda item: (-item["dense_score"], item["fact_id"]),
             )
-            relevance_score = (
-                fts_weight * fts_score
-                + jaccard_weight * jaccard_score
-                + dense_weight * dense_score
+            lexical_ranks = {
+                item["fact_id"]: rank
+                for rank, item in enumerate(lexical_order, start=1)
+            }
+            dense_ranks = {
+                item["fact_id"]: rank
+                for rank, item in enumerate(dense_order, start=1)
+            }
+            ranked_rows: list[tuple[float, int, dict[str, Any]]] = []
+            for item in items:
+                fact_id = item["fact_id"]
+                row = item["row"]
+                fusion_score = _weighted_rrf(
+                    lexical_ranks.get(fact_id),
+                    dense_ranks.get(fact_id),
+                    lexical_weight,
+                    dense_weight,
+                )
+                trust_score = min(
+                    1.0, max(0.0, float(row.get("trust_score") or 0.0))
+                )
+                memory_kind_score = _memory_kind_score(
+                    row.get("memory_kind"), ranking
+                )
+                recency_score = _recency_score(
+                    row, self._now, ranking.recency_half_life_days
+                )
+                review_score = _review_score(row.get("correction_status"))
+                subject_score = named_subject_score(
+                    anchors, str(row.get("content") or "")
+                )
+                hop_distance = int(item["hop_distance"])
+                hop_prior = _ENTITY_HOP_PRIOR**hop_distance
+                score = hop_prior * (
+                    ranking.relevance_weight * fusion_score
+                    + ranking.trust_weight * trust_score
+                    + ranking.memory_kind_weight * memory_kind_score
+                    + ranking.recency_weight * recency_score
+                    + ranking.review_weight * review_score
+                    + ranking.named_subject_weight * subject_score
+                )
+                if score < self._min_score:
+                    continue
+                result = dict(row)
+                result.update(
+                    {
+                        "score": score,
+                        "_mmr_embedding": item["vector"],
+                        "fts_score": item["fts_score"],
+                        "jaccard_score": item["jaccard_score"],
+                        "dense_score": item["dense_score"],
+                        "fusion_score": fusion_score,
+                        "trust_score_component": trust_score,
+                        "memory_kind_score": memory_kind_score,
+                        "recency_score": recency_score,
+                        "review_score": review_score,
+                        "named_subject_score": subject_score,
+                    }
+                )
+                if hop_distance:
+                    result["hop_distance"] = hop_distance
+                    result["hop_prior"] = hop_prior
+                ranked_rows.append((score, fact_id, result))
+            ranked_rows.sort(
+                key=lambda item: (
+                    -item[0],
+                    -float(item[2].get("trust_score") or 0.0),
+                    item[1],
+                )
             )
-            trust_score = min(1.0, max(0.0, float(row.get("trust_score") or 0.0)))
-            memory_kind_score = _memory_kind_score(row.get("memory_kind"), ranking)
-            recency_score = _recency_score(
-                row, self._now, ranking.recency_half_life_days
+            return ranked_rows
+
+        ranked = rank_prepared(prepared)
+        graph_predicates = list(active_predicates)
+        graph_params = list(active_params)
+        if "correction_status" in columns and include_unreviewed:
+            graph_predicates.append("correction_status IS NOT ?")
+            graph_params.append("unreviewed")
+        expanded = []
+        if self._entity_expansion:
+            expanded = self._expand_via_entities(
+                [fact_id for _, fact_id, _ in ranked[:_ENTITY_GRAPH_SEED_LIMIT]],
+                {int(item["fact_id"]) for item in prepared},
+                selected_columns,
+                graph_predicates,
+                graph_params,
             )
-            score = (
-                ranking.relevance_weight * relevance_score
-                + ranking.trust_weight * trust_score
-                + ranking.memory_kind_weight * memory_kind_score
-                + ranking.recency_weight * recency_score
-            )
-            if score < self._min_score:
-                continue
-            vector = (
-                tuple(float(value) for value in document_vectors[position])
-                if document_vectors
-                else None
-            )
-            result = dict(row)
-            result.update(
-                {
-                    "score": score,
-                    "_mmr_embedding": vector,
-                    "fts_score": fts_score,
-                    "jaccard_score": jaccard_score,
-                    "dense_score": dense_score,
-                    "trust_score_component": trust_score,
-                    "memory_kind_score": memory_kind_score,
-                    "recency_score": recency_score,
-                }
-            )
-            ranked.append((score, fact_id, result))
-        ranked.sort(
-            key=lambda item: (
-                -item[0],
-                -float(item[2].get("trust_score") or 0.0),
-                item[1],
-            )
-        )
-        # A near-tie is ambiguous: returning the deterministic fact-id winner
-        # would manufacture confidence from a tie-breaker.  Fail closed instead.
+        expanded_vectors: Sequence[Sequence[float]] = ()
+        if expanded and not dense_disabled:
+            expanded_ids = tuple(int(row["fact_id"]) for row in expanded)
+            if dense_scores is not None and self._vector_index is not None:
+                try:
+                    dense_scores.update(
+                        self._vector_index.scores(query_vector, expanded_ids)
+                    )
+                except Exception as exc:
+                    LOGGER.warning(
+                        "sqlite-vec graph expansion warning: %s; using stored vectors",
+                        exc,
+                    )
+                    candidate_embedder = getattr(
+                        self._embedder, "embed_candidates", None
+                    )
+                    if callable(candidate_embedder):
+                        expanded_vectors = candidate_embedder(expanded)
+                    else:
+                        expanded_vectors = self._embedder.embed_documents(
+                            tuple(str(row["content"]) for row in expanded)
+                        )
+                    for row, vector in zip(expanded, expanded_vectors, strict=True):
+                        if not _is_absent_vector(vector):
+                            dense_scores[int(row["fact_id"])] = max(
+                                0.0, _cosine(query_vector, vector)
+                            )
+            elif dense_scores is None:
+                candidate_embedder = getattr(self._embedder, "embed_candidates", None)
+                if callable(candidate_embedder):
+                    expanded_vectors = candidate_embedder(expanded)
+                else:
+                    expanded_vectors = self._embedder.embed_documents(
+                        tuple(str(row["content"]) for row in expanded)
+                    )
+            if expanded_vectors and len(expanded_vectors) != len(expanded):
+                raise ValueError(
+                    "embedder returned the wrong number of document vectors"
+                )
+
+        if expanded:
+            prepared.extend(prepare_rows(expanded, expanded_vectors))
+            ranked = rank_prepared(prepared)
+        # A near-tie between compatible rows is not a reason to discard them
+        # or the rest of the list. A near-tie between contradicting current
+        # state slots stays fail-closed and is marked so the caller can see
+        # the disagreement.
         if len(ranked) > 1 and ranked[0][0] - ranked[1][0] < ranking.ambiguity_margin:
-            return []
+            cluster = [
+                item
+                for item in ranked
+                if ranked[0][0] - item[0] < ranking.ambiguity_margin
+            ]
+            if len(cluster) > 1 and _contradicting_state_slots(
+                cluster[0][2], cluster[1][2]
+            ):
+                for _, _, row in cluster:
+                    row["ambiguous"] = True
+                return [row for _, _, row in cluster]
         survivors = ranked[:limit]
-        if dense_scores is not None:
+        if dense_disabled:
+            for _, _, row in survivors:
+                row["_mmr_embedding"] = None
+        elif dense_scores is not None:
             mmr_vectors = self._stored_mmr_embeddings(
                 [fact_id for _, fact_id, _ in survivors]
             )
             for _, fact_id, row in survivors:
                 row["_mmr_embedding"] = mmr_vectors.get(fact_id)
+        elif any(row["_mmr_embedding"] is None for _, _, row in survivors):
+            for _, _, row in survivors:
+                row["_mmr_embedding"] = None
         return [row for _, _, row in survivors]

@@ -1,26 +1,24 @@
 Enfold
 ======
 
-A hybrid long-term memory provider for Hermes Agent: it extends the holographic
-(HRR) fact store with dense semantic embeddings and LLM-based fact extraction,
-and merges all signals in a single hybrid retrieval pass.
+A local-first SQLite memory service with provenance, current-state rules,
+and a Unix-socket daemon. There is no hosted service. Distribution is
+GitHub-only under the MIT License.
 
 This project builds on prior work, gratefully credited:
 
-- The base holographic memory provider (the `MemoryProvider` integration, the
-  HRR (Holographic Reduced Representations) retrieval, the SQLite fact store,
-  trust scoring, and entity resolution) was created by **dusterbloom** for
-  NousResearch/hermes-agent (PR #2351) and is licensed MIT. Enfold
-  subclasses it; all credit for the holographic foundation is theirs.
+- The holographic memory provider (the `MemoryProvider` integration, HRR
+  retrieval, the SQLite fact store, trust scoring, and entity resolution)
+  was created by **dusterbloom** for NousResearch/hermes-agent (PR #2351)
+  and is licensed MIT. Parts of that foundation remain in this tree.
 
-- Holographic Reduced Representations, the vector-symbolic technique underlying
-  the holographic retrieval, are due to **Tony A. Plate**, "Holographic Reduced
-  Representations," IEEE Transactions on Neural Networks, 6(3):623-641, 1995.
+- Holographic Reduced Representations, the vector-symbolic technique
+  underlying holographic retrieval, are due to **Tony A. Plate**,
+  "Holographic Reduced Representations," IEEE Transactions on Neural
+  Networks, 6(3):623-641, 1995.
 
-The original contributions of this project are the dense embedding retrieval
-layer (`embeddings.py`, `embed_store.py`), the LLM-based fact extraction and
-its persistent queue (`llm_extract.py`, `extract_queue.py`), the optimized
-retriever (`retrieval_plus.py`), and the hybrid scoring that merges dense
-similarity with the holographic signals.
+Enfold is a standalone daemon and MCP bridge. It is not a Hermes plugin.
+The optional Hermes staging adapter lives in
+`integrations/hermes_enfold_v1` and is not installed by Enfold.
 
 Copyright (c) 2026 victorv2i. Released under the MIT License (see LICENSE).

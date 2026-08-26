@@ -281,12 +281,14 @@ def test_entity_expansion_filters_lifecycle_and_scope(hp, tmp_path):
     store = fake_hermes.MemoryStore(db_path=tmp_path / "entities.db", hrr_dim=64)
     try:
         _add_lifecycle_columns(store)
+        store._conn.execute("ALTER TABLE facts ADD COLUMN correction_status TEXT")
         direct = store.add_fact("Orchid rollout is led by Alex Rivera")
         eligible = store.add_fact("Alex Rivera owns the private roadmap")
         invalid = store.add_fact("Alex Rivera owns an invalid roadmap")
         superseded = store.add_fact("Alex Rivera owns an obsolete roadmap")
         conflicted = store.add_fact("Alex Rivera owns a disputed roadmap")
         work = store.add_fact("Alex Rivera owns the work roadmap")
+        unreviewed = store.add_fact("Alex Rivera owns an unreviewed roadmap")
         store._conn.execute(
             "UPDATE facts SET invalid_at = '2026-01-01' WHERE fact_id = ?",
             (invalid,),
@@ -302,6 +304,10 @@ def test_entity_expansion_filters_lifecycle_and_scope(hp, tmp_path):
         store._conn.execute(
             "UPDATE facts SET scope = 'work' WHERE fact_id = ?",
             (work,),
+        )
+        store._conn.execute(
+            "UPDATE facts SET correction_status = 'unreviewed' WHERE fact_id = ?",
+            (unreviewed,),
         )
         store._conn.commit()
         plus = hp.retrieval_plus.PlusFactRetriever(

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import math
+
 import pytest
 
 from memory_eval.metrics import (
     mean_reciprocal_rank,
+    ndcg_at_k,
     precision_recall_f1,
     percentile,
     recall_at_k,
@@ -45,6 +48,22 @@ def test_precision_recall_f1_scores_set_overlap():
     assert metrics["precision"] == pytest.approx(2 / 3)
     assert metrics["recall"] == pytest.approx(2 / 3)
     assert metrics["f1"] == pytest.approx(2 / 3)
+
+
+def test_ndcg_at_k_is_one_when_gold_is_first_and_zero_when_missing():
+    ranked = [["gold", "b"], ["x", "gold", "z"], ["nope"]]
+    gold = ["gold", "gold", "gold"]
+
+    assert ndcg_at_k(ranked, gold, k=1) == pytest.approx((1.0 + 0.0 + 0.0) / 3)
+    rank2_ndcg = 1.0 / math.log2(3)
+    assert ndcg_at_k(ranked, gold, k=3) == pytest.approx((1.0 + rank2_ndcg + 0.0) / 3)
+
+
+def test_ndcg_at_k_rejects_non_positive_k_and_mismatched_lengths():
+    with pytest.raises(ValueError, match="k must be positive"):
+        ndcg_at_k([["a"]], ["a"], k=0)
+    with pytest.raises(ValueError, match="same length"):
+        ndcg_at_k([["a"]], ["a", "b"], k=1)
 
 
 def test_stale_leak_rate_counts_any_stale_fact_in_top_k():

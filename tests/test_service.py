@@ -10,7 +10,7 @@ from enfold.core_store import insert_fact
 from enfold.policy import MemoryPolicy
 from enfold.extraction_enqueue import ExtractionEnqueuer
 from enfold.embeddings import embedding_to_bytes
-from enfold.hybrid_retrieval import HybridRetriever
+from enfold.hybrid_retrieval import HybridRetriever, deterministic_retriever_factory
 from enfold.protocol import ClientContext, Request
 from enfold.schema import migrate
 from enfold.service import EnfoldService, MAX_WRITE_TEXT_BYTES, ServiceRequestError
@@ -178,6 +178,77 @@ def test_service_near_duplicate_merge_and_off_switch(
     if near_dedup_enabled:
         assert result["fact_id"] == existing["fact_id"]
         assert history[1]["superseded_by"] == existing["fact_id"]
+    conn.close()
+
+
+def test_retrieval_metadata_can_use_a_caller_supplied_connection(tmp_path):
+    writer = _store(tmp_path)
+    builds: list[sqlite3.Connection] = []
+    inner = deterministic_retriever_factory()
+
+    def factory(used_conn, scopes):
+        builds.append(used_conn)
+        return inner(used_conn, scopes)
+
+    service = EnfoldService(
+        writer,
+        MemoryPolicy({"terminal-install": ("private",)}),
+        retriever_factory=factory,
+    )
+    inspector = sqlite3.connect(tmp_path / "enfold-service.db")
+    inspector.row_factory = sqlite3.Row
+    builds.clear()
+
+    metadata = service.retrieval_metadata_for(inspector)
+
+    assert builds == [inspector]
+    assert writer not in builds
+    assert metadata["retrieval_stack"]
+    inspector.close()
+    writer.close()
+
+
+def test_service_defaults_near_dedup_off_for_preference_paraphrase(tmp_path):
+    conn = _store(tmp_path)
+    identity = "fake:service:document:none:v1"
+    service = EnfoldService(
+        conn,
+        MemoryPolicy({"terminal-install": ("private",)}),
+        embedding_identity=identity,
+        query_embedder=lambda _content: np.asarray((1.0, 0.0), dtype=np.float32),
+    )
+    context = _context("terminal-install", "terminal", "terminal", scopes=("private",))
+    existing = _write(
+        service, context, "existing-pref", "Avery prefers tea.", trust_score=0.8
+    )
+    conn.execute(
+        "INSERT INTO fact_embeddings(fact_id, embedding, dim, embedding_identity) "
+        "VALUES (?, ?, 2, ?)",
+        (
+            existing["fact_id"],
+            embedding_to_bytes(np.asarray((1.0, 0.0), dtype=np.float32)),
+            identity,
+        ),
+    )
+    conn.execute("INSERT INTO facts_fts(facts_fts) VALUES ('rebuild')")
+    conn.commit()
+
+    result = _write(
+        service,
+        context,
+        "incoming-pref",
+        "Avery prefers tea with honey.",
+        trust_score=0.9,
+    )
+
+    assert result["outcome"] == "inserted"
+    assert result["fact_id"] != existing["fact_id"]
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM facts WHERE invalid_at IS NULL"
+        ).fetchone()[0]
+        == 2
+    )
     conn.close()
 
 
@@ -903,7 +974,7 @@ def test_context_is_scoped_cited_current_and_conflict_safe(setup):
             "valid_from": "2026-07-10T10:00:00Z",
         },
     )
-    _write(
+    conflicted = _write(
         service,
         contexts["client-b"],
         "context-conflict-second",
@@ -915,6 +986,7 @@ def test_context_is_scoped_cited_current_and_conflict_safe(setup):
             "valid_from": "2026-07-11T10:00:00Z",
         },
     )
+    conflict_id = conflicted["detail"]["conflict_id"]
     _conn.execute(
         "UPDATE facts SET correction_status = 'human_confirmed' "
         "WHERE fact_id IN (?, ?)",
@@ -961,7 +1033,12 @@ def test_context_is_scoped_cited_current_and_conflict_safe(setup):
         ),
     )
     assert conflict_pack["abstained"] is True
-    assert conflict_pack["facts"] == []
+    assert f"[conflict:{conflict_id}" in conflict_pack["markdown"]
+    assert "do not treat either as current" in conflict_pack["markdown"]
+    assert "UnstableAtlas model is Terra" not in conflict_pack["markdown"]
+    assert "UnstableAtlas model is Model Z" not in conflict_pack["markdown"]
+    assert conflict_pack["open_conflicts"][0]["conflict_id"] == conflict_id
+    assert all(fact.get("fact_id") for fact in conflict_pack["facts"])
 
 
 def test_context_validates_scope_and_token_budget(setup):
@@ -1199,3 +1276,195 @@ def test_conflicts_limit_batches_member_facts_and_reports_truncation(setup):
     assert not any(
         "FROM facts WHERE fact_id =" in statement for statement in statements
     )
+
+
+def test_run_scoped_writes_are_hidden_from_default_search_until_promoted(tmp_path):
+    conn = _store(tmp_path)
+    service = EnfoldService(conn, MemoryPolicy({"terminal-install": ("private",)}))
+    context = _context("terminal-install", "terminal", "terminal", scopes=("private",))
+    run = _write(
+        service,
+        context,
+        "run-note",
+        "The child found that lock ownership is safe.",
+        scope="run:child-session",
+    )
+
+    default = service.handle(
+        context, _request("default-search", "memory.search", query="lock ownership")
+    )
+    assert default["facts"] == []
+
+    scoped = service.handle(
+        context,
+        _request(
+            "run-search",
+            "memory.search",
+            query="lock ownership",
+            scope="run:child-session",
+        ),
+    )
+    assert [fact["fact_id"] for fact in scoped["facts"]] == [run["fact_id"]]
+
+    promoted = service.handle(
+        context,
+        _request(
+            "promote-1",
+            "memory.promote",
+            fact_id=run["fact_id"],
+            idempotency_key="promote-lock",
+            target_scope="private",
+        ),
+    )
+    assert promoted["outcome"] in {"inserted", "deduped"}
+    assert promoted["fact_id"] != run["fact_id"]
+
+    durable = service.handle(
+        context, _request("after-promote", "memory.search", query="lock ownership")
+    )
+    assert [fact["fact_id"] for fact in durable["facts"]] == [promoted["fact_id"]]
+    fact = conn.execute(
+        "SELECT scope, content FROM facts WHERE fact_id = ?",
+        (promoted["fact_id"],),
+    ).fetchone()
+    assert tuple(fact) == ("private", "The child found that lock ownership is safe.")
+    conn.close()
+
+
+def test_promote_rejects_non_run_facts_and_run_targets(tmp_path):
+    conn = _store(tmp_path)
+    service = EnfoldService(conn, MemoryPolicy({"terminal-install": ("private",)}))
+    context = _context("terminal-install", "terminal", "terminal", scopes=("private",))
+    durable = _write(
+        service, context, "already-private", "This fact is already durable."
+    )
+    run = _write(
+        service,
+        context,
+        "run-only",
+        "A worker-only observation.",
+        scope="run:child-session",
+    )
+
+    with pytest.raises(ServiceRequestError, match="run-scoped") as not_run:
+        service.handle(
+            context,
+            _request(
+                "promote-private",
+                "memory.promote",
+                fact_id=durable["fact_id"],
+                idempotency_key="promote-private",
+            ),
+        )
+    assert not_run.value.code == "invalid_params"
+
+    with pytest.raises(ServiceRequestError, match="durable") as run_target:
+        service.handle(
+            context,
+            _request(
+                "promote-to-run",
+                "memory.promote",
+                fact_id=run["fact_id"],
+                idempotency_key="promote-to-run",
+                target_scope="run:other",
+            ),
+        )
+    assert run_target.value.code == "invalid_params"
+
+    with pytest.raises(ServiceRequestError, match="not visible") as missing:
+        service.handle(
+            context,
+            _request(
+                "promote-missing",
+                "memory.promote",
+                fact_id=99999,
+                idempotency_key="promote-missing",
+            ),
+        )
+    assert missing.value.code == "access_denied"
+    conn.close()
+
+
+def test_run_fact_evidence_and_history_are_visible_to_private_clients(tmp_path):
+    conn = _store(tmp_path)
+    service = EnfoldService(conn, MemoryPolicy({"terminal-install": ("private",)}))
+    context = _context("terminal-install", "terminal", "terminal", scopes=("private",))
+    run = _write(
+        service,
+        context,
+        "run-evidence",
+        "The child found that lock ownership is safe.",
+        scope="run:child-session",
+    )
+
+    evidence = service.handle(
+        context, _request("run-evidence", "memory.evidence", fact_id=run["fact_id"])
+    )
+    assert evidence["fact"]["fact_id"] == run["fact_id"]
+    assert evidence["evidence"][0]["scope"] == "run:child-session"
+
+    history = service.handle(
+        context, _request("run-history", "memory.history", fact_id=run["fact_id"])
+    )
+    assert any(fact["fact_id"] == run["fact_id"] for fact in history["facts"])
+    conn.close()
+
+
+def test_promote_hides_sensitive_run_facts_from_private_only_clients(tmp_path):
+    conn = _store(tmp_path)
+    service = EnfoldService(
+        conn,
+        MemoryPolicy(
+            {
+                "private-only": ("private",),
+                "sensitive-writer": ("private", "sensitive"),
+            }
+        ),
+    )
+    writer = _context(
+        "sensitive-writer",
+        "terminal",
+        "writer",
+        scopes=("private", "sensitive"),
+    )
+    reader = _context("private-only", "terminal", "reader", scopes=("private",))
+    run = _write(
+        service,
+        writer,
+        "sensitive-run",
+        "A sensitive worker observation.",
+        scope="run:secret-run",
+        sensitivity="sensitive",
+    )
+
+    with pytest.raises(ServiceRequestError, match="not visible") as hidden:
+        service.handle(
+            reader,
+            _request(
+                "promote-sensitive",
+                "memory.promote",
+                fact_id=run["fact_id"],
+                idempotency_key="promote-sensitive",
+            ),
+        )
+    assert hidden.value.code == "access_denied"
+    conn.close()
+
+
+def test_run_scope_search_requires_private_grant(tmp_path):
+    conn = _store(tmp_path)
+    service = EnfoldService(conn, MemoryPolicy({"work-only": ("work",)}))
+    context = _context("work-only", "terminal", "terminal", scopes=("work",))
+
+    with pytest.raises(ServiceRequestError, match="not authorized") as denied:
+        service.handle(
+            context,
+            _request(
+                "run-search-denied",
+                "memory.search",
+                query="worker only",
+                scope="run:child-session",
+            ),
+        )
+    assert denied.value.code == "access_denied"
+    conn.close()

@@ -11,7 +11,7 @@ from enfold.client import (
     EnfoldRemoteError,
     EnfoldTransportError,
 )
-from enfold.mcp_stdio import build_server, parse_config
+from enfold.mcp_stdio import _load_mcp, build_server, parse_config
 from enfold.protocol import ClientContext, ProtocolError
 
 
@@ -20,14 +20,17 @@ class FakeToolError(Exception):
 
 
 class FakeMCP:
-    def __init__(self, name):
+    def __init__(self, name, instructions=None, **_kwargs):
         self.name = name
+        self.instructions = instructions
         self.tools = {}
+        self.tool_meta = {}
         self.runs = []
 
-    def tool(self):
+    def tool(self, *args, **kwargs):
         def register(function):
             self.tools[function.__name__] = function
+            self.tool_meta[function.__name__] = kwargs
             return function
 
         return register
@@ -75,6 +78,7 @@ def harness(tmp_path):
         server_factory=FakeMCP,
         transport_factory=RecordingTransport,
         tool_error_type=FakeToolError,
+        tool_profile="legacy-v1",
     )
     return server, RecordingTransport.instances[0]
 
@@ -82,7 +86,7 @@ def harness(tmp_path):
 def test_registers_only_v1_memory_tools_without_opening_transport(harness):
     server, transport = harness
 
-    assert server.name == "enfold-memory-v1"
+    assert server.name == "enfold-memory"
     assert set(server.tools) == {
         "memory_write",
         "memory_search",
@@ -96,6 +100,7 @@ def test_registers_only_v1_memory_tools_without_opening_transport(harness):
         "memory_conflicts",
         "memory_resolve_conflict",
         "memory_extraction_enqueue",
+        "memory_promote",
     }
     assert transport.calls == []
 
@@ -116,6 +121,34 @@ def test_registers_only_v1_memory_tools_without_opening_transport(harness):
         assert forbidden.isdisjoint(inspect.signature(tool).parameters)
 
 
+def test_search_keeps_facts_and_drops_retrieval_telemetry(harness):
+    server, transport = harness
+    transport.result = {
+        "facts": [{"fact_id": 6, "content": "the ranked hit that must survive"}],
+        "retrieval": {
+            "vector_backend": "brute",
+            "vector_fallback_active": False,
+            "embedder_production_ready": False,
+            "retrieval_stack": "standalone_core_fts+jaccard+pluggable_dense",
+            "score_formula": "0.5*fts + 0.3*dense + 0.2*jaccard",
+            "weights": {"fts": 0.5, "dense": 0.3, "jaccard": 0.2},
+            "query_embedding_identity": "ollama:nomic-embed-text",
+        },
+        "output_truncated": False,
+    }
+
+    result = server.tools["memory_search"]("needle")
+
+    assert result["facts"] == [
+        {"fact_id": 6, "content": "the ranked hit that must survive"}
+    ]
+    assert result["retrieval"] == {
+        "vector_backend": "brute",
+        "vector_fallback_active": False,
+        "embedder_production_ready": False,
+    }
+
+
 def test_tools_are_one_to_one_json_safe_protocol_calls(harness):
     server, transport = harness
     transport.result = {"facts": [{"fact_id": 1}], "tuple": (1, 2)}
@@ -126,7 +159,7 @@ def test_tools_are_one_to_one_json_safe_protocol_calls(harness):
     assert transport.calls == [
         (
             "memory.search",
-            {"query": "needle", "category": None, "min_trust": 0.0, "limit": 4},
+            {"query": "needle", "category": None, "limit": 4},
             None,
         )
     ]
@@ -161,8 +194,8 @@ def test_write_forwards_memory_fields_but_not_connection_identity(harness):
             ("current project",),
             ("memory.context", {"query": "current project", "token_budget": 256}),
         ),
-        ("memory_evidence", (9,), ("memory.evidence", {"fact_id": 9, "limit": 100})),
-        ("memory_history", (), ("memory.history", {"limit": 100})),
+        ("memory_evidence", (9,), ("memory.evidence", {"fact_id": 9, "limit": 20})),
+        ("memory_history", (), ("memory.history", {"limit": 20})),
         (
             "memory_conflicts",
             (),
@@ -216,6 +249,81 @@ def test_resolve_conflict_forwards_audited_decision(harness):
     )
 
 
+def test_promote_forwards_fact_id_and_target_scope(harness):
+    server, transport = harness
+    server.tools["memory_promote"](12, "promote-12", target_scope="work")
+    assert transport.calls[-1][:2] == (
+        "memory.promote",
+        {
+            "fact_id": 12,
+            "idempotency_key": "promote-12",
+            "target_scope": "work",
+        },
+    )
+
+
+def test_search_forwards_as_of_axes_when_requested(harness):
+    server, transport = harness
+
+    server.tools["memory_search"](
+        "needle",
+        as_of_valid="2021-01-01T00:00:00Z",
+        as_of_tx="2021-06-01T00:00:00Z",
+    )
+    assert transport.calls[-1][:2] == (
+        "memory.search",
+        {
+            "query": "needle",
+            "category": None,
+            "limit": 20,
+            "as_of_valid": "2021-01-01T00:00:00Z",
+            "as_of_tx": "2021-06-01T00:00:00Z",
+        },
+    )
+
+
+def test_search_forwards_include_unreviewed_only_when_requested(harness):
+    server, transport = harness
+
+    server.tools["memory_search"]("needle")
+    default_params = transport.calls[-1][1]
+    assert "include_unreviewed" not in default_params
+
+    server.tools["memory_search"]("needle", include_unreviewed=True)
+    assert transport.calls[-1][1]["include_unreviewed"] is True
+
+
+def test_search_omits_min_trust_unless_caller_sets_it(harness):
+    server, transport = harness
+
+    server.tools["memory_search"]("needle")
+    assert "min_trust" not in transport.calls[-1][1]
+
+    server.tools["memory_search"]("needle", min_trust=0.0)
+    assert transport.calls[-1][1]["min_trust"] == 0.0
+
+
+def test_search_forwards_this_session_run_scope_and_refuses_another(harness):
+    server, transport = harness
+
+    with pytest.raises(FakeToolError) as raised:
+        server.tools["memory_search"]("needle", scope="run:child-session")
+    payload = json.loads(str(raised.value))
+    assert payload["code"] == "access_denied"
+    assert transport.calls == []
+
+    server.tools["memory_search"]("needle", scope="run:thread-7")
+    assert transport.calls[-1][:2] == (
+        "memory.search",
+        {
+            "query": "needle",
+            "category": None,
+            "limit": 20,
+            "scope": "run:thread-7",
+        },
+    )
+
+
 def test_extraction_enqueue_is_explicit_scoped_model_free_protocol_call(harness):
     server, transport = harness
     server.tools["memory_extraction_enqueue"](
@@ -249,13 +357,12 @@ def test_remote_error_is_typed_json_mcp_error(harness):
         server.tools["memory_write"]("key", "claim", "agent_report")
 
     payload = json.loads(str(raised.value))
-    assert payload == {
-        "code": "needs_review",
-        "details": {"fact_id": 4},
-        "message": "human confirmation required",
-        "request_id": "req-4",
-        "retryable": False,
-    }
+    assert payload["code"] == "needs_review"
+    assert payload["details"] == {"fact_id": 4}
+    assert payload["message"] == "human confirmation required"
+    assert payload["request_id"] == "req-4"
+    assert payload["retryable"] is False
+    assert payload["next_action"]
 
 
 def test_transport_error_is_retryable_and_non_json_result_is_typed(harness):
@@ -271,6 +378,20 @@ def test_transport_error_is_retryable_and_non_json_result_is_typed(harness):
     with pytest.raises(FakeToolError) as raised:
         server.tools["memory_search"]("query")
     assert json.loads(str(raised.value))["code"] == "invalid_daemon_result"
+
+
+def test_parse_config_request_timeout_covers_retrieval_embed_budget(tmp_path):
+    config = parse_config(
+        [],
+        environ={
+            "ENFOLD_SOCKET_PATH": str(tmp_path / "enfold.sock"),
+            "ENFOLD_CLIENT_ID": "client-b-install",
+            "ENFOLD_SURFACE": "client-b",
+            "ENFOLD_AGENT_ID": "client-b",
+            "ENFOLD_SESSION_ID": "session-9",
+        },
+    )
+    assert config.request_timeout >= 35.0
 
 
 def test_parse_config_uses_explicit_environment_identity(tmp_path):
@@ -320,3 +441,21 @@ def test_parse_config_cli_overrides_environment_and_requires_absolute_socket(tmp
             ],
             environ={},
         )
+
+
+def test_load_mcp_import_error_names_working_install(monkeypatch):
+    import builtins
+
+    real_import = builtins.__import__
+
+    def blocked(name, *args, **kwargs):
+        if name == "mcp" or name.startswith("mcp."):
+            raise ImportError("blocked")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", blocked)
+    with pytest.raises(RuntimeError) as raised:
+        _load_mcp()
+    message = str(raised.value)
+    assert "enfold[" + "mcp]" not in message
+    assert "pip install 'mcp>=1.28.1,<2'" in message

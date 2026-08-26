@@ -31,6 +31,7 @@ import time
 import uuid
 from typing import Any, Dict, Iterable, Optional
 
+from .extraction_spans import TranscriptInput, normalize_transcript
 from .policy import default_credential_screen
 from .provenance import WriteRequest
 
@@ -204,8 +205,9 @@ class ExtractQueue:
             )
 
     @staticmethod
-    def _payload_hash(payload: str) -> str:
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    def _payload_hash(payload: str, *, role_structured: bool = False) -> str:
+        prefix = b"role-structured-v1\0" if role_structured else b""
+        return hashlib.sha256(prefix + payload.encode("utf-8")).hexdigest()
 
     @staticmethod
     def _age_exceeded(created_epoch) -> bool:
@@ -250,16 +252,27 @@ class ExtractQueue:
     # Write
     # ------------------------------------------------------------------
 
-    def enqueue(self, payload: str) -> int:
+    def enqueue(self, payload: TranscriptInput) -> int:
         """Insert a pending row and return its id.
 
-        Payloads above MAX_PAYLOAD_BYTES keep their tail, since transcripts
-        put the most recent (most relevant) turns last.
+        Opaque payloads above MAX_PAYLOAD_BYTES keep their tail. Structured
+        turns fail closed because truncation would destroy role attribution.
         """
+        role_structured = not isinstance(payload, str)
+        if role_structured:
+            _transcript_text, turns = normalize_transcript(payload)
+            payload = json.dumps(
+                list(turns or ()),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
         encoded = payload.encode("utf-8")
         if len(encoded) > MAX_PAYLOAD_BYTES:
+            if role_structured:
+                raise ValueError("role-structured extraction payload exceeds size limit")
             payload = encoded[-MAX_PAYLOAD_BYTES:].decode("utf-8", errors="ignore")
-        payload_hash = self._payload_hash(payload)
+        payload_hash = self._payload_hash(payload, role_structured=role_structured)
         with self._lock:
             existing = self._conn.execute(
                 "SELECT id FROM extract_queue "
@@ -669,7 +682,7 @@ class ExtractQueue:
             claimed = self._conn.execute(
                 """
                 SELECT id, payload, attempts, lease_owner, lease_until,
-                       proposal_json
+                       proposal_json, payload_hash
                 FROM extract_queue WHERE id = ?
                 """,
                 (row_id,),
@@ -684,6 +697,8 @@ class ExtractQueue:
             "lease_owner": _ClaimedLeaseOwner(str(claimed[3]), float(claimed[4])),
             "lease_until": float(claimed[4]),
             "proposal_json": claimed[5],
+            "role_structured": claimed[6]
+            == self._payload_hash(claimed[1], role_structured=True),
         }
 
     def pending_count(self) -> int:

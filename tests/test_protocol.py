@@ -65,6 +65,7 @@ def test_protocol_exposes_required_methods_and_capabilities():
     assert required_capability("memory.entity") == CAPABILITY_ENTITY
     assert required_capability("memory.conflicts") == CAPABILITY_CONFLICTS
     assert required_capability("memory.resolve_conflict") == CAPABILITY_RESOLVE_CONFLICT
+    assert required_capability("memory.promote") == CAPABILITY_WRITE
     assert set(SUPPORTED_CAPABILITIES) == {
         CAPABILITY_HEALTH,
         CAPABILITY_WRITE,
@@ -119,7 +120,7 @@ def test_request_and_response_round_trip_as_canonical_json_lines():
 
 def test_requests_cover_every_supported_method():
     for index, method in enumerate(
-        ("health", "memory.write", "memory.search", "memory.context", "memory.evidence", "memory.history", "memory.changes", "memory.timeline", "memory.entities", "memory.entity", "memory.conflicts", "memory.resolve_conflict", "memory.extraction.enqueue")
+        ("health", "memory.write", "memory.search", "memory.context", "memory.evidence", "memory.history", "memory.changes", "memory.timeline", "memory.entities", "memory.entity", "memory.conflicts", "memory.resolve_conflict", "memory.extraction.enqueue", "memory.promote")
     ):
         request = Request(f"req-{index}", method, {})
         assert decode_frame(encode_frame(request)) == request

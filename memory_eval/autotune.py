@@ -16,12 +16,15 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - exercised only in minimal envs
     yaml = None
 
+from enfold.hybrid_retrieval import DEFAULT_RANKING_CONFIG
+
 from .baseline import (
     clear_pending_extract_queue_for_eval,
-    load_provider,
+    load_eval_retriever,
     prepare_eval_db,
     resolve_cases,
 )
+from .cases import count_self_referential_cases, describe_case_run, split_tune_and_holdout
 from .runner import EvalCase, run_retrieval_cases, summarize_results
 from .sqlite_utils import backup_sqlite_db, quick_check
 
@@ -32,31 +35,31 @@ DEFAULT_REPORT_ROOT = HERMES_HOME / "reports" / "memory-eval"
 DEFAULT_LIVE_DB = HERMES_HOME / "memory_store.db"
 
 RETRIEVAL_KEYS = (
-    "embedding_weight",
     "fts_weight",
     "jaccard_weight",
-    "hrr_weight",
-    "entity_boost_weight",
-    "entity_expansion",
-    "entity_hub_degree_limit",
-    "retrieval_decision_enabled",
-    "retrieval_decision_min_score",
-    "retrieval_decision_min_margin",
-    "retrieval_decision_min_trust",
-    "temporal_decay_half_life",
+    "dense_weight",
+    "fts_query_coverage_weight",
+    "recency_half_life_days",
+    "score_floor",
+    "ambiguity_margin",
+    "trust_weight",
+    "memory_kind_weight",
+    "recency_weight",
 )
 
+_RELEVANCE_KEYS = ("fts_weight", "jaccard_weight", "dense_weight")
+
 FIXED_RETRIEVAL_KEYS = (
-    "embedding_backend",
-    "embedding_prefix_policy",
-    "embedding_query_prefix",
-    "embedding_document_prefix",
-    "ollama_url",
-    "ollama_model",
-    "fastembed_model",
-    "fastembed_cache_dir",
-    "hrr_dim",
-    "temporal_filter",
+    "retriever_mode",
+    "allow_nonproduction",
+    "vector_backend",
+    "allowed_scopes",
+    "dimensions",
+    "provider",
+    "model",
+    "query_identity",
+    "document_identity",
+    "embedding_version",
     "min_trust_threshold",
 )
 
@@ -209,25 +212,22 @@ def _expand_db_path(value: Any) -> Path:
 
 
 def _base_eval_config(live: dict[str, Any], db_path: Path) -> dict[str, Any]:
+    ranking = DEFAULT_RANKING_CONFIG
     config: dict[str, Any] = {
         "db_path": str(db_path),
-        "embedding_backend": "ollama",
-        "ollama_model": "embeddinggemma",
-        "embedding_prefix_policy": "auto",
-        "embedding_weight": 0.45,
-        "fts_weight": 0.3,
-        "jaccard_weight": 0.2,
-        "hrr_weight": 0.0,
-        "entity_boost_weight": 0.0,
-        "entity_expansion": False,
-        "entity_hub_degree_limit": 25,
-        "retrieval_decision_enabled": False,
-        "retrieval_decision_min_score": None,
-        "retrieval_decision_min_margin": None,
-        "retrieval_decision_min_trust": None,
-        "temporal_decay_half_life": 0,
-        "temporal_filter": True,
-        "hrr_dim": 1024,
+        "retriever_mode": "stored",
+        "fts_weight": ranking.fts_weight,
+        "jaccard_weight": ranking.jaccard_weight,
+        "dense_weight": ranking.dense_weight,
+        "fts_query_coverage_weight": ranking.fts_query_coverage_weight,
+        "recency_half_life_days": ranking.recency_half_life_days,
+        "score_floor": ranking.score_floor,
+        "ambiguity_margin": ranking.ambiguity_margin,
+        "trust_weight": ranking.trust_weight,
+        "memory_kind_weight": ranking.memory_kind_weight,
+        "recency_weight": ranking.recency_weight,
+        "vector_backend": "auto",
+        "allowed_scopes": ["private", "work", "public"],
         "embed_on_add": False,
         "dedup_on_add": False,
         "reflection_enabled": False,
@@ -253,27 +253,28 @@ def _jsonable_config(config: dict[str, Any]) -> dict[str, Any]:
 
 
 def _eligible_knobs(active_backend: dict[str, Any], current: dict[str, Any]) -> list[KnobSpec]:
-    dense_active = bool(active_backend.get("dense_embeddings"))
-    knobs = [
-        KnobSpec("fts_weight", (0.0, 0.1, 0.2, 0.3, 0.45, 0.6, 0.8, 1.0)),
-        KnobSpec("jaccard_weight", (0.0, 0.1, 0.2, 0.3, 0.45, 0.6, 0.8, 1.0)),
-        KnobSpec("hrr_weight", (0.0, 0.05, 0.1, 0.2, 0.3, 0.45, 0.6, 1.0)),
-        KnobSpec("entity_boost_weight", (0.0, 0.05, 0.1, 0.2, 0.3, 0.5)),
-        KnobSpec("entity_expansion", (False, True)),
-        KnobSpec("retrieval_decision_enabled", (False, True)),
-        KnobSpec("temporal_decay_half_life", (0, 604800, 2592000, 7776000)),
+    del active_backend, current
+    return [
+        KnobSpec("fts_weight", (0.1, 0.2, 0.35, 0.45, 0.6, 0.8)),
+        KnobSpec("jaccard_weight", (0.1, 0.2, 0.25, 0.35, 0.45, 0.6)),
+        KnobSpec("dense_weight", (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.8)),
+        KnobSpec("fts_query_coverage_weight", (0.0, 0.25, 0.5, 0.75, 1.0)),
+        KnobSpec("recency_half_life_days", (30.0, 90.0, 180.0, 365.0, 730.0)),
+        KnobSpec("score_floor", (0.0, 0.05, 0.12, 0.2, 0.3)),
     ]
-    if dense_active:
-        knobs.insert(0, KnobSpec("embedding_weight", (0.0, 0.15, 0.3, 0.45, 0.6, 0.75, 0.9)))
-    if bool(current.get("entity_expansion")):
-        knobs.append(KnobSpec("entity_hub_degree_limit", (5, 10, 15, 25, 40, 75)))
-    if bool(current.get("retrieval_decision_enabled")):
-        knobs.extend([
-            KnobSpec("retrieval_decision_min_score", (None, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7)),
-            KnobSpec("retrieval_decision_min_margin", (None, 0.0, 0.01, 0.02, 0.05, 0.1)),
-            KnobSpec("retrieval_decision_min_trust", (None, 0.3, 0.4, 0.5, 0.6, 0.7)),
-        ])
-    return knobs
+
+
+def _rescale_relevance(config: dict[str, Any], key: str, after: Any) -> None:
+    others = [name for name in _RELEVANCE_KEYS if name != key]
+    remaining = max(0.0, 1.0 - float(after))
+    old_sum = float(config.get(others[0], 0.0)) + float(config.get(others[1], 0.0))
+    if old_sum <= 0:
+        config[others[0]] = remaining / 2.0
+        config[others[1]] = remaining / 2.0
+    else:
+        config[others[0]] = remaining * float(config[others[0]]) / old_sum
+        config[others[1]] = remaining * float(config[others[1]]) / old_sum
+    config[key] = after
 
 
 def _propose_neighbor(
@@ -284,25 +285,23 @@ def _propose_neighbor(
     spec = rng.choice(knobs)
     before, after = spec.propose(current, rng)
     proposed = copy.deepcopy(current)
-    proposed[spec.key] = after
+    if spec.key in _RELEVANCE_KEYS:
+        _rescale_relevance(proposed, spec.key, after)
+    else:
+        proposed[spec.key] = after
     return Proposal(knob=spec.key, before=before, after=after, config=proposed)
 
 
 def _active_backend(provider: Any) -> dict[str, Any]:
-    backend = str(getattr(provider, "_embedding_backend", "unknown"))
-    model_name = None
-    model_fn = getattr(provider, "_embedding_model_name", None)
-    if callable(model_fn):
-        try:
-            model_name = model_fn()
-        except Exception:
-            model_name = None
-    dense = bool(getattr(provider, "_embedder_available", False))
+    retriever = getattr(provider, "_retriever", provider)
+    meta = getattr(retriever, "metadata", {}) or {}
+    identity = str(meta.get("embedder_identity") or "hybrid")
     return {
-        "configured_backend": backend,
-        "model": model_name,
-        "dense_embeddings": dense,
-        "active": f"{backend}:{model_name}" if dense and model_name else "holographic_only",
+        "configured_backend": meta.get("retrieval_stack", "hybrid"),
+        "model": identity,
+        "dense_embeddings": True,
+        "active": identity,
+        "embedder_production_ready": bool(meta.get("embedder_production_ready")),
     }
 
 
@@ -324,12 +323,8 @@ def _evaluate_trial(
     config = copy.deepcopy(proposal.config)
     config["db_path"] = str(trial_db)
 
-    provider = load_provider(
-        repo_root,
-        config,
-        hermes_src=hermes_src,
-        test_stubs=test_stubs,
-    )
+    del repo_root, hermes_src, test_stubs
+    provider = load_eval_retriever(trial_db, config)
     active_backend = _active_backend(provider)
     try:
         results = run_retrieval_cases(provider, cases, limit=limit)
@@ -381,16 +376,8 @@ def _normalize_inactive_knobs(
     baseline: dict[str, Any],
     active_backend: dict[str, Any],
 ) -> dict[str, Any]:
-    normalized = copy.deepcopy(config)
-    if not active_backend.get("dense_embeddings"):
-        normalized["embedding_weight"] = baseline.get("embedding_weight")
-    if not normalized.get("entity_expansion"):
-        normalized["entity_hub_degree_limit"] = baseline.get("entity_hub_degree_limit")
-    if not normalized.get("retrieval_decision_enabled"):
-        normalized["retrieval_decision_min_score"] = baseline.get("retrieval_decision_min_score")
-        normalized["retrieval_decision_min_margin"] = baseline.get("retrieval_decision_min_margin")
-        normalized["retrieval_decision_min_trust"] = baseline.get("retrieval_decision_min_trust")
-    return normalized
+    del baseline, active_backend
+    return copy.deepcopy(config)
 
 
 def _format_config_value(value: Any) -> str:
@@ -476,7 +463,7 @@ def _write_recommendation(
     notes = [
         f"Caps: max_experiments={caps['max_experiments']}, max_minutes={caps['max_minutes']}.",
         "Each trial ran on a fresh SQLite backup copied from the initial snapshot.",
-        "The recency tie-break in `EnfoldProvider.search()` is hardcoded; only `temporal_decay_half_life` is configurable.",
+        "HybridRetriever recency uses RankingConfig.recency_half_life_days.",
     ]
     notes.extend(case_notes)
     notes.extend(backend_notes)
@@ -530,6 +517,7 @@ def run_autotune(
     hermes_src: Path | None,
     test_stubs: bool,
     seed: int,
+    retriever_mode: str = "stored",
 ) -> dict[str, Any]:
     if max_experiments <= 0:
         raise ValueError("--max-experiments must be positive")
@@ -553,11 +541,32 @@ def run_autotune(
         sample=sample,
         min_trust=min_trust,
     )
-    case_notes = [
-        "No paraphrase or distractor generation was found in `memory_eval/cases.py`; this run used exact-fact cases."
-    ]
+    tune_cases, holdout_cases = split_tune_and_holdout(cases, holdout_fraction=0.4, seed=seed)
+    self_referential = count_self_referential_cases(cases, prepared.path)
+    can_report_improvement = bool(holdout_cases) and self_referential == 0
+    scoring_cases = tune_cases or cases
+    case_notes = describe_case_run(
+        cases,
+        tune=tune_cases,
+        holdout=holdout_cases,
+        self_referential=self_referential,
+    )
+    if not can_report_improvement:
+        reasons = []
+        if not holdout_cases:
+            reasons.append("no holdout set was available")
+        if self_referential:
+            reasons.append(
+                f"{self_referential} self-referential or exact-fact queries were present"
+            )
+        case_notes.append(
+            "Improvement reporting refused: " + "; ".join(reasons) + "."
+        )
 
     baseline_config = _base_eval_config(live_config, prepared.path)
+    baseline_config["retriever_mode"] = retriever_mode
+    if retriever_mode == "ci":
+        baseline_config["allow_nonproduction"] = True
     baseline_proposal = Proposal(knob=None, before=None, after=None, config=baseline_config)
     started = time.monotonic()
     summary, actual_baseline_config, cleared, active_backend = _evaluate_trial(
@@ -565,7 +574,7 @@ def run_autotune(
         proposal=baseline_proposal,
         base_snapshot=prepared.path,
         report_dir=report_dir,
-        cases=cases,
+        cases=scoring_cases,
         limit=limit,
         repo_root=repo_root,
         hermes_src=hermes_src,
@@ -613,7 +622,7 @@ def run_autotune(
                 proposal=proposal,
                 base_snapshot=prepared.path,
                 report_dir=report_dir,
-                cases=cases,
+                cases=scoring_cases,
                 limit=limit,
                 repo_root=repo_root,
                 hermes_src=hermes_src,
@@ -659,13 +668,45 @@ def run_autotune(
 
     best_config = _normalize_inactive_knobs(best_config, baseline_config, active_backend)
 
+    if can_report_improvement and holdout_cases:
+        holdout_baseline_summary, _, _, _ = _evaluate_trial(
+            trial=9000,
+            proposal=baseline_proposal,
+            base_snapshot=prepared.path,
+            report_dir=report_dir,
+            cases=holdout_cases,
+            limit=limit,
+            repo_root=repo_root,
+            hermes_src=hermes_src,
+            test_stubs=test_stubs,
+        )
+        holdout_best_summary, _, _, _ = _evaluate_trial(
+            trial=9001,
+            proposal=Proposal(knob=None, before=None, after=None, config=best_config),
+            base_snapshot=prepared.path,
+            report_dir=report_dir,
+            cases=holdout_cases,
+            limit=limit,
+            repo_root=repo_root,
+            hermes_src=hermes_src,
+            test_stubs=test_stubs,
+        )
+        reported_baseline = TrialScore.from_summary(holdout_baseline_summary)
+        reported_best = TrialScore.from_summary(holdout_best_summary)
+        improvement_reported = reported_best != reported_baseline
+    else:
+        reported_baseline = baseline_score
+        reported_best = baseline_score
+        best_config = copy.deepcopy(baseline_config)
+        improvement_reported = False
+
     _write_recommendation(
         path=recommendation_path,
         live_config=live_config,
         baseline_config=baseline_config,
         best_config=best_config,
-        baseline_score=baseline_score,
-        best_score=best_score,
+        baseline_score=reported_baseline,
+        best_score=reported_best,
         trials=trials,
         caps={"max_experiments": max_experiments, "max_minutes": max_minutes},
         case_count=len(cases),
@@ -684,10 +725,14 @@ def run_autotune(
             "bytes": prepared.backup.bytes,
         },
         "case_count": len(cases),
+        "tune_case_count": len(tune_cases),
+        "holdout_case_count": len(holdout_cases),
+        "self_referential_cases": self_referential,
         "trials": len(trials),
-        "baseline": baseline_score.as_dict(),
-        "best": best_score.as_dict(),
-        "beat_baseline": best_score != baseline_score,
+        "baseline": reported_baseline.as_dict(),
+        "best": reported_best.as_dict(),
+        "beat_baseline": improvement_reported,
+        "improvement_reported": improvement_reported,
         "active_backend": active_backend,
     }
     (report_dir / "summary.json").write_text(json.dumps(result, indent=2, sort_keys=True))
@@ -703,13 +748,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-experiments", type=int, required=True, help="Hard cap including baseline trial")
     parser.add_argument("--max-minutes", type=float, required=True, help="Wall-clock cap in minutes")
     parser.add_argument("--cases", help="Optional JSON eval case file")
-    parser.add_argument("--sample", type=int, default=50, help="Exact-fact case count when --cases is omitted")
+    parser.add_argument("--sample", type=int, default=50, help="Template-paraphrase case count when --cases is omitted")
     parser.add_argument("--limit", type=int, default=10, help="Search result limit")
     parser.add_argument("--min-trust", type=float, default=0.3)
     parser.add_argument("--repo-root", default=str(Path.cwd()))
-    parser.add_argument("--hermes-src", help="Hermes source root for real parent provider imports")
-    parser.add_argument("--test-stubs", action="store_true", help="Use tests/fake_hermes stubs")
+    parser.add_argument("--hermes-src", help="Ignored; HybridRetriever does not import Hermes")
+    parser.add_argument("--test-stubs", action="store_true", help="Ignored; HybridRetriever does not use Hermes stubs")
     parser.add_argument("--seed", type=int, default=1701)
+    parser.add_argument(
+        "--retriever-mode",
+        choices=("stored", "ci"),
+        default="stored",
+        help="stored matches the daemon; ci uses HybridRetriever with the deterministic embedder",
+    )
     args = parser.parse_args(argv)
 
     live = _live_plugin_config(LIVE_CONFIG_PATH)
@@ -730,6 +781,7 @@ def main(argv: list[str] | None = None) -> int:
         hermes_src=Path(args.hermes_src).expanduser() if args.hermes_src else None,
         test_stubs=args.test_stubs,
         seed=args.seed,
+        retriever_mode=args.retriever_mode,
     )
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0

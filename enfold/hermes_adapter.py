@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .client import ClientConfig, EnfoldClient, EnfoldTransportError
+from .extraction_spans import TranscriptInput
 from .mcp_proxy import MemoryMCPProxy, MemoryTransport
 from .protocol import ClientContext
 
@@ -233,6 +234,23 @@ class HermesMemorySession:
         )
         return self._proxy.write(params)
 
+    def promote(
+        self,
+        fact_id: int,
+        *,
+        event_id: str,
+        target_scope: str = "private",
+    ) -> Any:
+        """Copy a current run-scoped fact onto a durable granted scope."""
+
+        return self._proxy.promote(
+            {
+                "fact_id": fact_id,
+                "idempotency_key": self.idempotency_key(event_id),
+                "target_scope": target_scope,
+            }
+        )
+
     def search(self, query: str, **filters: Any) -> Any:
         return self._read("memory.search", {"query": query, **filters})
 
@@ -282,7 +300,7 @@ class HermesMemorySession:
 
     def enqueue_extraction(
         self,
-        transcript: str,
+        transcript: TranscriptInput,
         *,
         source: str,
         scope: str = "private",

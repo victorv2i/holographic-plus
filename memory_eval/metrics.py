@@ -24,6 +24,24 @@ def recall_at_k(ranked_per_query: Sequence[Sequence[Any]], gold_ids: Sequence[An
     return hits / len(gold_ids)
 
 
+def ndcg_at_k(ranked_per_query: Sequence[Sequence[Any]], gold_ids: Sequence[Any], k: int) -> float:
+    """Binary nDCG@k for a single gold id per query. Unfound gold is zero."""
+    if k <= 0:
+        raise ValueError("k must be positive")
+    if len(ranked_per_query) != len(gold_ids):
+        raise ValueError("ranked_per_query and gold_ids must have the same length")
+    if not gold_ids:
+        return 0.0
+    total = 0.0
+    ideal = 1.0 / math.log2(2)
+    for ranked, gold in zip(ranked_per_query, gold_ids, strict=True):
+        top = list(ranked)[:k]
+        if gold in top:
+            rank = top.index(gold) + 1
+            total += (1.0 / math.log2(rank + 1)) / ideal
+    return total / len(gold_ids)
+
+
 def mean_reciprocal_rank(ranked_per_query: Sequence[Sequence[Any]], gold_ids: Sequence[Any]) -> float:
     """Return MRR with unfound gold ids counted as zero."""
     if len(ranked_per_query) != len(gold_ids):

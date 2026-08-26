@@ -28,7 +28,18 @@ from .backup import (
     sqlite_file_uri,
     verify_database,
 )
+from .core_store import DEFAULT_BUSY_TIMEOUT_MS
 from .erasure import ErasureError, erase_fact
+from .export import ExportError, export_current
+from .extraction_enqueue import (
+    CaptureDisabled,
+    CaptureEnableError,
+    ExtractionEnqueuer,
+    ExtractionQueueUnavailable,
+    capture_status,
+    enable_capture,
+)
+from .provenance import ConnectionContext
 from .rehearsal import RehearsalError, rehearse_snapshot
 from .schema import (
     SUPPORTED_SCHEMA_VERSION,
@@ -67,7 +78,18 @@ def _connect(path: str | Path, *, read_only: bool) -> sqlite3.Connection:
     if not resolved.is_file():
         raise BackupError(f"database does not exist: {resolved}")
     mode = "ro" if read_only else "rw"
-    return sqlite3.connect(sqlite_file_uri(resolved, mode=mode), uri=True)
+    conn = sqlite3.connect(sqlite_file_uri(resolved, mode=mode), uri=True)
+    try:
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute(f"PRAGMA busy_timeout={int(DEFAULT_BUSY_TIMEOUT_MS)}")
+        if not read_only:
+            journal_mode = str(conn.execute("PRAGMA journal_mode=WAL").fetchone()[0])
+            if journal_mode.lower() != "wal":
+                raise BackupError("database cannot enable WAL journal mode")
+        return conn
+    except BaseException:
+        conn.close()
+        raise
 
 
 def _print_json(value: object) -> None:
@@ -164,6 +186,7 @@ def _erase_fact(args: argparse.Namespace) -> None:
     _require_live_override(args.database, allow_live=args.allow_live)
     with maintenance_database_lock(args.database):
         with _connect(args.database, read_only=False) as conn:
+            require_compatible_schema(conn, for_writer=True)
             report = erase_fact(
                 conn,
                 args.fact_id,
@@ -398,7 +421,7 @@ def _rebuild_vector_index(args: argparse.Namespace) -> None:
     _require_live_override(args.database, allow_live=args.allow_live)
     with maintenance_database_lock(args.database):
         with _connect(args.database, read_only=False) as conn:
-            require_compatible_schema(conn)
+            require_compatible_schema(conn, for_writer=True)
             report = rebuild_sqlite_vec_index(
                 conn, args.embedding_identity, args.dimensions
             )
@@ -458,7 +481,7 @@ def _revive_extraction_dead(args: argparse.Namespace) -> None:
     placeholders = ",".join("?" for _ in ids)
     with maintenance_database_lock(args.database):
         with _connect(args.database, read_only=False) as conn:
-            require_compatible_schema(conn)
+            require_compatible_schema(conn, for_writer=True)
             rows = conn.execute(
                 f"SELECT id, status, last_error FROM extract_queue "
                 f"WHERE id IN ({placeholders}) ORDER BY id",
@@ -514,7 +537,7 @@ def _acknowledge_extraction_dead(args: argparse.Namespace) -> None:
     placeholders = ",".join("?" for _ in ids)
     with maintenance_database_lock(args.database):
         with _connect(args.database, read_only=False) as conn:
-            require_compatible_schema(conn)
+            require_compatible_schema(conn, for_writer=True)
             rows = conn.execute(
                 f"SELECT id, status, last_error FROM extract_queue "
                 f"WHERE id IN ({placeholders}) ORDER BY id",
@@ -552,6 +575,83 @@ def _acknowledge_extraction_dead(args: argparse.Namespace) -> None:
             "database": str(_resolved(args.database)),
             "acknowledged": list(ids),
             "expected_error": expected_error,
+            "ok": True,
+        }
+    )
+
+
+def _capture_status(args: argparse.Namespace) -> None:
+    with _connect(args.database, read_only=True) as conn:
+        require_compatible_schema(conn)
+        status = capture_status(conn)
+    _print_json(
+        {
+            "database": str(_resolved(args.database)),
+            **status,
+        }
+    )
+
+
+def _capture_enable(args: argparse.Namespace) -> None:
+    _require_live_override(args.database, allow_live=args.allow_live)
+    with _connect(args.database, read_only=False) as conn:
+        require_compatible_schema(conn, for_writer=True)
+        status = enable_capture(
+            conn,
+            allow_unreviewed=args.allow_unreviewed,
+            verifier_ready=args.verifier_ready,
+        )
+    _print_json(
+        {
+            "database": str(_resolved(args.database)),
+            **status,
+            "ok": True,
+        }
+    )
+
+
+def _capture_session(args: argparse.Namespace) -> None:
+    _require_live_override(args.database, allow_live=args.allow_live)
+    transcript_path = _resolved(args.transcript)
+    if not transcript_path.is_file():
+        raise BackupError(f"transcript does not exist: {transcript_path}")
+    transcript = transcript_path.read_text(encoding="utf-8")
+    context = ConnectionContext(
+        client_id=args.client_id,
+        surface=args.surface,
+        agent_id=args.agent_id,
+        session_id=args.session_id,
+        access_scopes=(args.scope,),
+    )
+    with _connect(args.database, read_only=False) as conn:
+        require_compatible_schema(conn, for_writer=True)
+        result = ExtractionEnqueuer(conn).enqueue_session_capture(
+            context, transcript, scope=args.scope
+        )
+    _print_json(
+        {
+            "database": str(_resolved(args.database)),
+            "queue_id": result.queue_id,
+            "payload_sha256": result.payload_sha256,
+            "replayed": result.replayed,
+            "ok": True,
+        }
+    )
+
+
+def _export_current(args: argparse.Namespace) -> None:
+    if not args.current:
+        raise BackupError("export requires --current")
+    report = export_current(args.database, args.destination)
+    _print_json(
+        {
+            "database": str(_resolved(args.database)),
+            "current": str(report.current_path),
+            "needs_review": str(report.needs_review_dir),
+            "current_facts": report.current_facts,
+            "conflicted_facts": report.conflicted_facts,
+            "unreviewed_facts": report.unreviewed_facts,
+            "omitted_erased": report.omitted_erased,
             "ok": True,
         }
     )
@@ -729,6 +829,76 @@ def build_parser() -> argparse.ArgumentParser:
         help="allow a .hermes path after every writer is stopped",
     )
     dead_acknowledge.set_defaults(handler=_acknowledge_extraction_dead)
+
+    capture = commands.add_parser(
+        "capture",
+        help="opt in to session capture that enqueues without memory_write",
+    )
+    capture_commands = capture.add_subparsers(dest="capture_command", required=True)
+    capture_status = capture_commands.add_parser(
+        "status", help="report whether session capture is enabled"
+    )
+    capture_status.add_argument(
+        "database", help="explicit schema-v1 SQLite database path"
+    )
+    capture_status.set_defaults(handler=_capture_status)
+    capture_enable = capture_commands.add_parser(
+        "enable",
+        help="opt in to session capture; refused unless a verifier or unreviewed ack",
+    )
+    capture_enable.add_argument(
+        "database", help="explicit schema-v1 SQLite database path"
+    )
+    capture_enable.add_argument(
+        "--allow-unreviewed",
+        action="store_true",
+        help="enqueue anyway; captured rows stay excluded from default recall",
+    )
+    capture_enable.add_argument(
+        "--verifier-ready",
+        action="store_true",
+        help="operator attests a local evidence verifier is configured",
+    )
+    capture_enable.add_argument(
+        "--allow-live",
+        action="store_true",
+        help="allow a .hermes path after every writer is stopped",
+    )
+    capture_enable.set_defaults(handler=_capture_enable)
+    capture_session = capture_commands.add_parser(
+        "session",
+        help="enqueue one session transcript without writing a fact",
+    )
+    capture_session.add_argument(
+        "database", help="explicit schema-v1 SQLite database path"
+    )
+    capture_session.add_argument("--transcript", required=True)
+    capture_session.add_argument("--client-id", required=True)
+    capture_session.add_argument("--session-id", required=True)
+    capture_session.add_argument("--agent-id", required=True)
+    capture_session.add_argument("--surface", required=True)
+    capture_session.add_argument("--scope", default="private")
+    capture_session.add_argument(
+        "--allow-live",
+        action="store_true",
+        help="allow a .hermes path after every writer is stopped",
+    )
+    capture_session.set_defaults(handler=_capture_session)
+
+    export_cmd = commands.add_parser(
+        "export",
+        help="write a read-only Markdown projection of current facts",
+    )
+    export_cmd.add_argument(
+        "--current",
+        action="store_true",
+        help="export non-superseded, non-conflicted facts plus source references",
+    )
+    export_cmd.add_argument("database", help="explicit schema-v1 SQLite database path")
+    export_cmd.add_argument(
+        "destination", help="directory for current.md and needs_review/"
+    )
+    export_cmd.set_defaults(handler=_export_current)
     return parser
 
 
@@ -739,7 +909,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.handler(args)
     except (
         BackupError,
+        CaptureDisabled,
+        CaptureEnableError,
         ErasureError,
+        ExportError,
+        ExtractionQueueUnavailable,
         RehearsalError,
         SchemaError,
         SQLiteVecError,

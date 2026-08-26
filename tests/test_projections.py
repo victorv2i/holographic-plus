@@ -212,7 +212,7 @@ def test_changes_reports_conflict_resolution_for_winner_and_loser(tmp_path):
     conn.close()
 
 
-def test_timeline_is_chronological_and_excludes_unsettled_conflicts(tmp_path):
+def test_timeline_emits_conflicted_receipt_instead_of_silence(tmp_path):
     conn = _store(tmp_path)
     old = _fact(
         conn,
@@ -260,7 +260,18 @@ def test_timeline_is_chronological_and_excludes_unsettled_conflicts(tmp_path):
     assert [event["changed_at"] for event in result["events"]] == sorted(
         event["changed_at"] for event in result["events"]
     )
-    assert {event["fact"]["fact_id"] for event in result["events"]} == {old}
+    created_ids = {
+        event["fact"]["fact_id"]
+        for event in result["events"]
+        if event["kind"] == "created"
+    }
+    assert new not in created_ids
+    assert disputed not in created_ids
+    conflicted = [
+        event for event in result["events"] if event["kind"] == "conflicted"
+    ]
+    assert len(conflicted) == 1
+    assert conflicted[0]["fact"]["conflict_group"] == conflict.conflict_id
     conn.close()
 
 
@@ -405,7 +416,10 @@ def test_entity_dossier_combines_current_changes_and_open_conflicts(tmp_path):
     assert [item["conflict_id"] for item in result["open_conflicts"]] == [
         conflict.conflict_id
     ]
-    assert result["recent_changes"] == []
+    assert [
+        (item["kind"], item["fact"]["conflict_group"])
+        for item in result["recent_changes"]
+    ] == [("conflicted", conflict.conflict_id)]
     conn.close()
 
 

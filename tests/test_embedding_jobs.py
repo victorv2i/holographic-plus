@@ -474,7 +474,7 @@ def test_conflict_winner_revives_completed_skip_and_gets_embedded(tmp_path):
     conn.close()
 
 
-def test_pending_exact_job_allows_zero_dense_but_dead_or_missing_fails(tmp_path):
+def test_pending_exact_job_is_absent_dense_but_dead_or_missing_fails(tmp_path):
     _path, conn = _db(tmp_path)
     fact_id = _fact(conn)
     conn.commit()
@@ -489,7 +489,7 @@ def test_pending_exact_job_allows_zero_dense_but_dead_or_missing_fails(tmp_path)
         dimensions=2,
     )
     vectors = backend.load_documents(((fact_id, "durable memory"),))
-    assert tuple(vectors[0]) == (0.0, 0.0)
+    assert vectors[0] is None
 
     conn.execute("UPDATE embedding_jobs SET status = 'dead_letter'")
     conn.commit()

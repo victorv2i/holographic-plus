@@ -56,6 +56,7 @@ def test_daemon_protocol_arena_path_pins_quality_and_latency():
 def test_real_unix_daemon_protocol_arena_path(tmp_path):
     arena = load_public_arena()
     with EnfoldOfflineHybridProvider(arena) as core:
+        migrate(core.connection)
         service = EnfoldService(
             core.connection,
             MemoryPolicy({"arena-client": ("private",)}),

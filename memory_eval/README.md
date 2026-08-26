@@ -3,17 +3,25 @@
 `personal_arena.py` is the private, offline retrieval benchmark. Run it with:
 
 ```bash
+# Published retrieval claim (fails closed without stored identities):
 python -m memory_eval.personal_arena \
   --cases ~/.config/enfold/private-arena/cases-v0.jsonl \
-  --db ~/.hermes/memory_store.db --seed 0
+  --db ~/.hermes/memory_store.db --seed 0 \
+  --embedder production --embedder-config ~/.config/enfold/benchmark/embedder.json
+
+# Offline CI plumbing (not a retrieval claim):
+python -m memory_eval.personal_arena \
+  --cases ~/.config/enfold/private-arena/cases-v0.jsonl \
+  --db ~/.hermes/memory_store.db --seed 0 \
+  --embedder hash
 ```
 
 It opens the live database read-only and makes a SQLite backup in a temporary
-directory before every run. Retrieval is then `HybridRetriever` with the
-deterministic feature-hash embedder: active/current/scope/trust filters, FTS,
-Jaccard, the shipped hybrid weights, and ranking all run for real. It does not
-measure production embedding-model quality, stored-vector coverage, or MCP
-transport.
+directory before every run. The CLI default is `--embedder production`, which
+uses the daemon's stored `embeddinggemma` identity and fails closed when that
+identity is missing. Pass `--embedder hash` for the offline CI plumbing path
+(deterministic feature-hash). Hash numbers are not a retrieval claim. Neither
+path measures MCP transport.
 
 Each private JSONL row has `id`, `query`, and `category`; it has either
 `expected_fact_ids` and/or `expected_content_regexes`, or neither for an
@@ -37,7 +45,22 @@ python -m memory_eval.extraction_arena \
 
 This command makes no provider, model, network, service, or database calls.
 The bundled seven-case synthetic seed is format and safety smoke coverage; it
-is not the full 190-case corpus used for extraction-model selection.
+is not the capture ship gate and not the full 190-case corpus used for
+extraction-model selection. Capture stays off until the real-transcript
+gate is green:
+
+```bash
+python -m memory_eval.transcript_gate \
+  --cases memory_eval/fixtures/transcript_gate_cases.jsonl \
+  --outputs memory_eval/fixtures/transcript_gate_gold.jsonl \
+  --require-ship
+```
+
+Replay the known production failure with
+`memory_eval/fixtures/transcript_gate_production_junk.jsonl`. That run must
+not ship. Regenerate compacted fixtures with
+`memory_eval/fixtures/build_transcript_gate_bank.py`. Do not commit full
+private monologues.
 
 After offline content/evidence scoring, replay the same saved proposals through
 Enfold's real enqueue policy, extraction processor, state transitions, and
@@ -118,3 +141,38 @@ Keep real cases, results, and source facts under
 after checking its expected fact against a read-only snapshot, choose a stable
 id, and record a precise stale regex whenever the question has a known prior
 answer.
+
+## Published scorecards
+
+The standing rules live in `docs/BENCHMARK_PROTOCOL.md`. Retrieval quality and
+reader QA are never one number.
+
+```bash
+# Retrieval only (Recall@k, MRR, nDCG). No reader.
+PYTHONPATH=$PWD python -c "from memory_eval.retrieval_scorecard import retrieval_scorecard"
+
+# Truth model (stale leak, contradiction, abstain, injection, as-of, tokens, latency)
+PYTHONPATH=$PWD python -c "from memory_eval.truth_scorecard import truth_scorecard"
+```
+
+A metric that cannot be computed is reported as `blocked`, never as a made-up
+zero.
+
+## LOCOMO and LongMemEval-S
+
+Adapters parse public datasets offline and refuse to invent scores. Tiny
+fictional smoke fixtures live under `fixtures/`. The real datasets stay out of
+git.
+
+```bash
+# After downloading locomo10.json (see docs/BENCHMARK_PROTOCOL.md):
+PYTHONPATH=$PWD python -m memory_eval.locomo_adapter \
+  --data ~/.config/enfold/benchmark/data/locomo10.json --require-published-hash
+
+PYTHONPATH=$PWD python -m memory_eval.longmemeval_adapter \
+  --data ~/.config/enfold/benchmark/data/longmemeval_s_cleaned.json --split S
+```
+
+Both commands print a parse report with `scores: null` until a local reader
+run is attached. Category 5 is never dropped. Oracle files cannot be loaded
+as LongMemEval-S.

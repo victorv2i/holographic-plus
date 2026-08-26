@@ -39,6 +39,7 @@ from enfold.server import (
     DatabaseOwnershipError,
     ServerApplication,
     ServerConfigError,
+    _version,
     inspect_config,
     load_config,
     main,
@@ -65,6 +66,7 @@ def _database(path: Path) -> Path:
     conn = sqlite3.connect(path)
     migrate(conn)
     conn.close()
+    path.chmod(0o600)
     return path
 
 
@@ -103,6 +105,14 @@ def _client(socket_path: Path) -> EnfoldClient:
     return EnfoldClient(ClientConfig(socket_path, context))
 
 
+def test_daemon_handler_timeout_covers_retrieval_embed_budget(tmp_path):
+    application = ServerApplication(load_config(_config(tmp_path)))
+    try:
+        assert application.daemon.config.handler_timeout >= 35.0
+    finally:
+        application.close()
+
+
 def test_application_composes_service_health_and_write_in_temp_directory(tmp_path):
     config = load_config(_config(tmp_path))
     with ServerApplication(config) as application:
@@ -114,6 +124,7 @@ def test_application_composes_service_health_and_write_in_temp_directory(tmp_pat
         assert health["storage"] == "sqlite"
         assert health["retrieval"]["filter_before_dense_ranking"] is True
         assert health["retrieval"]["embedder_production_ready"] is False
+        assert health["retrieval"]["deployment"] == "test-only"
         assert health["automatic_llm_extraction"] == {"status": "disabled"}
         result = client.request(
             "memory.write",
@@ -204,16 +215,37 @@ def test_database_sidecar_symlink_is_refused(tmp_path):
         ServerApplication(config)
 
 
+def test_server_run_reports_overlong_socket_without_traceback(tmp_path, capsys):
+    parent = tmp_path / "sock"
+    while len(os.fsencode(os.fspath(parent / "enfold.sock"))) <= 107:
+        parent = parent / ("pad-" + "x" * 40)
+    parent.mkdir(parents=True)
+    os.chmod(parent, 0o700)
+    config_path = _config(tmp_path)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["socket_path"] = str(parent / "enfold.sock")
+    config_path.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
+    os.chmod(config_path, 0o600)
+
+    result = main(["--config", str(config_path), "run"])
+    captured = capsys.readouterr()
+    assert result == 2
+    assert "AF_UNIX" in captured.err
+    assert "Traceback" not in captured.err
+
+
 def test_check_reports_version_schema_and_grants_without_binding(tmp_path, capsys):
     config_path = _config(tmp_path)
-    assert main(["--config", str(config_path), "check"]) == 0
+    assert main(["--config", str(config_path), "check"]) == 2
     report = json.loads(capsys.readouterr().out)
-    assert report["status"] == "ready"
+    assert report["status"] == "blocked"
     assert report["schema_version"] == 1
     assert report["database"] == "compatible"
     assert report["socket"] == "absent"
     assert report["grant_count"] == 3
     assert report["retrieval"]["embedder_production_ready"] is False
+    assert report["retrieval"]["deployment"] == "test-only"
+    assert report["activation_blocker"] == "CI retrieval is test-only"
 
 
 def test_health_command_queries_the_live_protocol(tmp_path, capsys):
@@ -232,7 +264,7 @@ def test_health_command_queries_the_live_protocol(tmp_path, capsys):
 
     report = json.loads(capsys.readouterr().out)
     assert report["status"] == "ok"
-    assert report["service_version"] == "0.8.0"
+    assert report["service_version"] == _version()
     assert report["schema_version"] == 1
 
 
@@ -253,7 +285,7 @@ def test_health_readiness_accepts_configured_healthcheck_public_grant(
 
     report = json.loads(capsys.readouterr().out)
     assert report["status"] == "ok"
-    assert report["service_version"] == "0.8.0"
+    assert report["service_version"] == _version()
     assert report["schema_version"] == 1
 
 
@@ -406,6 +438,7 @@ def test_missing_database_is_not_created_or_migrated(tmp_path):
 def test_unmigrated_database_is_rejected_without_schema_changes(tmp_path):
     database = tmp_path / "empty.db"
     sqlite3.connect(database).close()
+    database.chmod(0o600)
     config = load_config(_config(tmp_path, database_path=str(database)))
     with pytest.raises(ServerConfigError, match="must already be schema v1; found v0"):
         inspect_config(config)
@@ -426,6 +459,13 @@ def test_live_paths_through_symlinked_ancestor_require_allow_live(tmp_path):
 
     with pytest.raises(ServerConfigError, match="--allow-live"):
         load_config(alias / "enfold-server.json")
+
+
+def test_world_readable_config_is_rejected(tmp_path):
+    config_path = _config(tmp_path)
+    config_path.chmod(0o644)
+    with pytest.raises(ServerConfigError, match="group/world readable"):
+        load_config(config_path)
 
 
 def test_config_and_socket_parent_permissions_fail_closed(tmp_path):
@@ -576,7 +616,14 @@ def test_huge_json_integers_use_config_error_path(
         ({"grants": {"client-a": ["made-up"]}}, "unsupported memory scope"),
         ({"cleanup_stale_socket": "yes"}, "must be a boolean"),
         ({"retrieval": {"mode": "ci"}}, "allow_nonproduction=true"),
-        ({"retrieval": {"mode": "mystery"}}, "must be 'ci' or 'stored'"),
+        (
+            {"retrieval": {"mode": "mystery"}},
+            "must be 'ci', 'stored', or 'local-lexical'",
+        ),
+        (
+            {"retrieval": {"mode": "local-lexical", "allow_nonproduction": True}},
+            "local-lexical retrieval cannot set allow_nonproduction",
+        ),
     ],
 )
 def test_strict_config_validation(tmp_path, change, message):
@@ -605,6 +652,52 @@ def test_retrieval_selection_is_required_and_ci_needs_explicit_opt_in(tmp_path):
     path.write_text(json.dumps(raw), encoding="utf-8")
     with pytest.raises(ServerConfigError, match="missing config fields.*retrieval"):
         load_config(path)
+
+
+def test_local_lexical_retrieval_is_accepted_without_nonproduction_opt_in(tmp_path):
+    config = load_config(_config(tmp_path, retrieval={"mode": "local-lexical"}))
+
+    assert config.retrieval.mode == "local-lexical"
+    assert config.retrieval.allow_nonproduction is False
+
+
+def test_local_lexical_check_and_daemon_are_production_ready(tmp_path, capsys):
+    path = _config(tmp_path, retrieval={"mode": "local-lexical"})
+
+    assert main(["--config", str(path), "check"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["status"] == "ready"
+    assert report["retrieval"]["embedder_production_ready"] is True
+    assert report["retrieval"]["dense_scoring"] == "disabled"
+    assert report["retrieval"]["embedder_identity"] == "local-lexical-v1"
+    assert report["embedding_worker"]["state"] == "disabled"
+
+    config = load_config(path)
+    with ServerApplication(config) as application:
+        application.daemon.start()
+        client = _client(config.socket_path)
+        health = client.request("health")
+        assert health["retrieval"]["embedder_production_ready"] is True
+        assert health["retrieval"]["dense_scoring"] == "disabled"
+        written = client.request(
+            "memory.write",
+            {
+                "idempotency_key": "local-lexical-1",
+                "content": "The test preference is dark mode",
+                "source_type": "integration_test",
+                "scope": "private",
+            },
+        )
+        found = client.request(
+            "memory.search", {"query": "test preference dark mode"}
+        )
+        assert [row["fact_id"] for row in found["facts"]] == [written["fact_id"]]
+        evidence = client.request(
+            "memory.evidence", {"fact_id": written["fact_id"]}
+        )
+        assert evidence["fact"]["fact_id"] == written["fact_id"]
+        assert evidence["evidence"][0]["client_id"] == "client-a-install"
+        assert evidence["output_truncated"] is False
 
 
 def test_stored_retrieval_readiness_checks_identity_without_model_call(tmp_path):
@@ -969,7 +1062,12 @@ def test_supervised_extraction_uses_dedicated_connection_and_reports_health(tmp_
         queued = client.request(
             "memory.extraction.enqueue",
             {
-                "transcript": "Avery uses supervised shared memory.",
+                "transcript": [
+                    {
+                        "role": "user",
+                        "content": "Avery uses supervised shared memory.",
+                    }
+                ],
                 "source": "integration_test",
             },
         )
@@ -1008,7 +1106,7 @@ def test_supervised_extraction_uses_dedicated_connection_and_reports_health(tmp_
         assert adapter.calls == 1
 
 
-def test_supervised_extraction_without_evidence_verifier_is_degraded_and_quarantines(
+def test_supervised_extraction_without_evidence_verifier_is_degraded_and_reviewable(
     tmp_path,
 ):
     config = load_config(_config(tmp_path, extraction=_extraction_config()))
@@ -1023,7 +1121,12 @@ def test_supervised_extraction_without_evidence_verifier_is_degraded_and_quarant
         queued = client.request(
             "memory.extraction.enqueue",
             {
-                "transcript": "Avery uses supervised shared memory.",
+                "transcript": [
+                    {
+                        "role": "user",
+                        "content": "Avery uses supervised shared memory.",
+                    }
+                ],
                 "source": "integration_test",
             },
         )
@@ -1032,8 +1135,16 @@ def test_supervised_extraction_without_evidence_verifier_is_degraded_and_quarant
         while time.monotonic() < deadline:
             health = client.request("health")
             queue = health["automatic_llm_extraction"].get("queue", {})
-            if queue.get("dead") == 1:
-                break
+            if (
+                queue.get("pending") == 0
+                and queue.get("processing") == 0
+                and queue.get("dead") == 0
+            ):
+                facts = application.connection.execute(
+                    "SELECT count(*) FROM facts"
+                ).fetchone()[0]
+                if facts:
+                    break
             time.sleep(0.01)
 
         extraction = health["automatic_llm_extraction"]
@@ -1043,8 +1154,14 @@ def test_supervised_extraction_without_evidence_verifier_is_degraded_and_quarant
             "configured": False,
             "verifier_id": "unconfigured",
         }
-        assert extraction["queue"]["dead"] == 1
-        assert application.connection.execute("SELECT count(*) FROM facts").fetchone()[0] == 0
+        assert extraction["queue"]["dead"] == 0
+        row = application.connection.execute(
+            "SELECT content, memory_kind, correction_status, tags FROM facts"
+        ).fetchone()
+        assert row[0] == "Avery uses supervised shared memory."
+        assert row[1] is None
+        assert row[2] == "unreviewed"
+        assert "evidence_unreviewed" in row[3]
 
 
 def test_oversized_extraction_enqueue_is_invalid_params(tmp_path):
@@ -1332,3 +1449,111 @@ def test_extraction_recipe_change_fails_attestation_without_exposing_digest(tmp_
         inspect_config(
             config, extraction_artifact_attestor=FakeArtifactAttestor()
         )
+
+
+def test_json_config_installs_evidence_verifier_end_to_end(tmp_path):
+    extraction = _extraction_config()
+    extraction["evidence_verifier"] = {
+        "import": f"{VerifiedTestEvidence.__module__}:{VerifiedTestEvidence.__qualname__}"
+    }
+    config = load_config(_config(tmp_path, extraction=extraction))
+    with ServerApplication(
+        config,
+        extraction_extractor_factory=lambda _config: FakeExtractionAdapter(),
+        extraction_artifact_attestor=FakeArtifactAttestor(),
+    ) as application:
+        application.extraction_worker.start()
+        application.daemon.start()
+        client = _client(config.socket_path)
+        queued = client.request(
+            "memory.extraction.enqueue",
+            {
+                "transcript": [
+                    {
+                        "role": "user",
+                        "content": "Avery uses supervised shared memory.",
+                    }
+                ],
+                "source": "integration_test",
+            },
+        )
+        assert queued["outcome"] == "queued"
+        deadline = time.monotonic() + 2.0
+        health = None
+        while time.monotonic() < deadline:
+            health = client.request("health")
+            extraction_health = health["automatic_llm_extraction"]
+            queue_health = extraction_health.get("queue", {})
+            if (
+                extraction_health["status"] == "ready"
+                and queue_health.get("pending") == 0
+                and queue_health.get("processing") == 0
+            ):
+                break
+            time.sleep(0.01)
+
+        extraction_health = health["automatic_llm_extraction"]
+        assert health["status"] == "ok"
+        assert extraction_health["status"] == "ready"
+        assert extraction_health["evidence_verifier"] == {
+            "configured": True,
+            "verifier_id": "test-evidence-v1",
+        }
+        row = application.connection.execute(
+            "SELECT content, memory_kind, correction_status, tags FROM facts"
+        ).fetchone()
+        assert row[0] == "Avery uses supervised shared memory."
+        assert row[2] is None
+        assert "evidence_unreviewed" not in (row[3] or "")
+
+
+def test_json_config_accepts_local_evidence_verifier_options(tmp_path):
+    extraction = _extraction_config()
+    extraction["evidence_verifier"] = {
+        "import": "enfold.evidence_verifier:LocalOllamaEvidenceVerifier",
+        "model": "qwen2.5:3b-instruct",
+        "timeout_seconds": 15,
+        "prefilter": True,
+        "endpoint": "http://127.0.0.1:11434/api/chat",
+    }
+    config = load_config(_config(tmp_path, extraction=extraction))
+    verifier = config.extraction.evidence_verifier
+    assert verifier.import_path == "enfold.evidence_verifier:LocalOllamaEvidenceVerifier"
+    assert verifier.model == "qwen2.5:3b-instruct"
+    assert verifier.timeout_seconds == 15.0
+    assert verifier.prefilter is True
+    assert verifier.endpoint == "http://127.0.0.1:11434/api/chat"
+
+
+def test_json_config_rejects_extractor_model_as_evidence_verifier(tmp_path):
+    extraction = _extraction_config()
+    extraction["evidence_verifier"] = {
+        "import": "enfold.evidence_verifier:LocalOllamaEvidenceVerifier",
+        "model": "qwen3:30b",
+    }
+    with pytest.raises(ServerConfigError, match="extractor"):
+        load_config(_config(tmp_path, extraction=extraction))
+
+
+def test_local_evidence_verifier_import_reports_configured_identity(tmp_path):
+    extraction = _extraction_config()
+    extraction["evidence_verifier"] = {
+        "import": "enfold.evidence_verifier:LocalOllamaEvidenceVerifier",
+        "model": "qwen2.5:3b-instruct",
+    }
+    config = load_config(_config(tmp_path, extraction=extraction))
+    with ServerApplication(
+        config,
+        extraction_extractor_factory=lambda _config: FakeExtractionAdapter(),
+        extraction_artifact_attestor=FakeArtifactAttestor(),
+    ) as application:
+        application.extraction_worker.start()
+        application.daemon.start()
+        client = _client(config.socket_path)
+        health = client.request("health")
+        extraction_health = health["automatic_llm_extraction"]
+        assert extraction_health["evidence_verifier"] == {
+            "configured": True,
+            "verifier_id": "enfold-local-nli:qwen2.5:3b-instruct:v1",
+        }
+        assert extraction_health["status"] == "ready"

@@ -1,0 +1,54 @@
+[
+  {
+    "qa": [
+      {
+        "question": "What did Riv study?",
+        "answer": "Local-first databases",
+        "evidence": ["D1:2"],
+        "category": 1
+      },
+      {
+        "question": "When did Riv join the studio?",
+        "answer": "3 May 2023",
+        "evidence": ["D2:1"],
+        "category": 2
+      },
+      {
+        "question": "What did Riv realize after the charity race?",
+        "evidence": ["D1:3"],
+        "category": 5,
+        "adversarial_answer": "self-care is important"
+      }
+    ],
+    "conversation": {
+      "speaker_a": "Riv",
+      "speaker_b": "Nia",
+      "session_1_date_time": "1:56 pm on 8 May, 2023",
+      "session_1": [
+        {
+          "speaker": "Nia",
+          "dia_id": "D1:1",
+          "text": "Hey Riv, what have you been reading?"
+        },
+        {
+          "speaker": "Riv",
+          "dia_id": "D1:2",
+          "text": "I researched local-first databases for the studio."
+        },
+        {
+          "speaker": "Riv",
+          "dia_id": "D1:3",
+          "text": "The charity race last month reminded me to rest."
+        }
+      ],
+      "session_2_date_time": "1:14 pm on 25 May, 2023",
+      "session_2": [
+        {
+          "speaker": "Riv",
+          "dia_id": "D2:1",
+          "text": "I joined the studio on 3 May 2023."
+        }
+      ]
+    }
+  }
+]

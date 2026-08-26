@@ -3,6 +3,12 @@ from __future__ import annotations
 import json
 import sqlite3
 
+import pytest
+
+from enfold.core_store import connect_database
+from enfold.hybrid_retrieval import HybridRetriever
+from enfold.schema import migrate
+
 import memory_eval.baseline as baseline
 from memory_eval.baseline import prepare_eval_db, production_like_config, resolve_cases
 
@@ -12,11 +18,45 @@ def test_production_like_config_points_to_supplied_db_and_disables_mutating_adds
     cfg = production_like_config(db)
 
     assert cfg["db_path"] == str(db)
-    assert cfg["embedding_backend"] == "ollama"
-    assert cfg["ollama_model"] == "embeddinggemma"
-    assert cfg["embedding_prefix_policy"] == "auto"
-    assert cfg["hrr_weight"] == 0.0
+    assert cfg["retriever_mode"] == "stored"
+    assert "embedding_weight" not in cfg
+    assert "hrr_weight" not in cfg
+    assert cfg["fts_weight"] + cfg["jaccard_weight"] + cfg["dense_weight"] == 1.0
     assert cfg["embed_on_add"] is False
+
+
+def test_load_eval_retriever_builds_hybrid_retriever_not_enfold_provider(tmp_path):
+    db = tmp_path / "eval.db"
+    conn = connect_database(db)
+    migrate(conn)
+    conn.execute(
+        "INSERT INTO facts(fact_id, content, category, tags, trust_score, scope, sensitivity, schema_version) "
+        "VALUES (1, 'Avery prefers dark theme', 'user_pref', '', 0.9, 'private', 'normal', 1)"
+    )
+    conn.commit()
+    conn.close()
+
+    config = production_like_config(db)
+    config["retriever_mode"] = "ci"
+    config["allow_nonproduction"] = True
+    provider = baseline.load_eval_retriever(db, config)
+    try:
+        assert isinstance(provider._retriever, HybridRetriever)
+        assert type(provider).__name__ != "EnfoldProvider"
+        rows = provider.search("What is known about prefers dark theme Avery?", limit=5, bump=False)
+        assert isinstance(rows, list)
+    finally:
+        provider.shutdown()
+
+
+def test_load_eval_retriever_stored_mode_refuses_without_production_identities(tmp_path):
+    db = tmp_path / "eval.db"
+    conn = connect_database(db)
+    migrate(conn)
+    conn.close()
+
+    with pytest.raises(RuntimeError, match="will not fall back to EnfoldProvider"):
+        baseline.load_eval_retriever(db, production_like_config(db))
 
 
 def test_resolve_cases_loads_file_instead_of_generating(tmp_path):

@@ -10,9 +10,10 @@ from __future__ import annotations
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
+import hashlib
 import re
 from types import MappingProxyType
-from typing import Callable, Iterable, Iterator, Mapping, Optional
+from typing import Callable, Iterable, Iterator, Mapping, Optional, Sequence
 
 from .provenance import ConnectionContext, WriteRequest
 
@@ -30,14 +31,47 @@ CORRECTION_STATUSES = frozenset(
     {"unreviewed", "human_corrected", "human_confirmed"}
 )
 _PROJECT_SCOPE = re.compile(r"^project:[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_RUN_SCOPE = re.compile(r"^run:[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
 class UnknownMemoryClient(PermissionError):
     """A client without a server-side grant attempted to connect."""
 
 
+def is_run_scope(value: str) -> bool:
+    """True when *value* is a run-scoped private partition."""
+    return bool(_RUN_SCOPE.fullmatch(value))
+
+
+def run_scope_for_session(session_id: str) -> str:
+    """Map a session token onto a valid ``run:`` scope.
+
+    Printable tokens that already match the run vocabulary are used as-is.
+    Anything else is hashed so a write never fails on an exotic session id.
+    """
+    token = session_id.strip()
+    candidate = f"run:{token}"
+    if _RUN_SCOPE.fullmatch(candidate):
+        return candidate
+    digest = hashlib.sha256(token.encode()).hexdigest()[:24]
+    return f"run:{digest}"
+
+
+def scope_authorized(scope: str, access_scopes: Sequence[str]) -> bool:
+    """Return whether a connection may read or write *scope*.
+
+    ``run:*`` is a partition of ``private``.  A client granted ``private``
+    may use any valid run scope without a separate server.json grant.  Run
+    facts stay invisible to default recall because handshake scopes never
+    include ``run:*``.
+    """
+    if scope in access_scopes:
+        return True
+    return is_run_scope(scope) and "private" in access_scopes
+
+
 def validate_scope(value: str) -> str:
-    if value in BASE_SCOPES or _PROJECT_SCOPE.fullmatch(value):
+    if value in BASE_SCOPES or _PROJECT_SCOPE.fullmatch(value) or is_run_scope(value):
         return value
     raise ValueError(f"unsupported memory scope: {value!r}")
 
@@ -104,6 +138,21 @@ _CREDENTIAL_SHAPES = (
     re.compile(r"(?i)\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?)://[^\s:/]+:[^\s/@]+@"),
     re.compile(r"(?i)\b(?:accountkey|sharedaccesssignature|aws_secret_access_key)\s*=\s*[^\s;]{8,}"),
 )
+
+
+def extracted_proposal_credential_decision(
+    content: str, evidence_excerpt: Optional[str] = None
+) -> Optional[PolicyDecision]:
+    """Screen one proposal's own text, never a surrounding transcript."""
+
+    return default_credential_screen(
+        WriteRequest(
+            idempotency_key="extraction-proposal-screen",
+            content=content.strip() or "invalid proposal",
+            source_type="automatic_extraction",
+            evidence_excerpt=evidence_excerpt,
+        )
+    )
 
 
 def default_credential_screen(

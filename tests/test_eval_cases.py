@@ -3,7 +3,14 @@ from __future__ import annotations
 import json
 import sqlite3
 
-from memory_eval.cases import generate_exact_fact_cases, load_cases, write_json_report
+from memory_eval.baseline import resolve_cases
+from memory_eval.cases import (
+    generate_exact_fact_cases,
+    generate_paraphrase_cases,
+    load_cases,
+    split_tune_and_holdout,
+    write_json_report,
+)
 from memory_eval.runner import EvalCase, EvalResult
 
 
@@ -103,6 +110,57 @@ def test_generate_exact_fact_cases_respects_category_filter_and_limit(tmp_path):
 
     assert [c.gold_fact_id for c in cases] == [1, 3]
     assert all(c.category == "user_pref" for c in cases)
+
+
+def test_generate_paraphrase_cases_queries_are_not_gold_content(tmp_path):
+    db = tmp_path / "facts.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE facts (fact_id INTEGER PRIMARY KEY, content TEXT, category TEXT, trust_score REAL)")
+    conn.executemany(
+        "INSERT INTO facts VALUES (?, ?, ?, ?)",
+        [
+            (1, "old low trust", "general", 0.1),
+            (2, "current preference", "user_pref", 0.9),
+            (3, "current project", "project", 0.7),
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+    cases = generate_paraphrase_cases(db, limit=3, min_trust=0.3)
+    contents = {"current preference", "current project"}
+
+    assert [c.gold_fact_id for c in cases] == [2, 3]
+    assert all(c.query not in contents for c in cases)
+    assert all(c.case_type == "paraphrase" for c in cases)
+    assert all(c.query != "" for c in cases)
+
+
+def test_resolve_cases_default_does_not_use_gold_content_as_query(tmp_path):
+    db = tmp_path / "facts.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE facts (fact_id INTEGER PRIMARY KEY, content TEXT, category TEXT, trust_score REAL)")
+    conn.execute("INSERT INTO facts VALUES (2, 'current preference', 'user_pref', 0.9)")
+    conn.commit()
+    conn.close()
+
+    cases = resolve_cases(db_path=db, cases_path=None, sample=1, min_trust=0.3)
+
+    assert cases[0].query != "current preference"
+    assert cases[0].case_type == "paraphrase"
+
+
+def test_split_tune_and_holdout_keeps_disjoint_sets():
+    cases = [
+        EvalCase(id=f"c{i}", query=f"q{i}", gold_fact_id=i)
+        for i in range(1, 6)
+    ]
+
+    tune, holdout = split_tune_and_holdout(cases, holdout_fraction=0.4, seed=7)
+
+    assert tune and holdout
+    assert {c.id for c in tune}.isdisjoint({c.id for c in holdout})
+    assert len(tune) + len(holdout) == 5
 
 
 def test_write_json_report_omits_result_content_by_default(tmp_path):

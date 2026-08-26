@@ -1,9 +1,11 @@
 """Private, offline retrieval benchmark for a snapshot of an Enfold database.
 
 This module deliberately uses :class:`enfold.hybrid_retrieval.HybridRetriever`
-instead of a test-only ranking implementation.  Its default feature-hash
-embedder is deterministic and offline, so a PersonalArena run measures the
-real FTS/Jaccard/dense blend and eligibility filters without loading a model.
+instead of a test-only ranking implementation.  The default Python API still
+uses the deterministic feature-hash embedder so CI stays offline.  Published
+retrieval claims must call ``embedder_mode='production'`` (the CLI default),
+which loads the daemon's stored-embedding path and fails closed when the
+production identity is missing.
 """
 
 from __future__ import annotations
@@ -263,6 +265,28 @@ def _summarize(results: tuple[PersonalResult, ...]) -> dict[str, Any]:
     return summary
 
 
+def _search_personal_cases(
+    search,
+    cases: list[PersonalCase],
+    *,
+    abstention_min_score: float,
+) -> list[PersonalResult]:
+    results: list[PersonalResult] = []
+    for case in cases:
+        rows = search(case.query, category=case.category, limit=3)
+        expected_rank = _expected_rank(case, rows)
+        forbidden_rank = _forbidden_rank(case, rows)
+        confidently_answered = bool(rows) and float(rows[0]["score"]) >= abstention_min_score
+        results.append(PersonalResult(
+            case=case,
+            ranked_fact_ids=tuple(int(row["fact_id"]) for row in rows),
+            expected_rank=expected_rank,
+            forbidden_rank=forbidden_rank,
+            abstained=not confidently_answered,
+        ))
+    return results
+
+
 def run_personal_arena(
     cases_path: str | Path = DEFAULT_CASES_PATH,
     database_path: str | Path = DEFAULT_DB_PATH,
@@ -270,9 +294,19 @@ def run_personal_arena(
     dimensions: int = 256,
     seed: int = 0,
     abstention_min_score: float = 0.35,
+    embedder_mode: str = "hash",
+    embedder_config: dict[str, Any] | None = None,
 ) -> PersonalArenaRun:
-    """Run cases through a temporary snapshot and the production hybrid scorer."""
+    """Run cases through a temporary snapshot and the production hybrid scorer.
 
+    ``embedder_mode='hash'`` is the offline CI plumbing path. It is not a
+    published retrieval claim. ``embedder_mode='production'`` uses the same
+    stored-embedding HybridRetriever the daemon serves and fails closed when
+    identities or coverage are missing.
+    """
+
+    if embedder_mode not in {"hash", "production"}:
+        raise ValueError("embedder_mode must be 'hash' or 'production'")
     if not 0.0 <= abstention_min_score <= 1.0:
         raise ValueError("abstention_min_score must be between 0 and 1")
     cases = list(load_personal_cases(cases_path))
@@ -282,29 +316,39 @@ def run_personal_arena(
         snapshot_database(database_path, snapshot_path)
         conn = sqlite3.connect(snapshot_path)
         conn.row_factory = sqlite3.Row
+        retriever_metadata: dict[str, Any]
         try:
             validate_personal_cases(conn, cases)
-            retriever = HybridRetriever(
-                conn,
-                DeterministicFeatureHashEmbedder(dimensions),
-                allowed_scopes=("private",),
-            )
-            results: list[PersonalResult] = []
-            for case in cases:
-                rows = retriever.search(case.query, category=case.category, limit=3)
-                expected_rank = _expected_rank(case, rows)
-                forbidden_rank = _forbidden_rank(case, rows)
-                confidently_answered = bool(rows) and float(rows[0]["score"]) >= abstention_min_score
-                results.append(PersonalResult(
-                    case=case,
-                    ranked_fact_ids=tuple(int(row["fact_id"]) for row in rows),
-                    expected_rank=expected_rank,
-                    forbidden_rank=forbidden_rank,
-                    abstained=not confidently_answered,
-                ))
+            if embedder_mode == "production":
+                from .baseline import load_eval_retriever, production_like_config
+
+                config = production_like_config(snapshot_path)
+                config["retriever_mode"] = "stored"
+                config["allowed_scopes"] = ["private"]
+                if embedder_config:
+                    config.update(embedder_config)
+                provider = load_eval_retriever(snapshot_path, config)
+                try:
+                    results = _search_personal_cases(
+                        provider.search, cases, abstention_min_score=abstention_min_score,
+                    )
+                    retriever_metadata = dict(provider._retriever.metadata)
+                finally:
+                    provider.shutdown()
+            else:
+                retriever = HybridRetriever(
+                    conn,
+                    DeterministicFeatureHashEmbedder(dimensions),
+                    allowed_scopes=("private",),
+                )
+                results = _search_personal_cases(
+                    retriever.search, cases, abstention_min_score=abstention_min_score,
+                )
+                retriever_metadata = dict(retriever.metadata)
         finally:
             conn.close()
     final_results = tuple(results)
+    production = embedder_mode == "production"
     return PersonalArenaRun(
         final_results,
         _summarize(final_results),
@@ -313,9 +357,21 @@ def run_personal_arena(
             "seed": seed,
             "dimensions": dimensions,
             "abstention_min_score": abstention_min_score,
-            "retrieval": retriever.metadata,
-            "exercised": "active filters, FTS, Jaccard, hybrid weighting, deterministic dense scoring",
-            "not_exercised": "production embedding model quality, stored production vectors, MCP transport",
+            "embedder_mode": embedder_mode,
+            "claimable_retrieval": production and bool(
+                retriever_metadata.get("embedder_production_ready")
+            ),
+            "retrieval": retriever_metadata,
+            "exercised": (
+                "active filters, FTS, Jaccard, hybrid weighting, production stored embeddings"
+                if production
+                else "active filters, FTS, Jaccard, hybrid weighting, deterministic dense scoring"
+            ),
+            "not_exercised": (
+                "MCP transport"
+                if production
+                else "production embedding model quality, stored production vectors, MCP transport"
+            ),
         },
     )
 
@@ -348,10 +404,28 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dimensions", type=int, default=256)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--abstention-min-score", type=float, default=0.35)
+    parser.add_argument(
+        "--embedder",
+        choices=("hash", "production"),
+        default="production",
+        help="production is the published path; hash is offline CI plumbing",
+    )
+    parser.add_argument(
+        "--embedder-config",
+        type=Path,
+        help="JSON file with stored-embedding identities for --embedder production",
+    )
     args = parser.parse_args(argv)
+    embedder_config = None
+    if args.embedder_config is not None:
+        embedder_config = json.loads(args.embedder_config.read_text(encoding="utf-8"))
+        if not isinstance(embedder_config, dict):
+            raise ValueError("embedder config must be a JSON object")
     _print_scorecard(run_personal_arena(
         args.cases, args.db, dimensions=args.dimensions, seed=args.seed,
         abstention_min_score=args.abstention_min_score,
+        embedder_mode=args.embedder,
+        embedder_config=embedder_config,
     ))
     return 0
 

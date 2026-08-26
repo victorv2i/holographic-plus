@@ -10,6 +10,7 @@ import time
 
 import pytest
 
+import enfold.daemon as daemon_module
 from enfold.daemon import (
     DaemonAlreadyRunning,
     DaemonConfig,
@@ -148,6 +149,25 @@ def _config(path: Path, **changes) -> DaemonConfig:
     return DaemonConfig(**values)
 
 
+def _overlong_socket_path(root: Path) -> Path:
+    parent = root
+    while len(os.fsencode(os.fspath(parent / "enfold.sock"))) <= 107:
+        parent = parent / ("pad-" + "x" * 40)
+    parent.mkdir(parents=True, exist_ok=True)
+    return parent / "enfold.sock"
+
+
+def test_bind_rejects_unix_socket_path_that_exceeds_af_unix_limit(tmp_path):
+    path = _overlong_socket_path(tmp_path)
+    encoded = len(os.fsencode(os.fspath(path)))
+    with pytest.raises(SocketPathError, match="AF_UNIX") as caught:
+        UnixJsonDaemon(_config(path), lambda context, request: {}).start()
+    message = str(caught.value)
+    assert str(encoded) in message
+    assert "107" in message
+    assert "--socket-path" in message
+
+
 @pytest.mark.parametrize("timeout", [float("nan"), float("inf"), -float("inf")])
 def test_daemon_config_rejects_non_finite_timeouts(tmp_path, timeout):
     with pytest.raises(ValueError, match="timeouts must be positive"):
@@ -188,6 +208,49 @@ def test_handshake_negotiates_capabilities_and_health_uses_trusted_context(tmp_p
     finally:
         daemon.shutdown()
     assert not path.exists()
+
+
+def test_missing_peer_credentials_are_refused_when_so_peercred_exists(
+    tmp_path, monkeypatch
+):
+    if not hasattr(socket, "SO_PEERCRED"):
+        pytest.skip("SO_PEERCRED is Linux-specific")
+    monkeypatch.setattr(daemon_module, "inspect_peer_credentials", lambda client: None)
+    path = tmp_path / "enfold.sock"
+    daemon = UnixJsonDaemon(_config(path), lambda context, request: {})
+    daemon.start()
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.settimeout(1)
+    try:
+        client.connect(os.fspath(path))
+        assert client.recv(1) == b""
+    finally:
+        client.close()
+        daemon.shutdown()
+
+
+def test_accept_path_caps_concurrent_clients(tmp_path):
+    path = tmp_path / "enfold.sock"
+    daemon = UnixJsonDaemon(
+        _config(path, backlog=1, client_timeout=2.0),
+        lambda context, request: {},
+    )
+    daemon.start()
+    try:
+        first, hello = _connect(path)
+        try:
+            assert hello.accepted
+            second = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            second.settimeout(1)
+            try:
+                second.connect(os.fspath(path))
+                assert second.recv(1) == b""
+            finally:
+                second.close()
+        finally:
+            first.close()
+    finally:
+        daemon.shutdown()
 
 
 def test_linux_peer_credentials_are_kernel_supplied_and_auditable(tmp_path):
@@ -556,6 +619,30 @@ def test_live_socket_and_regular_file_are_never_removed(tmp_path):
     assert regular.read_text() == "do not delete"
 
 
+def test_handler_deadline_fails_the_request_instead_of_running_past_budget(tmp_path):
+    path = tmp_path / "enfold.sock"
+    started = threading.Event()
+
+    def handler(context, request):
+        started.set()
+        time.sleep(0.4)
+        return {"late": True}
+
+    daemon = UnixJsonDaemon(
+        _config(path, client_timeout=2.0, handler_timeout=0.05),
+        handler,
+    )
+    daemon.start()
+    try:
+        response = _request(path, Request("slow-1", "memory.write", {}))
+        assert response.ok is False
+        assert response.error is not None
+        assert response.error.code == "request_timeout"
+        assert started.wait(1.0)
+    finally:
+        daemon.shutdown()
+
+
 def test_idle_client_timeout_is_typed_and_shutdown_is_graceful(tmp_path):
     path = tmp_path / "enfold.sock"
     daemon = UnixJsonDaemon(
@@ -573,3 +660,45 @@ def test_idle_client_timeout_is_typed_and_shutdown_is_graceful(tmp_path):
         client.close()
         daemon.shutdown()
     assert not path.exists()
+
+
+def test_socket_liveness_reports_absent_live_and_stale(tmp_path):
+    path = tmp_path / "enfold.sock"
+    assert daemon_module.socket_liveness(path) == "absent"
+
+    daemon = UnixJsonDaemon(_config(path), lambda context, request: {})
+    daemon.start()
+    try:
+        assert daemon_module.socket_liveness(path) == "live"
+    finally:
+        daemon.shutdown()
+
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(os.fspath(path))
+    listener.close()
+    assert path.exists()
+    assert daemon_module.socket_liveness(path) == "stale"
+    assert daemon_module.remove_stale_socket(path) is True
+    assert not path.exists()
+    assert daemon_module.socket_liveness(path) == "absent"
+
+
+def test_socket_liveness_reports_absent_live_and_stale(tmp_path):
+    path = tmp_path / "enfold.sock"
+    assert daemon_module.socket_liveness(path) == "absent"
+
+    daemon = UnixJsonDaemon(_config(path), lambda context, request: {})
+    daemon.start()
+    try:
+        assert daemon_module.socket_liveness(path) == "live"
+    finally:
+        daemon.shutdown()
+
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(os.fspath(path))
+    listener.close()
+    assert path.exists()
+    assert daemon_module.socket_liveness(path) == "stale"
+    assert daemon_module.remove_stale_socket(path) is True
+    assert not path.exists()
+    assert daemon_module.socket_liveness(path) == "absent"

@@ -1,6 +1,10 @@
 # Enfold 1.0 Implementation and Migration Plan
 
-Status: Draft pending council approval
+Status: Historical design note. Not current product documentation.
+The shipped first-run path is `enfold setup` / `enfold-mcp` as described
+in `README.md` and `docs/BOOTSTRAP.md`.
+
+Original status: Draft pending council approval
 
 ## Safety contract
 

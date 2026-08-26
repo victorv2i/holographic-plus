@@ -293,8 +293,12 @@ def test_dead_rows_skip_the_backoff_wait(make_provider, aux_module, waiter):
     provider._queue_backoff_cap = 60.0
     provider.initialize("test-session")
 
-    provider._extract_queue.enqueue("USER: first doomed transcript")
-    provider._extract_queue.enqueue("USER: second doomed transcript")
+    provider._extract_queue.enqueue(
+        [{"role": "user", "content": "first doomed transcript"}]
+    )
+    provider._extract_queue.enqueue(
+        [{"role": "user", "content": "second doomed transcript"}]
+    )
     provider._queue_wake.set()
 
     assert waiter(lambda: provider._extract_queue.dead_count() == 2)
@@ -322,7 +326,14 @@ def test_in_memory_attempt_bound_when_mark_failed_is_broken(make_provider, aux_m
         raise sqlite3.OperationalError("disk I/O error")
 
     provider._extract_queue.mark_failed = broken_mark_failed
-    provider._extract_queue.enqueue("USER: transcript whose failures cannot be recorded")
+    provider._extract_queue.enqueue(
+        [
+            {
+                "role": "user",
+                "content": "transcript whose failures cannot be recorded",
+            }
+        ]
+    )
     provider._queue_wake.set()
 
     assert waiter(lambda: len(calls) == 2)
@@ -338,7 +349,9 @@ def test_restart_drains_rows_left_by_previous_run(hp, make_provider, aux_module,
     db_path = tmp_path / "facts.db"
     conn = sqlite3.connect(str(db_path), check_same_thread=False)
     queue = hp.extract_queue.ExtractQueue(conn)
-    queue.enqueue("USER: I always use pnpm for node projects.")
+    queue.enqueue(
+        [{"role": "user", "content": "I always use pnpm for node projects."}]
+    )
     conn.close()
 
     aux_module.call_llm = lambda **kwargs: _llm_response(FACTS_JSON)
@@ -425,7 +438,9 @@ def test_shutdown_interrupted_extraction_stays_pending(make_provider, aux_module
 
     aux_module.call_llm = fail_as_if_shutting_down
 
-    row_id = provider._extract_queue.enqueue("USER: transcript cut off by a restart")
+    row_id = provider._extract_queue.enqueue(
+        [{"role": "user", "content": "transcript cut off by a restart"}]
+    )
     provider._drain_extract_queue(stop, provider._extract_queue)
 
     row = provider._extract_queue._conn.execute(

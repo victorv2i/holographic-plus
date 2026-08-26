@@ -1,4 +1,4 @@
-"""Cross-process serialization for multi-step fact writes."""
+"""Legacy MCP sidecar lock for multi-step holographic writes."""
 
 from __future__ import annotations
 
@@ -39,12 +39,16 @@ if hasattr(os, "register_at_fork"):
 
 @contextlib.contextmanager
 def cross_process_write_lock(db_path: str) -> Iterator[None]:
-    """Serialize multi-transaction writes across processes sharing *db_path*.
+    """Serialize legacy MCP/Hermes multi-transaction writes on *db_path*.
 
-    The lock is keyed by the canonical database path and uses a sidecar file
-    next to the database. It is reentrant within the owning thread, so a write
-    path that already holds the sidecar can safely call another helper that
-    also asks for it. Other threads wait for the owner to release it.
+    This sidecar (``.mcp-write.lock``) is taken by the v0 MCP provider and
+    holographic helpers. The v1 daemon does not take it: process exclusion
+    uses ``.enfold.lock`` for the daemon lifetime, and each mutation uses
+    ``BEGIN IMMEDIATE``. Maintenance waits on both sidecars. Do not treat
+    this file as proof that the v1 writer is idle.
+
+    The lock is keyed by the canonical database path and is reentrant
+    within the owning thread. Other threads wait for the owner to release it.
     """
     if fcntl is None:  # pragma: no cover
         yield

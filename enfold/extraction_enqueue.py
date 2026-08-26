@@ -15,15 +15,94 @@ import json
 import sqlite3
 from typing import Any, Mapping
 
+from .extraction_spans import TranscriptInput, normalize_transcript
+from .policy import scope_authorized
 from .provenance import ConnectionContext
 
 
 MAX_EXTRACTION_PAYLOAD_BYTES = 12 * 1024
 _REQUIRED_COLUMNS = frozenset({"id", "payload", "status", "payload_hash"})
+CAPTURE_ENABLED_KEY = "capture.enabled"
+CAPTURE_ALLOW_UNREVIEWED_KEY = "capture.allow_unreviewed"
+CAPTURE_VERIFIER_READY_KEY = "capture.verifier_ready"
 
 
 class ExtractionQueueUnavailable(RuntimeError):
     """The explicitly provisioned durable extraction queue is unavailable."""
+
+
+class CaptureDisabled(RuntimeError):
+    """Session capture is off until an operator opts in."""
+
+
+class CaptureEnableError(ValueError):
+    """Capture was refused because it would hide rows from default recall."""
+
+
+def _meta_value(conn: sqlite3.Connection, key: str) -> str | None:
+    try:
+        row = conn.execute(
+            "SELECT value FROM enfold_meta WHERE key = ?", (key,)
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    return None if row is None else str(row[0])
+
+
+def capture_status(conn: sqlite3.Connection) -> dict[str, bool]:
+    """Report whether session capture is opted in, and whether it can be seen."""
+
+    enabled = _meta_value(conn, CAPTURE_ENABLED_KEY) == "1"
+    allow_unreviewed = _meta_value(conn, CAPTURE_ALLOW_UNREVIEWED_KEY) == "1"
+    verifier_ready = _meta_value(conn, CAPTURE_VERIFIER_READY_KEY) == "1"
+    return {
+        "enabled": enabled,
+        "allow_unreviewed": allow_unreviewed,
+        "verifier_ready": verifier_ready,
+        "visible_to_default_recall": enabled and verifier_ready,
+    }
+
+
+def enable_capture(
+    conn: sqlite3.Connection,
+    *,
+    allow_unreviewed: bool = False,
+    verifier_ready: bool = False,
+) -> dict[str, bool]:
+    """Opt in to session capture. Refuses a silent invisible-row default."""
+
+    if not allow_unreviewed and not verifier_ready:
+        raise CaptureEnableError(
+            "capture enable requires a configured evidence verifier "
+            "(local model). Pass --allow-unreviewed to enqueue anyway; "
+            "those rows stay excluded from default recall until reviewed"
+        )
+    if conn.in_transaction:
+        raise RuntimeError("capture enable must run after commit")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        for key, value in (
+            (CAPTURE_ENABLED_KEY, "1"),
+            (CAPTURE_ALLOW_UNREVIEWED_KEY, "1" if allow_unreviewed else "0"),
+            (CAPTURE_VERIFIER_READY_KEY, "1" if verifier_ready else "0"),
+        ):
+            conn.execute(
+                "INSERT INTO enfold_meta(key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, value),
+            )
+        conn.commit()
+    except sqlite3.OperationalError as exc:
+        if conn.in_transaction:
+            conn.rollback()
+        raise CaptureEnableError(
+            "capture enable requires a schema-v1 store with enfold_meta"
+        ) from exc
+    except BaseException:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+    return capture_status(conn)
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,10 +127,45 @@ class ExtractionEnqueuer:
                 + ", ".join(missing)
             )
 
+    def enqueue_session_capture(
+        self,
+        context: ConnectionContext,
+        transcript: TranscriptInput,
+        *,
+        source: str = "session_capture",
+        scope: str = "private",
+        metadata: Mapping[str, Any] | None = None,
+    ) -> ExtractionEnqueueResult:
+        """Enqueue a session transcript without writing a fact.
+
+        This is the opt-in capture path. It is off until
+        :func:`enable_capture` succeeds. It never inserts facts; the
+        processor still fail-closes unverified proposals out of default
+        recall.
+        """
+
+        status = capture_status(self._conn)
+        if not status["enabled"]:
+            raise CaptureDisabled(
+                "session capture is disabled; run capture enable first"
+            )
+        extra = {
+            "capture": True,
+            "visible_to_default_recall": status["visible_to_default_recall"],
+        }
+        extra.update(dict(metadata or {}))
+        return self.enqueue_after_commit(
+            context,
+            transcript,
+            source=source,
+            scope=scope,
+            metadata=extra,
+        )
+
     def enqueue_after_commit(
         self,
         context: ConnectionContext,
-        transcript: str,
+        transcript: TranscriptInput,
         *,
         source: str,
         scope: str = "private",
@@ -66,16 +180,15 @@ class ExtractionEnqueuer:
 
         if self._conn.in_transaction:
             raise RuntimeError("extraction enqueue must run after commit")
-        transcript = transcript.strip()
+        transcript_text, turns = normalize_transcript(transcript)
         source = source.strip()
         scope = scope.strip()
-        if not transcript or not source or not scope:
+        if not transcript_text or not source or not scope:
             raise ValueError("transcript, source, and scope must be non-empty")
-        if scope not in context.access_scopes:
+        if not scope_authorized(scope, context.access_scopes):
             raise ValueError("extraction scope must be present in context access scopes")
         envelope = {
             "version": 1,
-            "transcript": transcript,
             "source": source,
             "scope": scope,
             "provenance": {
@@ -92,6 +205,10 @@ class ExtractionEnqueuer:
             },
             "metadata": dict(metadata or {}),
         }
+        if turns is None:
+            envelope["transcript"] = transcript_text
+        else:
+            envelope["turns"] = list(turns)
         try:
             payload = json.dumps(
                 envelope,

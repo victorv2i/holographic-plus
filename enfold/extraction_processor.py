@@ -15,6 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import hashlib
 import json
+import logging
 import math
 import sqlite3
 import threading
@@ -22,21 +23,41 @@ import time
 from typing import Any, Callable, Literal, Mapping, Protocol, Sequence
 import uuid
 
-from .extraction_spans import MAX_EVIDENCE_CHARS, transcript_spans
+from .extraction_spans import (
+    MAX_EVIDENCE_CHARS,
+    TranscriptSpan,
+    eligible_transcript_spans,
+    normalize_transcript,
+    transcript_spans,
+)
+from .prompt_safety import ephemeral_extraction_reason
 from .policy import (
     LEGACY_EXTRACTION_CLIENT_ID,
     default_credential_screen,
+    extracted_proposal_credential_decision,
+    scope_authorized,
     validate_scope,
 )
 from .protocol import ClientContext, Request
 from .provenance import WriteRequest
 from .service import EnfoldService
-from .state_slots import StateCandidate, normalize_predicate_key, normalize_subject_key
+from .state_slots import (
+    StateCandidate,
+    canonical_slot_registry,
+    resolve_extracted_predicate_key,
+    resolve_stored_subject_key,
+)
+
+logger = logging.getLogger(__name__)
 
 
 MAX_EXTRACTED_MEMORIES = 32
 AUTOMATIC_TRUST_SCORE = 0.5
-AUTOMATIC_SOURCE_AUTHORITY = 0.5
+AUTOMATIC_SOURCE_AUTHORITY = {
+    "user": 0.5,
+    "assistant": 0.2,
+    "tool": 0.4,
+}
 MIN_TYPED_CONFIDENCE = 0.8
 MAX_RETRY_DELAY_SECONDS = 300.0
 MAX_RETRY_AFTER_SECONDS = 3600.0
@@ -99,6 +120,9 @@ _SAFE_ERROR_CODES = frozenset(
         "proposal_sensitivity_rejected",
         "snapshot_hash_mismatch",
         "write_policy_rejected",
+        "invalid_params",
+        "access_denied",
+        "idempotency_conflict",
     }
 )
 
@@ -171,7 +195,19 @@ class ExtractionEnvelope:
     scope: str
     context: ClientContext
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    turns: tuple[dict[str, str], ...] | None = None
     legacy_payload: bool = False
+
+
+def _envelope_spans(envelope: ExtractionEnvelope) -> tuple[TranscriptSpan, ...]:
+    source = envelope.turns if envelope.turns is not None else envelope.transcript
+    return transcript_spans(source)
+
+
+def _eligible_envelope_spans(
+    envelope: ExtractionEnvelope,
+) -> tuple[TranscriptSpan, ...]:
+    return eligible_transcript_spans(_envelope_spans(envelope))
 
 
 @dataclass(frozen=True, slots=True)
@@ -286,7 +322,12 @@ class ExtractionProcessor:
                 row_id, lease_token, envelope
             )
             if snapshot_json is None:
-                proposals = self._extract_with_heartbeat(envelope, row_id, lease_token)
+                if _eligible_envelope_spans(envelope):
+                    proposals = self._extract_with_heartbeat(
+                        envelope, row_id, lease_token
+                    )
+                else:
+                    proposals = ()
                 snapshot_json, snapshot_hash = self._make_snapshot(proposals, envelope)
                 self._persist_snapshot(
                     row_id, lease_token, snapshot_json, snapshot_hash
@@ -308,24 +349,30 @@ class ExtractionProcessor:
                 for index, params in enumerate(prepared)
             )
             if requests:
-                batch = self._service.handle_write_batch(
-                    envelope.context,
-                    requests,
-                    before_commit=lambda: self._complete_in_transaction(
-                        row_id, lease_token
-                    ),
-                )
-                for response in batch.responses:
-                    if response["outcome"] in {"rejected", "needs_review"}:
-                        raise PermanentExtractionError(
-                            "authoritative write policy rejected extraction",
-                            error_code="write_policy_rejected",
-                        )
-                if not batch.committed:
-                    raise RuntimeError(
-                        "write batch rolled back without policy rejection"
+                pending = list(requests)
+                while pending:
+                    batch = self._service.handle_write_batch(
+                        envelope.context,
+                        tuple(pending),
+                        before_commit=lambda: self._complete_in_transaction(
+                            row_id, lease_token
+                        ),
                     )
-                writes = len(batch.responses)
+                    if batch.committed:
+                        writes = len(batch.responses)
+                        break
+                    survivors = [
+                        request
+                        for request, response in zip(pending, batch.responses)
+                        if response["outcome"] not in {"rejected", "needs_review"}
+                    ]
+                    if len(survivors) == len(pending):
+                        raise RuntimeError(
+                            "write batch rolled back without policy rejection"
+                        )
+                    pending = survivors
+                else:
+                    self._complete(row_id, lease_token)
             else:
                 self._complete(row_id, lease_token)
             return ExtractionProcessResult("completed", row_id, writes, attempts)
@@ -736,7 +783,7 @@ class ExtractionProcessor:
             )
 
         normalized: list[dict[str, Any]] = []
-        spans = transcript_spans(envelope.transcript)
+        spans = _eligible_envelope_spans(envelope)
         for proposal in legacy_proposals:
             if (
                 not isinstance(proposal, dict)
@@ -845,13 +892,26 @@ class ExtractionProcessor:
             context = ClientContext.from_dict(provenance)
             if context.client_id == LEGACY_EXTRACTION_CLIENT_ID:
                 raise ValueError("reserved extraction client id is not permitted")
-            if scope not in context.access_scopes or scope == "secret":
+            if not scope_authorized(scope, context.access_scopes) or scope == "secret":
                 raise ValueError("extraction scope is unauthorized or secret")
-            transcript = str(data["transcript"]).strip()
+            has_transcript = "transcript" in data
+            has_turns = "turns" in data
+            if has_transcript == has_turns:
+                raise ValueError("envelope must contain transcript or turns")
+            transcript, turns = normalize_transcript(
+                data["transcript"] if has_transcript else data["turns"]
+            )
             source = str(data["source"]).strip()
             if not transcript or not source:
                 raise ValueError("transcript and source must be non-empty")
-            return ExtractionEnvelope(transcript, source, scope, context, metadata)
+            return ExtractionEnvelope(
+                transcript,
+                source,
+                scope,
+                context,
+                metadata,
+                turns,
+            )
         except PermanentExtractionError:
             raise
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
@@ -886,6 +946,8 @@ class ExtractionProcessor:
                 "extractor returned too many memories", error_code="proposal_limit"
             )
         normalized: list[dict[str, Any]] = []
+        credential_rejected = False
+        grounding_rejected = False
         for proposal in proposals:
             if not isinstance(proposal, ExtractedMemory):
                 raise PermanentExtractionError(
@@ -931,10 +993,8 @@ class ExtractionProcessor:
                 or len(excerpt) > MAX_EVIDENCE_CHARS
                 or excerpt not in envelope.transcript
             ):
-                raise PermanentExtractionError(
-                    "proposal evidence is not an exact bounded transcript excerpt",
-                    error_code="proposal_grounding_rejected",
-                )
+                grounding_rejected = True
+                continue
             item = {
                 "category": proposal.category.strip(),
                 "content": proposal.content.strip(),
@@ -944,23 +1004,21 @@ class ExtractionProcessor:
             }
             span_id = proposal.metadata.get("evidence_span_id")
             if not isinstance(span_id, str) or not span_id:
-                raise PermanentExtractionError(
-                    "proposal evidence must identify one transcript span",
-                    error_code="proposal_grounding_rejected",
-                )
+                grounding_rejected = True
+                continue
             matching_span = next(
                 (
                     span
-                    for span in transcript_spans(envelope.transcript)
+                    for span in _envelope_spans(envelope)
                     if span.span_id == span_id
                 ),
                 None,
             )
+            if matching_span is not None and matching_span.role != "user":
+                continue
             if matching_span is None or matching_span.text != excerpt:
-                raise PermanentExtractionError(
-                    "proposal evidence span id is invalid",
-                    error_code="proposal_grounding_rejected",
-                )
+                grounding_rejected = True
+                continue
             item["evidence_span_id"] = span_id
             verification = self._evidence_verifier.verify(
                 proposal,
@@ -969,7 +1027,7 @@ class ExtractionProcessor:
             )
             if (
                 not isinstance(verification, EvidenceVerification)
-                or verification.status != "verified"
+                or verification.status not in {"verified", "needs_review"}
             ):
                 raise PermanentExtractionError(
                     "proposal claim support requires review",
@@ -979,15 +1037,51 @@ class ExtractionProcessor:
                 "status": verification.status,
                 "verifier_id": verification.verifier_id,
             }
-            typed = self._normalize_typed_fields(proposal.state, item["content"])
-            if typed is not None:
-                item["typed"] = typed
-            if self._credential_shaped_snapshot_item(item):
-                raise PermanentExtractionError(
-                    "credential-shaped proposal rejected",
-                    error_code="proposal_credential_rejected",
+            if verification.status == "verified":
+                typed = self._normalize_typed_fields(
+                    proposal.state, item["content"], scope=envelope.scope
                 )
+                if typed is not None:
+                    item["typed"] = typed
+                elif proposal.state is not None:
+                    item["typed_demotion"] = {
+                        "reason": "invalid_or_incomplete_typed_fields",
+                    }
+            contract_demotion = proposal.metadata.get("typed_demotion")
+            if contract_demotion is not None:
+                if (
+                    not isinstance(contract_demotion, Mapping)
+                    or set(contract_demotion) != {"reason"}
+                    or contract_demotion.get("reason") != "incomplete_typed_fields"
+                    or proposal.state is not None
+                ):
+                    raise PermanentExtractionError(
+                        "proposal typed demotion is invalid",
+                        error_code="invalid_proposal",
+                    )
+                item["typed_demotion"] = dict(contract_demotion)
+            if self._credential_shaped_snapshot_item(item):
+                credential_rejected = True
+                continue
+            skip_reason = ephemeral_extraction_reason(item["content"])
+            if skip_reason is not None:
+                logger.info(
+                    "extraction: dropped proposal (%s): %r",
+                    skip_reason,
+                    item["content"][:80],
+                )
+                continue
             normalized.append(item)
+        if not normalized and credential_rejected:
+            raise PermanentExtractionError(
+                "credential-shaped proposal rejected",
+                error_code="proposal_credential_rejected",
+            )
+        if not normalized and grounding_rejected:
+            raise PermanentExtractionError(
+                "proposal evidence is not an exact bounded transcript excerpt",
+                error_code="proposal_grounding_rejected",
+            )
         snapshot = {
             "extractor_identity": self._extractor.identity,
             "proposals": normalized,
@@ -1009,13 +1103,17 @@ class ExtractionProcessor:
 
     @staticmethod
     def _credential_shaped_snapshot_item(item: Mapping[str, Any]) -> bool:
+        content = str(item.get("content", "")).strip() or "invalid proposal"
+        excerpt = str(item.get("evidence_excerpt", "")) or None
+        if extracted_proposal_credential_decision(content, excerpt) is not None:
+            return True
         request = WriteRequest(
             idempotency_key="extraction-snapshot-screen",
-            content=str(item.get("content", "")).strip() or "invalid proposal",
+            content=content,
             source_type="automatic_extraction",
             category=str(item.get("category", "general")),
             tags=str(item.get("tags", "")),
-            evidence_excerpt=str(item.get("evidence_excerpt", "")) or None,
+            evidence_excerpt=excerpt,
         )
         encoded = json.dumps(
             item,
@@ -1090,7 +1188,12 @@ class ExtractionProcessor:
                 or not base_fields.issubset(proposal)
                 or set(proposal)
                 - base_fields
-                - {"evidence_span_id", "evidence_verification", "typed"}
+                - {
+                    "evidence_span_id",
+                    "evidence_verification",
+                    "typed",
+                    "typed_demotion",
+                }
             ):
                 raise PermanentExtractionError(
                     "proposal snapshot has unsupported fields",
@@ -1102,6 +1205,7 @@ class ExtractionProcessor:
             excerpt = proposal["evidence_excerpt"]
             sensitivity = proposal["sensitivity"]
             typed = proposal.get("typed")
+            typed_demotion = proposal.get("typed_demotion")
             evidence_span_id = proposal.get("evidence_span_id")
             verification = proposal.get("evidence_verification")
             if (
@@ -1118,6 +1222,14 @@ class ExtractionProcessor:
                     "proposal snapshot contains invalid fields",
                     error_code="invalid_snapshot",
                 )
+            skip_reason = ephemeral_extraction_reason(content)
+            if skip_reason is not None:
+                logger.info(
+                    "extraction: dropped snapshot proposal (%s): %r",
+                    skip_reason,
+                    content[:80],
+                )
+                continue
             if len(excerpt) > MAX_EVIDENCE_CHARS or excerpt not in envelope.transcript:
                 raise PermanentExtractionError(
                     "proposal snapshot evidence is not grounded in the transcript",
@@ -1131,11 +1243,13 @@ class ExtractionProcessor:
             matching_span = next(
                 (
                     span
-                    for span in transcript_spans(envelope.transcript)
+                    for span in _envelope_spans(envelope)
                     if span.span_id == evidence_span_id
                 ),
                 None,
             )
+            if matching_span is not None and matching_span.role != "user":
+                continue
             if matching_span is None or matching_span.text != excerpt:
                 raise PermanentExtractionError(
                     "proposal snapshot evidence span id is invalid",
@@ -1144,7 +1258,7 @@ class ExtractionProcessor:
             if (
                 not isinstance(verification, dict)
                 or set(verification) != {"status", "verifier_id"}
-                or verification.get("status") != "verified"
+                or verification.get("status") not in {"verified", "needs_review"}
                 or not isinstance(verification.get("verifier_id"), str)
                 or not verification["verifier_id"].strip()
             ):
@@ -1152,10 +1266,32 @@ class ExtractionProcessor:
                     "proposal snapshot lacks verified claim support",
                     error_code="proposal_support_unverified",
                 )
-            if typed is not None and not self._is_normalized_typed_fields(typed):
+            if verification["status"] != "verified":
+                typed = None
+            if typed is not None and not self._is_normalized_typed_fields(
+                typed, scope=envelope.scope
+            ):
                 raise PermanentExtractionError(
                     "proposal snapshot contains invalid typed fields",
                     error_code="invalid_snapshot",
+                )
+            if typed_demotion is not None and (
+                not isinstance(typed_demotion, dict)
+                or set(typed_demotion) != {"reason"}
+                or typed_demotion.get("reason")
+                not in {
+                    "incomplete_typed_fields",
+                    "invalid_or_incomplete_typed_fields",
+                }
+                or typed is not None
+            ):
+                raise PermanentExtractionError(
+                    "proposal snapshot contains invalid typed demotion",
+                    error_code="invalid_snapshot",
+                )
+            if verification["status"] != "verified":
+                tags = (
+                    f"{tags},evidence_unreviewed" if tags.strip() else "evidence_unreviewed"
                 )
             metadata = {
                 "extraction_queue_id": row_id,
@@ -1165,6 +1301,11 @@ class ExtractionProcessor:
                 "proposal_snapshot_sha256": proposal_hash,
                 "evidence_verifier": verification["verifier_id"],
             }
+            if verification["status"] != "verified":
+                metadata["evidence_verification"] = {
+                    "status": verification["status"],
+                    "verifier_id": verification["verifier_id"],
+                }
             if typed is not None:
                 metadata.update(
                     {
@@ -1178,6 +1319,8 @@ class ExtractionProcessor:
                         "extraction_typed": typed,
                     }
                 )
+            if typed_demotion is not None:
+                metadata["typed_demotion"] = typed_demotion
             metadata["evidence_span_id"] = evidence_span_id
             try:
                 request = WriteRequest(
@@ -1187,9 +1330,9 @@ class ExtractionProcessor:
                     category=category,
                     tags=tags,
                     trust_score=AUTOMATIC_TRUST_SCORE,
-                    source_authority=AUTOMATIC_SOURCE_AUTHORITY,
-                    observation_content=envelope.transcript,
-                    asserted_by=identity,
+                    source_authority=AUTOMATIC_SOURCE_AUTHORITY[matching_span.role],
+                    observation_content=excerpt,
+                    asserted_by=matching_span.role,
                     observed_at=observed_at,
                     scope=envelope.scope,
                     sensitivity=sensitivity,
@@ -1203,10 +1346,7 @@ class ExtractionProcessor:
                 ) from exc
             decision = default_credential_screen(request)
             if decision is not None:
-                raise PermanentExtractionError(
-                    "credential-shaped proposal rejected",
-                    error_code="proposal_credential_rejected",
-                )
+                continue
             params: dict[str, Any] = {
                 "idempotency_key": request.idempotency_key,
                 "content": request.content,
@@ -1224,6 +1364,8 @@ class ExtractionProcessor:
                 "relation": request.relation,
                 "metadata": metadata,
             }
+            if verification["status"] != "verified":
+                params["correction_status"] = "unreviewed"
             if typed is not None and typed["kind"] == "state":
                 params["state"] = {
                     "subject_key": typed["subject_key"],
@@ -1232,10 +1374,19 @@ class ExtractionProcessor:
                     "valid_from": typed["valid_from"],
                 }
             prepared.append(params)
-        return tuple(prepared)
+        return tuple(self._demote_conflicting_batch_state(prepared))
 
     @staticmethod
-    def _normalize_typed_fields(value: Any, content: str) -> dict[str, Any] | None:
+    def _demote_conflicting_batch_state(
+        prepared: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Leave typed state in place so write_batch can open a real conflict."""
+
+        return prepared
+
+    def _normalize_typed_fields(
+        self, value: Any, content: str, *, scope: str
+    ) -> dict[str, Any] | None:
         """Return a safe typed payload, or abstain without dropping content."""
 
         if value is None or not isinstance(value, Mapping):
@@ -1273,8 +1424,16 @@ class ExtractionProcessor:
         ):
             return None
         try:
-            subject_key = normalize_subject_key(value.get("subject"))
-            predicate_key = normalize_predicate_key(value.get("predicate"))
+            subject_key = resolve_stored_subject_key(
+                self._conn, value.get("subject"), scope=scope
+            )
+            if subject_key is None:
+                return None
+            registry = canonical_slot_registry(self._conn, scope=scope)
+            predicate_key = resolve_extracted_predicate_key(
+                value.get("predicate"),
+                known_predicates=tuple(registry["predicates"]),
+            )
             # Reuse the slot type's timestamp validation rather than maintaining
             # a subtly different parser at the model boundary.
             StateCandidate(
@@ -1296,8 +1455,7 @@ class ExtractionProcessor:
             "valid_from": valid_from.strip() if valid_from is not None else None,
         }
 
-    @staticmethod
-    def _is_normalized_typed_fields(value: Any) -> bool:
+    def _is_normalized_typed_fields(self, value: Any, *, scope: str) -> bool:
         if not isinstance(value, dict) or set(value) != {
             "confidence",
             "kind",
@@ -1308,7 +1466,7 @@ class ExtractionProcessor:
             "valid_from",
         }:
             return False
-        normalized = ExtractionProcessor._normalize_typed_fields(
+        normalized = self._normalize_typed_fields(
             {
                 "confidence": value["confidence"],
                 "kind": value["kind"],
@@ -1319,6 +1477,7 @@ class ExtractionProcessor:
                 "valid_from": value["valid_from"],
             },
             "snapshot validation",
+            scope=scope,
         )
         return normalized == value
 
@@ -1326,7 +1485,14 @@ class ExtractionProcessor:
     def _safe_error_code(exc: BaseException | str) -> str:
         """Return an allowlisted operational code, never adapter/model text."""
 
-        candidate = exc if isinstance(exc, str) else getattr(exc, "error_code", None)
-        if isinstance(candidate, str) and candidate in _SAFE_ERROR_CODES:
-            return candidate
+        if isinstance(exc, str):
+            candidates = (exc,)
+        else:
+            candidates = (
+                getattr(exc, "error_code", None),
+                getattr(exc, "code", None),
+            )
+        for candidate in candidates:
+            if isinstance(candidate, str) and candidate in _SAFE_ERROR_CODES:
+                return candidate
         return "extractor_failed"

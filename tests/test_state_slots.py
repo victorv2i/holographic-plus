@@ -10,8 +10,11 @@ from enfold.state_slots import (
     current_state_facts,
     decide_state_write,
     ensure_state_slot_schema,
+    list_conflict_receipts,
+    list_needs_review,
     list_state_conflicts,
     open_state_conflict,
+    record_needs_review,
     resolve_state_conflict,
 )
 
@@ -273,8 +276,15 @@ def test_conflict_lifecycle_is_visible_and_resolution_is_audited():
     ).fetchone()
     assert audit == (new_id, "avery", "confirmed from inspected config")
     assert conn.execute(
-        "SELECT superseded_by FROM facts WHERE fact_id = ?", (old_id,)
-    ).fetchone()[0] == new_id
+        "SELECT superseded_by, invalid_at, expired_at, valid_to "
+        "FROM facts WHERE fact_id = ?",
+        (old_id,),
+    ).fetchone() == (
+        new_id,
+        "2026-07-11T13:00:00Z",
+        "2026-07-11T13:00:00Z",
+        "2026-07-11T00:00:00Z",
+    )
 
 
 def test_unique_projection_rejects_two_nonconflicted_current_values():
@@ -309,4 +319,47 @@ def test_conflict_listing_is_bounded_and_supports_sql_pagination():
     assert tuple(record.conflict_id for record in page) == (
         "conflict-200",
         "conflict-201",
+    )
+
+
+def test_needs_review_queue_is_listable_and_paginated():
+    conn = _connection()
+    ensure_state_slot_schema(conn)
+    first = record_needs_review(
+        conn,
+        scope="private",
+        reason="client is not authorized to assert human correction",
+        content="briefing uses Terra",
+        subject_key="cron:briefing",
+        predicate_key="model",
+    )
+    second = record_needs_review(
+        conn,
+        scope="private",
+        reason="target is protected by human correction",
+        content="briefing uses Grok",
+    )
+
+    listed = list_needs_review(conn)
+    assert [item.review_id for item in listed] == [first.review_id, second.review_id]
+    assert listed[0].reason == first.reason
+    assert listed[0].subject_key == "cron:briefing"
+    page = list_needs_review(conn, limit=1, offset=1)
+    assert [item.review_id for item in page] == [second.review_id]
+
+
+def test_conflict_receipts_name_the_unsettled_slot():
+    conn = _connection()
+    ensure_state_slot_schema(conn)
+    old_id = _insert_state(conn, "Uses v1")
+    open_state_conflict(conn, "cron:briefing", "model", (old_id,))
+
+    receipts = list_conflict_receipts(conn)
+    assert len(receipts) == 1
+    assert receipts[0].subject_key == "cron:briefing"
+    assert receipts[0].predicate_key == "model"
+    assert old_id in receipts[0].member_fact_ids
+    assert receipts[0].summary == (
+        f"[conflict:{receipts[0].conflict_id} slot:cron:briefing.model "
+        "members:1 - do not treat either as current]"
     )

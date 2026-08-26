@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import json
 import os
 from pathlib import Path
 import re
@@ -233,6 +234,130 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         server = build_server(config)
     except RuntimeError as exc:
+        print(f"enfold MCP launcher startup failed: {exc}", file=sys.stderr)
+        return 2
+    server.run(transport="stdio")
+    return 0
+
+
+def product_main(argv: Sequence[str] | None = None) -> int:
+    """Create or reuse the local store, ensure the daemon, then serve MCP."""
+
+    from .bootstrap import BootstrapError, default_config_dir, default_data_dir
+    from .setup_cli import (
+        SetupError,
+        prepare_stdio_session,
+        registered_client_surface,
+        run_protocol_smoke,
+    )
+
+    parser = argparse.ArgumentParser(
+        prog="enfold-mcp",
+        description=(
+            "Start or attach to the per-user Enfold daemon and serve MCP on stdio."
+        ),
+    )
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="write and recall one fact through the daemon, then exit",
+    )
+    parser.add_argument("--config-dir", type=Path, default=default_config_dir())
+    parser.add_argument("--data-dir", type=Path, default=default_data_dir())
+    parser.add_argument("--socket-path")
+    parser.add_argument("--client-id")
+    parser.add_argument("--surface")
+    parser.add_argument("--agent-id")
+    parser.add_argument(
+        "--access-scope",
+        action="append",
+        dest="access_scopes",
+        metavar="SCOPE",
+    )
+    parser.add_argument("--session-id")
+    parser.add_argument("--connect-timeout", type=float, default=2.0)
+    parser.add_argument("--request-timeout", type=float, default=5.0)
+    args = parser.parse_args(argv)
+    try:
+        report, token, daemon_state, created = prepare_stdio_session(
+            config_dir=args.config_dir,
+            data_dir=args.data_dir,
+            client_id=args.client_id,
+        )
+    except (BootstrapError, SetupError) as exc:
+        print(f"enfold-mcp: {exc}", file=sys.stderr)
+        return 2
+
+    client_id = args.client_id or report.owner_client_id
+    surface = args.surface or registered_client_surface(
+        client_id,
+        config_dir=args.config_dir,
+        database_path=report.database_path,
+    ) or "enfold-mcp"
+    agent_id = args.agent_id or "enfold-mcp"
+    scopes = tuple(args.access_scopes) if args.access_scopes else ("private",)
+    socket_path = (
+        Path(args.socket_path).expanduser() if args.socket_path else report.socket_path
+    )
+    credential = os.environ.get("ENFOLD_CLIENT_CREDENTIAL")
+    if not credential:
+        if args.client_id and not created:
+            print(
+                "enfold-mcp: no client credential is available; run enfold setup "
+                "or set ENFOLD_CLIENT_CREDENTIAL in the supervisor environment",
+                file=sys.stderr,
+            )
+            return 2
+        credential = token
+    if args.self_test:
+        try:
+            smoke = run_protocol_smoke(
+                socket_path=socket_path,
+                client_id=client_id,
+                surface=surface,
+                agent_id=agent_id,
+                credential=credential,
+            )
+        except Exception as exc:
+            print(f"enfold-mcp: {exc}", file=sys.stderr)
+            return 2
+        print(
+            json.dumps(
+                {
+                    "daemon": daemon_state,
+                    "fact_id": smoke["fact_id"],
+                    "ok": True,
+                    "socket_path": str(socket_path),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+        return 0
+
+    provenance = discover_provenance()
+    try:
+        context = ClientContext(
+            client_id=client_id,
+            surface=surface,
+            agent_id=agent_id,
+            session_id=args.session_id or new_session_id(surface),
+            project_root=provenance.project_root,
+            repository=provenance.repository,
+            branch=provenance.branch,
+            commit_sha=provenance.commit_sha,
+            access_scopes=scopes,
+        )
+        config = ClientConfig(
+            socket_path=socket_path,
+            context=context,
+            capabilities=MEMORY_CAPABILITIES,
+            connect_timeout=args.connect_timeout,
+            request_timeout=args.request_timeout,
+            credential=credential,
+        )
+        server = build_server(config)
+    except (TypeError, ValueError, RuntimeError) as exc:
         print(f"enfold MCP launcher startup failed: {exc}", file=sys.stderr)
         return 2
     server.run(transport="stdio")

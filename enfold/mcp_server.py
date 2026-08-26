@@ -1,4 +1,12 @@
-"""Stdio MCP server exposing enfold as a shared-memory tool set.
+"""Hermes compatibility extra: legacy v0 holographic MCP server.
+
+This is not the public Enfold contract. The public server is
+``enfold-memory`` via ``enfold.mcp_stdio`` / ``enfold-mcp-launch``
+(default profile ``core``: memory_recall, memory_remember, memory_inspect).
+
+This module opens SQLite itself, has no grants or ``include_unreviewed``
+flag, and refuses schema v1 (``mcp_provider.py``). Existing file-path
+launch still works for owners who already wired Hermes to this extra.
 
 Lets other coding agents read and write the same
 fact store the Hermes gateway uses in-process, over the Model Context
@@ -100,11 +108,18 @@ try:
 except ImportError as exc:  # pragma: no cover - exercised only without the dep
     raise ImportError(
         "The 'mcp' package is required to run the enfold MCP server "
-        "(pip install mcp). It is an optional dependency of this repo, only "
-        "needed for mcp_server.py / mcp_provider.py, not for the Hermes plugin "
-        "itself."
+        "(pip install 'mcp>=1.28.1,<2'). It is a required dependency of this "
+        "repo, needed for mcp_server.py / mcp_provider.py, not for the Hermes "
+        "plugin itself."
     ) from exc
 
+
+PUBLIC_SERVER_NAME = "enfold-memory-legacy"
+DEPRECATION_WARNING = (
+    "enfold.mcp_server is a Hermes compatibility extra and is not the public "
+    "Enfold contract. Use enfold-mcp-launch / enfold.mcp_stdio (default "
+    "profile: core). Existing file-path launch still works."
+)
 
 SOURCE_ID_RE = re.compile(r"^[a-z][a-z0-9._-]{0,63}$")
 MAX_CONTENT_CHARS = 16_000
@@ -292,6 +307,23 @@ def _replacement_fact_is_distinct_and_active(
     )
 
 
+def _heuristic_supersede_forbidden(provider, fact_id: int) -> bool:
+    store = getattr(provider, "_store", None)
+    conn = getattr(store, "_conn", None)
+    if conn is None:
+        return False
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(facts)")}
+    memory_expr = "memory_kind" if "memory_kind" in columns else "NULL"
+    conflict_expr = "conflict_group" if "conflict_group" in columns else "NULL"
+    row = conn.execute(
+        f"SELECT {memory_expr}, {conflict_expr} FROM facts WHERE fact_id = ?",
+        (fact_id,),
+    ).fetchone()
+    if row is None:
+        return False
+    return row[0] == "state" or row[1] is not None
+
+
 def _supersede_with_rowcount(provider, old_fact_id: int, new_fact_id: int) -> bool:
     if not _replacement_fact_is_distinct_and_active(
         provider, old_fact_id, new_fact_id
@@ -327,7 +359,7 @@ def build_server(provider, read_only: bool = False) -> "FastMCP":
     When *read_only* is true, memory_add and memory_supersede are never
     registered at all.
     """
-    server = FastMCP("enfold-memory")
+    server = FastMCP(PUBLIC_SERVER_NAME)
     db_path = str(Path(provider._store.db_path).expanduser().resolve())
 
     @server.tool()
@@ -410,6 +442,10 @@ def build_server(provider, read_only: bool = False) -> "FastMCP":
             old_fact_id = (
                 int(update_target["fact_id"]) if update_target is not None else None
             )
+            if old_fact_id is not None and _heuristic_supersede_forbidden(
+                provider, old_fact_id
+            ):
+                old_fact_id = None
 
             def _insert() -> tuple[int, bool]:
                 row = provider._store._conn.execute(
@@ -454,7 +490,11 @@ def build_server(provider, read_only: bool = False) -> "FastMCP":
                 return {"fact_id": fact_id, "status": "deduplicated"}
             provider._embed_cb(fact_id, content)
 
-            return {"fact_id": fact_id, "status": "added"}
+            result = {"fact_id": fact_id, "status": "added"}
+            if old_fact_id is not None:
+                result["superseded"] = old_fact_id
+                result["supersede_via"] = "value_update"
+            return result
 
         with _cross_process_write_lock(db_path):
             return _retry_on_locked(_do_add)
@@ -571,6 +611,7 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    print(DEPRECATION_WARNING, file=sys.stderr)
     args = _parse_args(argv)
 
     db_path = args.db_path

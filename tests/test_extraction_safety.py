@@ -34,7 +34,9 @@ def _setup(tmp_path):
         conn, MemoryPolicy({"hermes-install": ("private", "work")})
     )
     ExtractionEnqueuer(conn).enqueue_after_commit(
-        context, "Avery uses durable shared memory.", source="session_end"
+        context,
+        [{"role": "user", "content": "Avery uses durable shared memory."}],
+        source="session_end",
     )
     return conn, context, service
 

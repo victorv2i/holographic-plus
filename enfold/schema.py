@@ -27,6 +27,10 @@ class SchemaTooNewError(SchemaError):
     """Raised when a database was created by a newer Enfold release."""
 
 
+class SchemaNeedsMigrationError(SchemaError):
+    """Raised when a ledger is readable but missing required writer patches."""
+
+
 class SchemaLedgerError(SchemaError):
     """Raised when the two version records disagree or are malformed."""
 
@@ -583,10 +587,13 @@ def _migration_001_complete_schema(conn: sqlite3.Connection) -> None:
         ("valid_from", "TIMESTAMP"),
         ("invalid_at", "TIMESTAMP"),
         ("superseded_by", "INTEGER"),
+        ("valid_to", "TIMESTAMP"),
+        ("expired_at", "TIMESTAMP"),
     ):
         if name not in columns:
             conn.execute(f"ALTER TABLE facts ADD COLUMN {name} {column_type}")
             columns.add(name)
+    _backfill_bitemporal_axes(conn)
 
     if not ensure_state_slot_schema(conn):
         raise MigrationError(
@@ -629,6 +636,122 @@ def _migration_001_complete_schema(conn: sqlite3.Connection) -> None:
 MIGRATIONS: Mapping[int, Migration] = {
     1: Migration(1, "complete_standalone_schema", _migration_001_complete_schema),
 }
+
+
+def _ensure_bitemporal_columns(conn: sqlite3.Connection) -> None:
+    """Add valid-time end and transaction-time end without rewriting rows."""
+
+    if not _table_exists(conn, "facts"):
+        return
+    columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(facts)")}
+    for name in ("valid_to", "expired_at"):
+        if name not in columns:
+            conn.execute(f"ALTER TABLE facts ADD COLUMN {name} TIMESTAMP")
+
+
+def _backfill_bitemporal_axes(conn: sqlite3.Connection) -> None:
+    """Copy known clocks only. Never invent a world-time end."""
+
+    columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(facts)")}
+    if not {"invalid_at", "superseded_by", "valid_to", "expired_at"}.issubset(columns):
+        return
+    conn.execute(
+        """
+        UPDATE facts
+        SET expired_at = invalid_at
+        WHERE superseded_by IS NOT NULL
+          AND expired_at IS NULL
+          AND invalid_at IS NOT NULL
+        """
+    )
+    conn.execute(
+        """
+        UPDATE facts
+        SET valid_to = (
+            SELECT successor.valid_from
+            FROM facts AS successor
+            WHERE successor.fact_id = facts.superseded_by
+        )
+        WHERE superseded_by IS NOT NULL
+          AND valid_to IS NULL
+          AND EXISTS (
+              SELECT 1
+              FROM facts AS successor
+              WHERE successor.fact_id = facts.superseded_by
+                AND successor.valid_from IS NOT NULL
+          )
+        """
+    )
+
+
+def _missing_bitemporal_columns(conn: sqlite3.Connection) -> bool:
+    """Whether ``facts`` cannot store both bitemporal end clocks."""
+
+    if not _table_exists(conn, "facts"):
+        return False
+    columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(facts)")}
+    return not {"valid_to", "expired_at"}.issubset(columns)
+
+
+def _needs_bitemporal_patch(conn: sqlite3.Connection) -> bool:
+    """Whether a v1 store still lacks the additive bitemporal axes."""
+
+    if _missing_bitemporal_columns(conn):
+        return True
+    pending_tx = conn.execute(
+        """
+        SELECT 1 FROM facts
+        WHERE superseded_by IS NOT NULL
+          AND invalid_at IS NOT NULL
+          AND expired_at IS NULL
+        LIMIT 1
+        """
+    ).fetchone()
+    if pending_tx is not None:
+        return True
+    pending_world = conn.execute(
+        """
+        SELECT 1 FROM facts
+        WHERE superseded_by IS NOT NULL
+          AND valid_to IS NULL
+          AND EXISTS (
+              SELECT 1
+              FROM facts AS successor
+              WHERE successor.fact_id = facts.superseded_by
+                AND successor.valid_from IS NOT NULL
+          )
+        LIMIT 1
+        """
+    ).fetchone()
+    return pending_world is not None
+
+
+def _apply_bitemporal_patch(conn: sqlite3.Connection) -> None:
+    """Atomically add bitemporal columns and backfill from known clocks."""
+
+    if not _needs_bitemporal_patch(conn):
+        return
+    foreign_keys_enabled = bool(conn.execute("PRAGMA foreign_keys").fetchone()[0])
+    try:
+        if foreign_keys_enabled:
+            conn.execute("PRAGMA foreign_keys=OFF")
+        conn.execute("BEGIN IMMEDIATE")
+        _ensure_bitemporal_columns(conn)
+        _backfill_bitemporal_axes(conn)
+        violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            raise MigrationError(
+                f"bitemporal patch left {len(violations)} foreign-key violation(s)"
+            )
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        if isinstance(exc, SchemaError):
+            raise
+        raise MigrationError("bitemporal axis patch failed") from exc
+    finally:
+        if foreign_keys_enabled:
+            conn.execute("PRAGMA foreign_keys=ON")
 
 
 def _needs_extraction_queue_patch(conn: sqlite3.Connection) -> bool:
@@ -751,15 +874,33 @@ def schema_version(conn: sqlite3.Connection) -> int:
 
 
 def require_compatible_schema(
-    conn: sqlite3.Connection, *, supported_version: int = SUPPORTED_SCHEMA_VERSION
+    conn: sqlite3.Connection,
+    *,
+    supported_version: int = SUPPORTED_SCHEMA_VERSION,
+    for_writer: bool = False,
 ) -> int:
-    """Fail closed if ``conn`` uses a schema newer than this code supports."""
+    """Fail closed if ``conn`` uses a schema newer than this code supports.
+
+    ``for_writer=True`` also refuses a v1 ledger that is missing the
+    extraction-queue snapshot columns or has a pending bitemporal patch.
+    Those patches stay outside the immutable v1 shape so an unpatched file
+    remains readable; a writer must run an explicit ``migrate`` first rather
+    than accept a write before existing rows are fully backfilled.
+    """
 
     version = schema_version(conn)
     if version > supported_version:
         raise SchemaTooNewError(
             f"database schema {version} is newer than supported schema "
             f"{supported_version}; upgrade Enfold before opening this database"
+        )
+    if for_writer and version >= 1 and (
+        _needs_extraction_queue_patch(conn) or _needs_bitemporal_patch(conn)
+    ):
+        raise SchemaNeedsMigrationError(
+            "database is missing required writer patches; "
+            "run python -m enfold.ops migrate before opening this database "
+            "as a writer"
         )
     return version
 
@@ -835,6 +976,7 @@ def migrate(
     # it for automatic writes.
     if target_version >= 1:
         _apply_extraction_queue_patch(conn)
+        _apply_bitemporal_patch(conn)
         _apply_state_slot_patch(conn)
     return schema_version(conn)
 

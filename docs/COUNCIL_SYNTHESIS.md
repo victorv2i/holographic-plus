@@ -1,7 +1,9 @@
 # Architecture Review Synthesis
 
+Status: Historical design note. Not current product documentation.
+
 Date: 2026-07-11
-Status: Approved direction with required revisions
+Original status: Approved direction with required revisions
 
 Three read-only council seats reviewed the Enfold repository and draft 1.0
 specification: architecture, product/evaluation/privacy, and implementation

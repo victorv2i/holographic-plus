@@ -28,10 +28,11 @@ supersession going forward.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import sqlite3
 import logging
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Mapping
 
 # Keep this module importable before package __init__ has finished executing.
 # Hermes' user-plugin loader preloads sibling .py files, so importing token
@@ -152,6 +153,8 @@ def ensure_temporal_schema(conn: sqlite3.Connection) -> None:
         ("valid_from", "TIMESTAMP"),
         ("invalid_at", "TIMESTAMP"),
         ("superseded_by", "INTEGER"),
+        ("valid_to", "TIMESTAMP"),
+        ("expired_at", "TIMESTAMP"),
     ):
         if column in cols:
             continue
@@ -208,27 +211,68 @@ def find_value_update_target(
     for candidate in candidates:
         if candidate.get("superseded_by"):
             continue
+        if candidate.get("memory_kind") == "state" or candidate.get("conflict_group"):
+            continue
         if _is_value_update(content, candidate.get("content", "")):
             return candidate
     return None
 
 
+def _protected_from_heuristic_supersede(
+    conn: sqlite3.Connection, fact_id: int
+) -> bool:
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(facts)")}
+    memory_expr = "memory_kind" if "memory_kind" in columns else "NULL"
+    conflict_expr = "conflict_group" if "conflict_group" in columns else "NULL"
+    row = conn.execute(
+        f"SELECT {memory_expr}, {conflict_expr} FROM facts WHERE fact_id = ?",
+        (fact_id,),
+    ).fetchone()
+    if row is None:
+        return False
+    return row[0] == "state" or row[1] is not None
+
+
 def supersede(conn: sqlite3.Connection, old_fact_id: int, new_fact_id: int) -> bool:
     """Mark *old_fact_id* invalid, superseded by *new_fact_id*.
 
-    Returns True when the old row was invalidated. Returns False when the old
-    fact does not exist or is already superseded.
+    Does not commit: the caller owns the transaction. Returns True when the
+    old row was invalidated. Returns False when the old fact does not exist,
+    is already superseded, or is typed state / an open conflict member.
     """
+    if _protected_from_heuristic_supersede(conn, old_fact_id):
+        logger.debug(
+            "temporal: refuse supersede of typed or conflicted fact "
+            "old_fact_id=%s new_fact_id=%s",
+            old_fact_id,
+            new_fact_id,
+        )
+        return False
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(facts)")}
+    assignments = ["invalid_at = CURRENT_TIMESTAMP", "superseded_by = ?"]
+    values: list[Any] = [new_fact_id]
+    if "expired_at" in columns:
+        assignments.append("expired_at = CURRENT_TIMESTAMP")
+    successor_from = None
+    if "valid_from" in columns:
+        successor = conn.execute(
+            "SELECT valid_from FROM facts WHERE fact_id = ?",
+            (new_fact_id,),
+        ).fetchone()
+        if successor is not None:
+            successor_from = successor[0]
+    if successor_from is not None and "valid_to" in columns:
+        assignments.append("valid_to = COALESCE(valid_to, ?)")
+        values.append(successor_from)
+    values.append(old_fact_id)
     cur = conn.execute(
-        """
+        f"""
         UPDATE facts
-           SET invalid_at = CURRENT_TIMESTAMP,
-               superseded_by = ?
+           SET {", ".join(assignments)}
          WHERE fact_id = ? AND invalid_at IS NULL
         """,
-        (new_fact_id, old_fact_id),
+        values,
     )
-    conn.commit()
     updated = int(cur.rowcount) == 1
     if not updated:
         logger.debug(
@@ -295,3 +339,74 @@ def fact_history(conn: sqlite3.Connection, fact_id: int) -> List[Dict[str, Any]]
                 changed = True
 
     return sorted(chain.values(), key=lambda f: (f.get("created_at") or "", f["fact_id"]))
+
+
+def _parse_clock(value: Optional[str]) -> Optional[datetime]:
+    if value is None:
+        return None
+    candidate = str(value).strip()
+    if not candidate:
+        return None
+    if candidate.endswith("Z"):
+        candidate = candidate[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError:
+        candidate = candidate.replace(" ", "T", 1)
+        try:
+            parsed = datetime.fromisoformat(candidate)
+        except ValueError:
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def row_matches_as_of(
+    row: Mapping[str, Any],
+    *,
+    as_of_valid: Optional[str] = None,
+    as_of_tx: Optional[str] = None,
+) -> bool:
+    """Apply independent valid-time and transaction-time as-of predicates."""
+
+    if as_of_valid is not None:
+        point = _parse_clock(as_of_valid)
+        if point is None:
+            return False
+        start = _parse_clock(row.get("valid_from"))
+        end = _parse_clock(row.get("valid_to"))
+        if start is not None and start > point:
+            return False
+        if (
+            end is None
+            and as_of_tx is None
+            and (
+                row.get("invalid_at") is not None
+                or row.get("superseded_by") is not None
+            )
+        ):
+            end = _parse_clock(row.get("invalid_at"))
+            if end is None:
+                return False
+        if end is not None and end <= point:
+            return False
+        if as_of_tx is None and row.get("expired_at") is not None:
+            return False
+    if as_of_tx is not None:
+        point = _parse_clock(as_of_tx)
+        if point is None:
+            return False
+        created = _parse_clock(row.get("created_at"))
+        expired = _parse_clock(row.get("expired_at"))
+        if (
+            expired is None
+            and row.get("superseded_by") is not None
+            and row.get("valid_to") is None
+        ):
+            expired = _parse_clock(row.get("invalid_at"))
+        if created is not None and created > point:
+            return False
+        if expired is not None and expired <= point:
+            return False
+    return True

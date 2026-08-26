@@ -4,15 +4,23 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "enfold"
-version = "0.8.0"
+version = "0.8.1"
 description = "Local-first shared memory over MCP, with SQLite provenance and optional extraction."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
-dependencies = ["numpy"]
+license-files = ["LICENSE"]
+dependencies = ["numpy", "mcp>=1.28.1,<2"]
+
+[project.urls]
+Homepage = "https://github.com/victorv2i/enfold"
+Repository = "https://github.com/victorv2i/enfold"
+Issues = "https://github.com/victorv2i/enfold/issues"
+Changelog = "https://github.com/victorv2i/enfold/blob/main/CHANGELOG.md"
 
 [project.scripts]
 enfold = "enfold.bootstrap:main"
+enfold-mcp = "enfold.mcp_launcher:product_main"
 enfold-mcp-proxy = "enfold.mcp_stdio:main"
 enfold-mcp-launch = "enfold.mcp_launcher:main"
 enfold-ollama-extractor = "enfold.ollama_extractor_child:main"
@@ -21,10 +29,9 @@ enfold-activation = "enfold.activation:main"
 enfold-server = "enfold.server:main"
 
 [project.optional-dependencies]
-mcp = ["mcp"]
 fastembed = ["fastembed"]
 sqlite-vec = ["sqlite-vec==0.1.9"]
-test = ["pytest", "mcp", "build==1.3.0"]
+test = ["pytest", "mcp>=1.28.1,<2", "build==1.3.0", "sqlite-vec==0.1.9"]
 
 [tool.setuptools]
 packages = ["enfold", "memory_eval", "memory_eval.fixtures"]

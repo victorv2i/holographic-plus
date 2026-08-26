@@ -23,7 +23,11 @@ from enfold.write_service import (
 def _connection(*, temporal: bool = True) -> sqlite3.Connection:
     conn = sqlite3.connect(":memory:")
     conn.execute("PRAGMA foreign_keys = ON")
-    temporal_sql = ", invalid_at TEXT, superseded_by INTEGER" if temporal else ""
+    temporal_sql = (
+        ", invalid_at TEXT, expired_at TEXT, superseded_by INTEGER"
+        if temporal
+        else ""
+    )
     conn.execute(
         f"""CREATE TABLE facts (
             fact_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -418,6 +422,30 @@ def test_write_scope_must_be_granted_by_connection_context():
     assert conn.execute("SELECT count(*) FROM observations").fetchone()[0] == 0
 
 
+def test_run_scope_write_is_authorized_by_private_grant():
+    conn = _connection()
+
+    outcome = _service(conn).write(
+        _context(access_scopes=("private",)),
+        _request(scope="run:child-session"),
+    )
+
+    assert outcome.outcome == "inserted"
+    assert conn.execute("SELECT scope FROM facts").fetchone()[0] == "run:child-session"
+
+
+def test_run_scope_write_is_rejected_without_private_grant():
+    conn = _connection()
+
+    outcome = _service(conn).write(
+        _context(access_scopes=("work",)),
+        _request(scope="run:child-session"),
+    )
+
+    assert outcome.outcome == "rejected"
+    assert conn.execute("SELECT count(*) FROM facts").fetchone()[0] == 0
+
+
 def test_fact_writer_cannot_persist_a_different_scope():
     conn = _connection()
 
@@ -675,6 +703,68 @@ def test_near_dedup_preserves_a_human_corrected_candidate():
     conn.rollback()
 
 
+def test_near_dedup_preserves_a_human_confirmed_candidate():
+    conn = _connection()
+    confirmed_id = conn.execute(
+        """INSERT INTO facts (
+               content, trust_score, source_authority, correction_status
+           ) VALUES ('Avery uses Enfold locally.', 0.1, 0.1, 'human_confirmed')"""
+    ).lastrowid
+    inserted_id = conn.execute(
+        """INSERT INTO facts (content, trust_score, source_authority)
+           VALUES ('Avery uses Enfold on this machine.', 0.9, 1.0)"""
+    ).lastrowid
+    conn.commit()
+
+    result, _enqueue = _service(conn)._merge_near_duplicate(
+        FactWriteResult(inserted_id),
+        NearDuplicateCandidate(confirmed_id, 0.1, "2026-01-01T00:00:00Z", 0.99),
+        _request(content="Avery uses Enfold on this machine.", trust_score=0.9),
+        "2026-01-02T00:00:00Z",
+    )
+
+    assert result.fact_id == confirmed_id
+    assert conn.execute(
+        "SELECT invalid_at, superseded_by FROM facts WHERE fact_id = ?",
+        (confirmed_id,),
+    ).fetchone() == (None, None)
+    assert conn.execute(
+        "SELECT superseded_by FROM facts WHERE fact_id = ?", (inserted_id,)
+    ).fetchone()[0] == confirmed_id
+    conn.rollback()
+
+
+def test_near_dedup_preserves_typed_state_candidate():
+    conn = _connection()
+    conn.execute("ALTER TABLE facts ADD COLUMN memory_kind TEXT")
+    state_id = conn.execute(
+        """INSERT INTO facts (
+               content, trust_score, source_authority, memory_kind
+           ) VALUES ('Avery role is engineer.', 0.1, 0.1, 'state')"""
+    ).lastrowid
+    inserted_id = conn.execute(
+        """INSERT INTO facts (content, trust_score, source_authority)
+           VALUES ('Avery role is engineer on this team.', 0.9, 1.0)"""
+    ).lastrowid
+    conn.commit()
+
+    result, _enqueue = _service(conn)._merge_near_duplicate(
+        FactWriteResult(inserted_id),
+        NearDuplicateCandidate(state_id, 0.1, "2026-01-01T00:00:00Z", 0.99),
+        _request(content="Avery role is engineer on this team.", trust_score=0.9),
+        "2026-01-02T00:00:00Z",
+    )
+
+    assert result.fact_id == state_id
+    assert conn.execute(
+        "SELECT invalid_at, superseded_by FROM facts WHERE fact_id = ?", (state_id,)
+    ).fetchone() == (None, None)
+    assert conn.execute(
+        "SELECT superseded_by FROM facts WHERE fact_id = ?", (inserted_id,)
+    ).fetchone()[0] == state_id
+    conn.rollback()
+
+
 def test_near_dedup_preserves_a_higher_authority_candidate():
     conn = _connection()
     trusted_id = conn.execute(
@@ -706,3 +796,27 @@ def test_near_dedup_preserves_a_higher_authority_candidate():
         "SELECT superseded_by FROM facts WHERE fact_id = ?", (inserted_id,)
     ).fetchone()[0] == trusted_id
     conn.rollback()
+
+
+def test_near_dedup_supersession_stamps_expired_at():
+    conn = _connection()
+    loser_id = conn.execute(
+        "INSERT INTO facts (content) VALUES ('Avery uses Enfold locally.')"
+    ).lastrowid
+    survivor_id = conn.execute(
+        "INSERT INTO facts (content) VALUES ('Avery uses Enfold on this machine.')"
+    ).lastrowid
+    conn.commit()
+
+    _service(conn)._supersede_near_duplicate(
+        loser_id, survivor_id, "2026-01-02T00:00:00Z"
+    )
+
+    assert conn.execute(
+        "SELECT invalid_at, expired_at, superseded_by FROM facts WHERE fact_id = ?",
+        (loser_id,),
+    ).fetchone() == (
+        "2026-01-02T00:00:00Z",
+        "2026-01-02T00:00:00Z",
+        survivor_id,
+    )

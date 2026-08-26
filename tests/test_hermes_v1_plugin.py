@@ -60,6 +60,9 @@ class FakeMemorySession:
     def enqueue_extraction(self, *args, **kwargs):
         return self._call("enqueue_extraction", *args, **kwargs)
 
+    def promote(self, *args, **kwargs):
+        return self._call("promote", *args, **kwargs)
+
 
 class FakeAdapter:
     def __init__(self, config, *, offline=False, error=None):
@@ -246,6 +249,39 @@ def test_explicit_tool_write_targets_audited_supersession(tmp_path):
     assert adapters[0].sessions[0].calls[-1][2]["supersede_fact_id"] == 42
 
 
+def test_explicit_promote_forwards_run_fact_and_target_scope(tmp_path):
+    memory, adapters = provider(tmp_path)
+    memory.initialize("parent-session", agent_identity="primary-agent")
+    memory.handle_tool_call(
+        "enfold_memory",
+        {
+            "action": "promote",
+            "fact_id": 12,
+            "event_id": "promote-1",
+            "target_scope": "work",
+        },
+    )
+    assert adapters[0].sessions[0].calls[-1] == (
+        "promote",
+        (12,),
+        {"event_id": "promote-1", "target_scope": "work"},
+    )
+
+
+def test_explicit_search_forwards_run_scope(tmp_path):
+    memory, adapters = provider(tmp_path)
+    memory.initialize("parent-session", agent_identity="primary-agent")
+    memory.handle_tool_call(
+        "enfold_memory",
+        {
+            "action": "search",
+            "query": "lock ownership",
+            "scope": "run:child-session",
+        },
+    )
+    assert adapters[0].sessions[0].calls[-1][2]["scope"] == "run:child-session"
+
+
 def test_builtin_write_and_delegation_capture_parent_child_provenance(tmp_path):
     memory, adapters = provider(tmp_path)
     memory.initialize("parent-session", agent_identity="primary-agent")
@@ -270,7 +306,30 @@ def test_builtin_write_and_delegation_capture_parent_child_provenance(tmp_path):
     assert child.context.agent_id == "reviewer-1"
     assert child.context.parent_agent_id == "primary-agent"
     assert child.calls[-1][2]["source_type"] == "hermes_delegation_result"
+    assert child.calls[-1][2]["scope"] == "run:child-session"
     assert "performed_by" not in child.calls[-1][2]
+
+
+def test_long_delegation_result_is_not_written_as_a_fact(tmp_path):
+    memory, adapters = provider(tmp_path)
+    memory.initialize("parent-session", agent_identity="primary-agent")
+    memory.on_delegation(
+        "review locking",
+        "x" * 501,
+        child_session_id="child-session",
+        child_agent_id="reviewer-1",
+    )
+
+    assert all(
+        session.context.session_id != "child-session"
+        for session in adapters[0].sessions
+    )
+    assert not any(
+        call[2].get("source_type") == "hermes_delegation_result"
+        for session in adapters[0].sessions
+        for call in session.calls
+        if len(call) > 2 and isinstance(call[2], dict)
+    )
 
 
 def test_builtin_hook_strips_nested_host_identity_metadata(tmp_path):
@@ -312,7 +371,7 @@ def test_session_hooks_enqueue_attributed_transcripts_without_local_model(tmp_pa
     calls = [call for call in adapters[0].sessions[0].calls if call[0] == "enqueue_extraction"]
     assert [call[2]["source"] for call in calls] == ["pre_compress", "session_end"]
     assert all(call[2]["scope"] == "private" for call in calls)
-    assert calls[0][1][0].startswith("USER: This is a meaningful")
+    assert calls[0][1][0] == messages
 
 
 def test_session_hook_utf8_safely_caps_long_transcript(tmp_path):
@@ -327,9 +386,11 @@ def test_session_hook_utf8_safely_caps_long_transcript(tmp_path):
 
     call = adapters[0].sessions[0].calls[-1]
     assert call[0] == "enqueue_extraction"
-    transcript = call[1][0]
-    assert len(transcript.encode("utf-8")) <= 10 * 1024
-    assert "recent 🧠" in transcript
+    turns = call[1][0]
+    transcript = "\n\n".join(turn["content"] for turn in turns)
+    assert len(transcript.encode("utf-8")) <= 6 * 1024
+    assert turns[-1]["role"] == "assistant"
+    assert "recent 🧠" in turns[-1]["content"]
 
 
 def test_daemon_unavailable_is_empty_prefetch_and_explicit_retryable_tool_error(tmp_path):

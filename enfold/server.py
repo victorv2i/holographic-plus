@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass, field
 import fcntl
+import importlib
 import importlib.metadata
 import ipaddress
 import json
@@ -25,7 +26,12 @@ from typing import Any, Callable, Mapping, Sequence
 from urllib import parse as urlparse
 
 from .client import ClientConfig, EnfoldClient, EnfoldClientError
-from .daemon import DaemonConfig, UnixJsonDaemon
+from .daemon import DaemonConfig, RequestError, SocketPathError, UnixJsonDaemon
+from .evidence_verifier import (
+    validate_verifier_endpoint,
+    validate_verifier_model,
+    validate_verifier_timeout,
+)
 from .extraction_enqueue import ExtractionEnqueuer, ExtractionQueueUnavailable
 from .extraction_processor import ExtractionProcessor
 from .extraction_worker import SupervisedExtractionWorker
@@ -61,13 +67,15 @@ from .hybrid_retrieval import (
     VectorFallbackTelemetry,
     VersionedStoredEmbeddingAdapter,
     deterministic_retriever_factory,
+    lexical_retriever_factory,
 )
-from .policy import MemoryPolicy, validate_scope
+from .policy import MemoryPolicy, is_run_scope, run_scope_for_session, validate_scope
 from .protocol import (
     CAPABILITY_HEALTH,
     MAX_FRAME_SIZE,
     SUPPORTED_CAPABILITIES,
     ClientContext,
+    Request,
 )
 from .read_pool import LRUQueryEmbedder, PerRequestReadHandler
 from .schema import SUPPORTED_SCHEMA_VERSION, SchemaError, require_compatible_schema
@@ -146,7 +154,7 @@ def _version() -> str:
     try:
         return importlib.metadata.version("enfold")
     except importlib.metadata.PackageNotFoundError:
-        return "0.8.0"
+        return "0.8.1"
 
 
 def _reject_json_constant(value: str) -> None:
@@ -217,7 +225,10 @@ class ServerConfig:
 
 @dataclass(frozen=True, slots=True)
 class RetrievalConfig:
-    """Explicit retrieval activation configuration."""
+    """Explicit retrieval activation configuration.
+
+    The ``ci`` mode is test-only and never passes production readiness.
+    """
 
     mode: str
     allow_nonproduction: bool = False
@@ -256,6 +267,18 @@ class ExtractionConfig:
     max_attempts: int = 3
     heartbeat_stale_seconds: float = 240.0
     pending_stale_seconds: float = 900.0
+    evidence_verifier: "ExtractionEvidenceVerifierConfig | None" = None
+
+
+@dataclass(frozen=True, slots=True)
+class ExtractionEvidenceVerifierConfig:
+    """Operator-installed evidence verifier loaded from server JSON."""
+
+    import_path: str
+    model: str | None = None
+    timeout_seconds: float | None = None
+    endpoint: str | None = None
+    prefilter: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -276,7 +299,7 @@ def _extraction_config(value: Any) -> ExtractionConfig:
     allowed = {
         "mode", "host", "artifact", "artifact_recheck_seconds", "poll_seconds", "drain_limit", "lease_seconds",
         "heartbeat_seconds", "retry_delay_seconds", "max_attempts",
-        "heartbeat_stale_seconds", "pending_stale_seconds",
+        "heartbeat_stale_seconds", "pending_stale_seconds", "evidence_verifier",
     }
     _keys(value, allowed, "extraction")
     mode = value.get("mode")
@@ -435,7 +458,112 @@ def _extraction_config(value: Any) -> ExtractionConfig:
         max_attempts=integer("max_attempts", 3),
         heartbeat_stale_seconds=stale_seconds,
         pending_stale_seconds=number("pending_stale_seconds", 900.0),
+        evidence_verifier=_evidence_verifier_config(value.get("evidence_verifier")),
     )
+
+
+def _evidence_verifier_config(value: Any) -> ExtractionEvidenceVerifierConfig | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ServerConfigError("extraction.evidence_verifier must be an object")
+    _keys(
+        value,
+        {"import", "model", "timeout_seconds", "endpoint", "prefilter"},
+        "extraction.evidence_verifier",
+    )
+    import_path = value.get("import")
+    if not isinstance(import_path, str) or import_path.count(":") != 1:
+        raise ServerConfigError(
+            "extraction.evidence_verifier.import must be module:attr"
+        )
+    module_name, attr = import_path.split(":", 1)
+    if not module_name.strip() or not attr.strip():
+        raise ServerConfigError(
+            "extraction.evidence_verifier.import must be module:attr"
+        )
+    model = value.get("model")
+    if model is not None:
+        try:
+            model = validate_verifier_model(model)
+        except ValueError as exc:
+            raise ServerConfigError(
+                "extraction.evidence_verifier.model must not be the extractor model"
+                if "extractor" in str(exc)
+                else f"extraction.evidence_verifier.model is invalid: {exc}"
+            ) from exc
+    timeout_seconds = None
+    if "timeout_seconds" in value:
+        try:
+            timeout_seconds = validate_verifier_timeout(value.get("timeout_seconds"))
+        except ValueError as exc:
+            raise ServerConfigError(
+                "extraction.evidence_verifier.timeout_seconds must be a positive number"
+            ) from exc
+    endpoint = None
+    if "endpoint" in value:
+        try:
+            endpoint = validate_verifier_endpoint(value.get("endpoint"))
+        except ValueError as exc:
+            raise ServerConfigError(
+                "extraction.evidence_verifier.endpoint must be a loopback /api/chat URL"
+            ) from exc
+    prefilter = value.get("prefilter")
+    if prefilter is not None and not isinstance(prefilter, bool):
+        raise ServerConfigError(
+            "extraction.evidence_verifier.prefilter must be a boolean"
+        )
+    return ExtractionEvidenceVerifierConfig(
+        f"{module_name.strip()}:{attr.strip()}",
+        model=model,
+        timeout_seconds=timeout_seconds,
+        endpoint=endpoint,
+        prefilter=prefilter,
+    )
+
+
+def _evidence_verifier_kwargs(config: ExtractionEvidenceVerifierConfig) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {}
+    if config.model is not None:
+        kwargs["model"] = config.model
+    if config.timeout_seconds is not None:
+        kwargs["timeout_seconds"] = config.timeout_seconds
+    if config.endpoint is not None:
+        kwargs["endpoint"] = config.endpoint
+    if config.prefilter is not None:
+        kwargs["prefilter"] = config.prefilter
+    return kwargs
+
+
+def _instantiate_evidence_verifier(
+    config: ExtractionEvidenceVerifierConfig,
+) -> Any:
+    module_name, attr = config.import_path.split(":", 1)
+    try:
+        loaded = getattr(importlib.import_module(module_name), attr)
+    except (ImportError, AttributeError) as exc:
+        raise ServerConfigError(
+            "extraction.evidence_verifier.import could not be loaded"
+        ) from exc
+    kwargs = _evidence_verifier_kwargs(config)
+    if isinstance(loaded, type):
+        try:
+            instance = loaded(**kwargs)
+        except (TypeError, ValueError) as exc:
+            raise ServerConfigError(
+                "extraction.evidence_verifier.import could not be constructed"
+            ) from exc
+    else:
+        if kwargs:
+            raise ServerConfigError(
+                "extraction.evidence_verifier options require an importable class"
+            )
+        instance = loaded
+    if not callable(getattr(instance, "verify", None)):
+        raise ServerConfigError(
+            "extraction.evidence_verifier.import must provide verify()"
+        )
+    return instance
 
 
 def _retrieval_config(value: Any) -> RetrievalConfig:
@@ -450,8 +578,10 @@ def _retrieval_config(value: Any) -> RetrievalConfig:
     }
     _keys(value, allowed, "retrieval")
     mode = value.get("mode")
-    if mode not in {"ci", "stored"}:
-        raise ServerConfigError("retrieval.mode must be 'ci' or 'stored'")
+    if mode not in {"ci", "stored", "local-lexical"}:
+        raise ServerConfigError(
+            "retrieval.mode must be 'ci', 'stored', or 'local-lexical'"
+        )
     allow_nonproduction = value.get("allow_nonproduction", False)
     if not isinstance(allow_nonproduction, bool):
         raise ServerConfigError("retrieval.allow_nonproduction must be a boolean")
@@ -467,7 +597,7 @@ def _retrieval_config(value: Any) -> RetrievalConfig:
     if mode == "ci":
         if not allow_nonproduction:
             raise ServerConfigError(
-                "CI retrieval is non-production and requires "
+                "CI retrieval is test-only and requires "
                 "retrieval.allow_nonproduction=true"
             )
         unexpected = sorted(
@@ -483,6 +613,24 @@ def _retrieval_config(value: Any) -> RetrievalConfig:
             allow_nonproduction=True,
             dimensions=dimensions,
             vector_backend=vector_backend,
+            near_dedup_enabled=near_dedup_enabled,
+        )
+
+    if mode == "local-lexical":
+        if allow_nonproduction:
+            raise ServerConfigError(
+                "local-lexical retrieval cannot set allow_nonproduction"
+            )
+        unexpected = sorted(
+            set(value) - {"mode", "allow_nonproduction", "near_dedup_enabled"}
+        )
+        if unexpected:
+            raise ServerConfigError(
+                f"local-lexical retrieval has unsupported fields: {unexpected}"
+            )
+        return RetrievalConfig(
+            mode=mode,
+            allow_nonproduction=False,
             near_dedup_enabled=near_dedup_enabled,
         )
 
@@ -656,6 +804,8 @@ def load_config(path: str | Path, *, allow_live: bool = False) -> ServerConfig:
             raise ServerConfigError(
                 "config file must be owned by this user and not group/world writable"
             )
+        if info.st_mode & 0o077:
+            raise ServerConfigError("config file must not be group/world readable")
         with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
             descriptor = -1
             raw = json.load(
@@ -881,8 +1031,13 @@ def _retriever_factory(
 ) -> RetrieverFactory:
     """Build the explicitly selected retrieval stack without probing a model."""
 
+    if config.mode == "local-lexical":
+        return lexical_retriever_factory(
+            vector_fallback_telemetry=vector_fallback_telemetry,
+        )
+
     if config.mode == "ci":
-        # Parsing already required the conspicuous non-production opt-in.
+        # Parsing already required the conspicuous test-only opt-in.
         return deterministic_retriever_factory(
             dimensions=config.dimensions,
             vector_backend=config.vector_backend,
@@ -1121,6 +1276,48 @@ def _extraction_artifact_state(
     return {"provider": "ollama", **attestation.safe_state()}
 
 
+_RUN_FACT_METHODS = frozenset({
+    "memory.evidence",
+    "memory.history",
+    "memory.promote",
+})
+
+
+def _reject_foreign_run_access(
+    context: ClientContext,
+    request: Request,
+    load_fact: Callable[[int], Mapping[str, Any] | None],
+) -> None:
+    """Bind ``run:*`` parameters and fact ids to this connection session."""
+
+    bound = run_scope_for_session(context.session_id)
+    for key in ("scope", "target_scope"):
+        value = request.params.get(key)
+        if isinstance(value, str) and is_run_scope(value) and value != bound:
+            raise RequestError(
+                "access_denied",
+                "run scope is bound to this connection session",
+            )
+    if request.method not in _RUN_FACT_METHODS:
+        return
+    raw_fact_id = request.params.get("fact_id")
+    if raw_fact_id is None:
+        return
+    try:
+        fact_id = int(raw_fact_id)
+    except (TypeError, ValueError):
+        return
+    fact = load_fact(fact_id)
+    if fact is None:
+        return
+    scope = str(fact.get("scope") or "")
+    if not is_run_scope(scope) or scope == bound:
+        return
+    if request.method == "memory.promote":
+        raise RequestError("access_denied", "fact is not visible")
+    raise RequestError("not_found", "fact was not found")
+
+
 class ServerApplication:
     """Own the database connection, service, and Unix daemon as one unit."""
 
@@ -1241,7 +1438,7 @@ class ServerApplication:
                 query_embedder=write_query_embedder,
                 near_dedup_enabled=config.retrieval.near_dedup_enabled,
             )
-            request_handler = PerRequestReadHandler(
+            routed_handler = PerRequestReadHandler(
                 self.service,
                 lambda: _open_existing_v1(config, read_only=True),
                 lambda read_connection: EnfoldService(
@@ -1257,6 +1454,12 @@ class ServerApplication:
                     extraction_processing_mode=config.extraction.mode,
                 ),
             )
+
+            def request_handler(context: ClientContext, request: Request) -> Any:
+                _reject_foreign_run_access(
+                    context, request, self.service._load_fact
+                )
+                return routed_handler(context, request)
             if config.extraction.mode == "daemon-supervised":
                 if extraction_enqueuer is None or config.extraction.host is None:
                     raise ServerConfigError("automatic extraction queue is unavailable")
@@ -1281,6 +1484,11 @@ class ServerApplication:
                 )
                 try:
                     extractor = extraction_extractor_factory(config.extraction.host)
+                    verifier = extraction_evidence_verifier
+                    if verifier is None and config.extraction.evidence_verifier is not None:
+                        verifier = _instantiate_evidence_verifier(
+                            config.extraction.evidence_verifier
+                        )
                     processor = ExtractionProcessor(
                         self.extraction_connection,
                         extraction_service,
@@ -1290,7 +1498,7 @@ class ServerApplication:
                         lease_seconds=config.extraction.lease_seconds,
                         heartbeat_seconds=config.extraction.heartbeat_seconds,
                         retry_delay_seconds=config.extraction.retry_delay_seconds,
-                        evidence_verifier=extraction_evidence_verifier,
+                        evidence_verifier=verifier,
                     )
                     def reattest_extraction_artifact() -> None:
                         attestation = _attest_extraction_artifact(
@@ -1391,6 +1599,8 @@ class ServerApplication:
                     not in {"verified", "not_required"}
                 )
                 retrieval_state = self.service.retrieval_metadata
+                if config.retrieval.mode == "ci":
+                    retrieval_state["deployment"] = "test-only"
                 retrieval_degraded = bool(
                     retrieval_state.get("vector_fallback_active")
                 )
@@ -1429,6 +1639,7 @@ class ServerApplication:
                     max_frame_bytes=config.max_frame_bytes,
                     client_timeout=config.client_timeout,
                     shutdown_timeout=config.shutdown_timeout,
+                    handler_timeout=config.retrieval.timeout + 5.0,
                     backlog=config.backlog,
                     cleanup_stale_socket=config.cleanup_stale_socket,
                     client_credentials=config.client_credentials,
@@ -1543,6 +1754,8 @@ def inspect_config(
             retriever_factory = _retriever_factory(config.retrieval, conn)
             retrieval = retriever_factory(conn, ("private",))
             retrieval_metadata = dict(retrieval.metadata)
+            if config.retrieval.mode == "ci":
+                retrieval_metadata["deployment"] = "test-only"
         else:
             retrieval_metadata = {
                 "embedder_production_ready": False,
@@ -1572,10 +1785,12 @@ def inspect_config(
     socket_unhealthy = bool(
         probe_socket and socket_state == "stale-or-unreachable"
     )
+    test_only_retrieval = config.retrieval.mode == "ci"
     activation_blocked = (
         not bool(outbox_health["activation_safe"])
         or live_worker_unverified
         or socket_unhealthy
+        or test_only_retrieval
     )
     return {
         "status": "blocked" if activation_blocked else "ready",
@@ -1608,10 +1823,14 @@ def inspect_config(
             "configured socket is stale or unreachable"
             if socket_unhealthy
             else (
-                "CLI socket probing cannot attest the live embedding worker; "
-                "query protocol health"
-                if live_worker_unverified
-                else "embedding outbox is unsafe" if activation_blocked else None
+                "CI retrieval is test-only"
+                if test_only_retrieval
+                else (
+                    "CLI socket probing cannot attest the live embedding worker; "
+                    "query protocol health"
+                    if live_worker_unverified
+                    else "embedding outbox is unsafe" if activation_blocked else None
+                )
             )
         ),
     }
@@ -1695,6 +1914,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             previous[signum] = signal.signal(signum, stop)
         application.serve_forever()
         return 0
+    except SocketPathError as exc:
+        print(f"enfold-server: {exc}", file=sys.stderr)
+        return 2
     finally:
         application.close()
         for signum, handler in previous.items():

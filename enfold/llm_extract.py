@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from .policy import default_credential_screen
+from .prompt_safety import ephemeral_extraction_reason
 from .provenance import WriteRequest
 
 if TYPE_CHECKING:
@@ -55,7 +56,7 @@ RULES:
 8. Skip anything that's clearly a one-off instruction to the agent for this session.
 9. Emit each distinct fact EXACTLY ONCE. Never output multiple rephrasings or near-duplicates of the same fact (e.g. the same SHA, URL, port, or status stated several ways); choose the single clearest phrasing.
 10. Resolve pronouns and vague references to concrete entities so each fact stands alone out of context.
-11. If a fact corrects or updates something in the known facts, state the new fact with the current value (the system supersedes the old one); do not restate unchanged known facts.
+    11. If a fact corrects or updates something in the known facts, state the new fact with the current value; do not restate unchanged known facts. This path cannot retire existing memory.
 12. Convert relative time references ("yesterday", "last week", "next month") to absolute dates using TODAY'S DATE (given below), so every fact is unambiguous out of context.
 
 GOOD facts:
@@ -93,7 +94,11 @@ Extract new durable facts not already in the known facts list.
 
 
 def _format_conversation(messages: List[Dict[str, Any]], max_chars: int = 12000) -> str:
-    """Render messages as a readable transcript, truncated to max_chars."""
+    """Render messages as a readable transcript.
+
+    Oversized transcripts fail closed. Silently keeping a tail would drop
+    earlier decisions and can cut a session mid-thought.
+    """
     lines = []
     for msg in messages:
         role = msg.get("role", "unknown")
@@ -109,15 +114,13 @@ def _format_conversation(messages: List[Dict[str, Any]], max_chars: int = 12000)
                 content = str(content)
         if not content.strip():
             continue
-        # Truncate very long individual messages
         if len(content) > 2000:
-            content = content[:2000] + "…[truncated]"
+            raise ValueError("legacy extraction transcript exceeds size limit")
         lines.append(f"{role.upper()}: {content}")
 
     transcript = "\n\n".join(lines)
     if len(transcript) > max_chars:
-        # Keep the last max_chars (most recent = most relevant)
-        transcript = "…[earlier content omitted]\n\n" + transcript[-max_chars:]
+        raise ValueError("legacy extraction transcript exceeds size limit")
     return transcript
 
 
@@ -333,21 +336,12 @@ def _credential_shaped(content: str, category: str, tags: str) -> bool:
     return default_credential_screen(request) is not None
 
 
-def _finish_supersede(
-    content: str,
-    category: str,
-    fact_id: int,
-    *,
-    update_check,
-    supersede,
-) -> bool:
-    if update_check is None or supersede is None:
-        return True
+def _refuse_extraction_update(content: str, category: str, *, update_check) -> bool:
+    """Return True when extraction would have retired an existing fact."""
+    if update_check is None:
+        return False
     update_target = update_check(content, category=category)
-    if update_target is None or int(update_target["fact_id"]) == int(fact_id):
-        return True
-    result = supersede(int(update_target["fact_id"]), int(fact_id))
-    return result is not False
+    return update_target is not None
 
 
 def _total_changes(store: "MemoryStore") -> Optional[int]:
@@ -366,24 +360,24 @@ def insert_facts(
 ) -> InsertFactsResult:
     """Insert extracted facts into the store and return outcome counts.
 
-    Per-fact storage and supersede failures are logged and counted so the
-    queue can retry its persisted proposal snapshot. Duplicates, unsafe
-    credential-shaped proposals, and empty facts count as skipped.
+    Per-fact storage failures are logged and counted so the queue can retry
+    its persisted proposal snapshot. Duplicates, unsafe credential-shaped
+    proposals, empty facts, and refused updates count as skipped.
 
     When *dedup_check* is given (the provider's near-duplicate gate, the same
     one the interactive fact_store "add" action uses), each fact is checked
     against the store before insert so extraction never floods the store with
     duplicates the interactive path would have caught.
 
-    When *update_check* and *supersede* are both given, a fact that is not a
-    duplicate but a VALUE UPDATE of an existing fact (same content words, a
-    changed concrete value) triggers *supersede* on the existing fact after
-    the new one is inserted, so extraction gets the same invalidate-not-delete
-    behaviour as the interactive fact_store "add" action.
+    When *update_check* finds a VALUE UPDATE of an existing fact, the
+    proposal is skipped. This path cannot retire existing memory; only the
+    daemon processor may change current state under its supersession policy.
+    The *supersede* argument is accepted for caller compatibility and ignored.
     """
     inserted = 0
     skipped = 0
     failed = 0
+    _ = supersede
     for fact in facts:
         try:
             content = str(fact.get("content", "")).strip()
@@ -398,27 +392,18 @@ def insert_facts(
                 )
                 skipped += 1
                 continue
+            skip_reason = ephemeral_extraction_reason(content)
+            if skip_reason is not None:
+                logger.info(
+                    "llm_extract: dropped proposal (%s): %r",
+                    skip_reason,
+                    content[:80],
+                )
+                skipped += 1
+                continue
             if dedup_check is not None:
                 dup = dedup_check(content, category=category)
                 if dup is not None:
-                    if dup.get("content", "").strip() == content:
-                        try:
-                            completed = _finish_supersede(
-                                content,
-                                category,
-                                int(dup["fact_id"]),
-                                update_check=update_check,
-                                supersede=supersede,
-                            )
-                        except Exception as sup_exc:
-                            completed = False
-                            logger.warning(
-                                "llm_extract: supersede retry failed for %s: %s",
-                                dup.get("fact_id"), sup_exc,
-                            )
-                        if not completed:
-                            failed += 1
-                            continue
                     logger.debug(
                         "llm_extract: skipped near-duplicate of fact %s: %r",
                         dup.get("fact_id"), content[:80],
@@ -427,28 +412,18 @@ def insert_facts(
                     continue
             existing_id = _existing_fact_id(store, content)
             if existing_id is not None:
-                try:
-                    completed = _finish_supersede(
-                        content,
-                        category,
-                        existing_id,
-                        update_check=update_check,
-                        supersede=supersede,
-                    )
-                except Exception as sup_exc:
-                    completed = False
-                    logger.warning(
-                        "llm_extract: supersede retry failed for %d: %s",
-                        existing_id, sup_exc,
-                    )
-                if not completed:
-                    failed += 1
-                    continue
                 skipped += 1
                 continue
-            update_target = None
-            if update_check is not None and supersede is not None:
-                update_target = update_check(content, category=category)
+            if _refuse_extraction_update(
+                content, category, update_check=update_check
+            ):
+                logger.info(
+                    "llm_extract: refused extraction update that would retire "
+                    "an existing fact: %r",
+                    content[:80],
+                )
+                skipped += 1
+                continue
             before_changes = _total_changes(store)
             fact_id = store.add_fact(
                 content,
@@ -465,23 +440,6 @@ def insert_facts(
                     embed_callback(fact_id, content)
                 except Exception as emb_exc:
                     logger.debug("llm_extract: embed callback failed for %d: %s", fact_id, emb_exc)
-            if update_target is not None and fact_id and int(update_target["fact_id"]) != int(fact_id):
-                try:
-                    completed = supersede(
-                        int(update_target["fact_id"]), int(fact_id)
-                    )
-                except Exception as sup_exc:
-                    completed = False
-                    logger.warning(
-                        "llm_extract: supersede callback failed for %d: %s",
-                        fact_id, sup_exc,
-                    )
-                if completed is False:
-                    failed += 1
-                    logger.warning(
-                        "llm_extract: supersede callback reported failure for %d",
-                        fact_id,
-                    )
         except Exception as exc:
             failed += 1
             logger.debug("llm_extract: add_fact failed: %s", exc)

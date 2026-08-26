@@ -1,4 +1,9 @@
-"""Provider factory for the enfold MCP server.
+"""Hermes compatibility extra: legacy v0 provider for ``enfold.mcp_server``.
+
+This is not the public Enfold contract. The public surface is the v1
+daemon plus ``enfold.mcp_stdio``. This path is holographic schema v0
+only. It refuses schema v1 and does not expose the v1
+``include_unreviewed`` search contract.
 
 Builds a real ``EnfoldProvider`` against a configurable db_path, the
 same way the offline ``explain.py`` CLI does, but resolves the parent

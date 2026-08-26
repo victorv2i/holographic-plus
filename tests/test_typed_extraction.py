@@ -8,6 +8,7 @@ import pytest
 
 from enfold.extraction_enqueue import ExtractionEnqueuer
 from enfold.extraction_processor import (
+    AUTOMATIC_SOURCE_AUTHORITY,
     EvidenceVerification,
     ExtractedMemory,
     ExtractionProcessor,
@@ -88,7 +89,10 @@ def _setup(tmp_path, transcript="Avery's job status is active."):
         conn, MemoryPolicy({"typed-extraction-tests": ("private",)})
     )
     ExtractionEnqueuer(conn).enqueue_after_commit(
-        context, transcript, source="session_end", scope="private"
+        context,
+        [{"role": "user", "content": transcript}],
+        source="session_end",
+        scope="private",
     )
     return conn, context, service
 
@@ -178,6 +182,56 @@ def test_malformed_or_low_confidence_typed_data_degrades_to_untyped(tmp_path, st
     conn.close()
 
 
+def test_partial_typed_data_records_its_demotion_in_observation_metadata(tmp_path):
+    content = "Mara works at Northwind."
+    conn, _context, service = _setup(tmp_path, content)
+
+    result = _process(
+        conn,
+        service,
+        _proposal(content, state={"confidence": 0.98}),
+    )
+
+    assert result.outcome == "completed"
+    metadata = json.loads(
+        conn.execute(
+            "SELECT metadata_json FROM observations "
+            "WHERE source_type = 'automatic_extraction'"
+        ).fetchone()[0]
+    )
+    assert metadata["typed_demotion"] == {
+        "reason": "invalid_or_incomplete_typed_fields",
+    }
+    conn.close()
+
+
+def test_contract_demotion_reason_survives_to_observation_metadata(tmp_path):
+    content = "Mara works at Northwind."
+    conn, _context, service = _setup(tmp_path, content)
+    proposal = ExtractedMemory(
+        content,
+        category="status",
+        evidence_excerpt=content,
+        metadata={
+            "typed_demotion": {"reason": "incomplete_typed_fields"},
+        },
+    )
+
+    result = _process(conn, service, proposal)
+
+    assert result.outcome == "completed"
+    metadata = json.loads(
+        conn.execute(
+            "SELECT metadata_json FROM observations "
+            "WHERE source_type = 'automatic_extraction'"
+        ).fetchone()[0]
+    )
+    assert metadata["typed_demotion"] == {
+        "reason": "incomplete_typed_fields",
+    }
+    conn.close()
+
+
 def test_extracted_state_supersedes_the_old_slot_and_settled_search_hides_it(tmp_path):
     old = "Avery's job status is active."
     conn, context, service = _setup(tmp_path, old)
@@ -193,7 +247,10 @@ def test_extracted_state_supersedes_the_old_slot_and_settled_search_hides_it(tmp
 
     new = "Avery's job status is on leave."
     ExtractionEnqueuer(conn).enqueue_after_commit(
-        context, new, source="session_end", scope="private"
+        context,
+        [{"role": "user", "content": new}],
+        source="session_end",
+        scope="private",
     )
     second = _proposal(
         new,
@@ -214,6 +271,118 @@ def test_extracted_state_supersedes_the_old_slot_and_settled_search_hides_it(tmp
     conn.close()
 
 
+def test_undated_extracted_state_from_later_session_opens_conflict(tmp_path):
+    first_content = "Avery's job status is active."
+    conn, context, service = _setup(tmp_path, first_content)
+    conn.execute(
+        "UPDATE extract_queue SET created_at = '2026-07-11T10:00:00Z'"
+    )
+    conn.commit()
+    first = _proposal(
+        first_content,
+        state={
+            "kind": "state",
+            "subject": "person:avery",
+            "predicate": "job_status",
+            "value": "active",
+            "confidence": 0.98,
+        },
+    )
+    assert _process(conn, service, first).outcome == "completed"
+
+    second_content = "Avery's job status is on leave."
+    later_context = replace(context, session_id="typed-extraction-later-session")
+    ExtractionEnqueuer(conn).enqueue_after_commit(
+        later_context,
+        [{"role": "user", "content": second_content}],
+        source="session_end",
+        scope="private",
+    )
+    conn.execute(
+        "UPDATE extract_queue SET created_at = '2026-07-12T10:00:00Z' "
+        "WHERE status = 'pending'"
+    )
+    conn.commit()
+    second = _proposal(
+        second_content,
+        state={
+            "kind": "state",
+            "subject": "person:avery",
+            "predicate": "job_status",
+            "value": "on leave",
+            "confidence": 0.97,
+        },
+    )
+
+    assert _process(conn, service, second).outcome == "completed"
+
+    conflicts = list_state_conflicts(conn)
+    assert len(conflicts) == 1
+    current = current_state_facts(conn, "person:avery", "job_status")
+    assert {fact.object_value for fact in current} == {"active", "on leave"}
+    assert {fact.valid_from for fact in current} == {None}
+    assert {
+        row[0]
+        for row in conn.execute(
+            "SELECT DISTINCT session_id FROM observations "
+            "WHERE source_type = 'automatic_extraction'"
+        )
+    } == {context.session_id, later_context.session_id}
+    conn.close()
+
+
+def test_user_asserted_extracted_state_outranks_assistant_asserted_state(tmp_path):
+    user_content = "Avery's job status is active."
+    conn, context, service = _setup(tmp_path, user_content)
+    assistant = service.handle(
+        context,
+        Request(
+            "assistant-state",
+            "memory.write",
+            {
+                "idempotency_key": "assistant-state",
+                "content": "Avery's job status is on leave.",
+                "source_type": "automatic_extraction",
+                "source_authority": (
+                    AUTOMATIC_SOURCE_AUTHORITY["assistant"]
+                    if isinstance(AUTOMATIC_SOURCE_AUTHORITY, dict)
+                    else AUTOMATIC_SOURCE_AUTHORITY
+                ),
+                "asserted_by": "assistant",
+                "state": {
+                    "subject_key": "person:avery",
+                    "predicate_key": "job_status",
+                    "object_value": "on leave",
+                },
+            },
+        ),
+    )
+    proposal = _proposal(
+        user_content,
+        state={
+            "kind": "state",
+            "subject": "person:avery",
+            "predicate": "job_status",
+            "value": "active",
+            "confidence": 0.98,
+        },
+    )
+
+    assert _process(conn, service, proposal).outcome == "completed"
+
+    current = current_state_facts(conn, "person:avery", "job_status")
+    assert len(current) == 1
+    assert current[0].object_value == "active"
+    assert current[0].source_authority == 0.5
+    assert tuple(
+        conn.execute(
+            "SELECT source_authority, superseded_by FROM facts WHERE fact_id = ?",
+            (assistant["fact_id"],),
+        ).fetchone()
+    ) == (0.2, current[0].fact_id)
+    conn.close()
+
+
 def test_negation_supersedes_the_prior_value_as_a_slot_clear(tmp_path):
     old = "Avery lives in Boston."
     conn, context, service = _setup(tmp_path, old)
@@ -229,7 +398,10 @@ def test_negation_supersedes_the_prior_value_as_a_slot_clear(tmp_path):
 
     cleared = "Avery no longer lives in Boston."
     ExtractionEnqueuer(conn).enqueue_after_commit(
-        context, cleared, source="session_end", scope="private"
+        context,
+        [{"role": "user", "content": cleared}],
+        source="session_end",
+        scope="private",
     )
     second = _proposal(
         cleared,
@@ -287,6 +459,54 @@ def test_ambiguous_authority_opens_conflict_without_clearing_truth(tmp_path):
     assert manual["fact_id"] in conflicts[0].member_fact_ids
     facts = current_state_facts(conn, "person:avery", "location")
     assert {fact.object_value for fact in facts} == {"Boston", None}
+    conn.close()
+
+
+def test_same_batch_state_alternatives_open_a_conflict(tmp_path):
+    transcript = (
+        "The September trip is Mexico City.\n\nThe September trip is Lima."
+    )
+    conn, _context, service = _setup(tmp_path, transcript)
+    result = _process(
+        conn,
+        service,
+        _proposal(
+            "The September trip is Mexico City.",
+            state={
+                "kind": "state",
+                "subject": "trip:2026-09-03",
+                "predicate": "destination",
+                "value": "Mexico City",
+                "confidence": 0.99,
+            },
+        ),
+        _proposal(
+            "The September trip is Lima.",
+            state={
+                "kind": "state",
+                "subject": "trip:2026-09-03",
+                "predicate": "destination",
+                "value": "Lima",
+                "confidence": 0.99,
+            },
+        ),
+    )
+
+    assert result.outcome == "completed"
+    conflicts = list_state_conflicts(conn)
+    assert len(conflicts) == 1
+    current = current_state_facts(conn, "trip:2026-09-03", "destination")
+    assert {fact.object_value for fact in current} == {"Mexico City", "Lima"}
+    assert all(fact.conflict_group for fact in current)
+    assert {
+        row[0] for row in conn.execute("SELECT content FROM facts").fetchall()
+    } == {
+        "The September trip is Mexico City.",
+        "The September trip is Lima.",
+    }
+    assert {
+        row[0] for row in conn.execute("SELECT memory_kind FROM facts").fetchall()
+    } == {"state"}
     conn.close()
 
 
@@ -383,7 +603,7 @@ def test_child_quarantines_injected_proposal_through_output_validation():
     raw = json.dumps({
         "envelope": {
             "context": {}, "scope": "private", "source": "session_end",
-            "transcript": transcript,
+            "turns": [{"role": "user", "content": transcript}],
         },
         "model_identity": "ollama:qwen3-30b",
         "prompt_identity": PROMPT_IDENTITY,

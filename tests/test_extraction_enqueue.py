@@ -5,8 +5,16 @@ import sqlite3
 
 import pytest
 
-from enfold.extraction_enqueue import ExtractionEnqueuer, ExtractionQueueUnavailable
+from enfold.extraction_enqueue import (
+    CaptureDisabled,
+    CaptureEnableError,
+    ExtractionEnqueuer,
+    ExtractionQueueUnavailable,
+    capture_status,
+    enable_capture,
+)
 from enfold.provenance import ConnectionContext
+from enfold.schema import migrate
 
 
 def _connection(tmp_path):
@@ -77,3 +85,61 @@ def test_enqueue_rejects_open_transaction_and_unprovisioned_queue(tmp_path):
     with pytest.raises(ExtractionQueueUnavailable, match="not provisioned"):
         ExtractionEnqueuer(empty)
     empty.close()
+
+
+def _v1_connection(tmp_path):
+    conn = sqlite3.connect(tmp_path / "v1.db")
+    conn.execute("PRAGMA foreign_keys=ON")
+    migrate(conn)
+    return conn
+
+
+def test_session_capture_is_disabled_by_default_and_does_not_write_facts(tmp_path):
+    conn = _v1_connection(tmp_path)
+    queue = ExtractionEnqueuer(conn)
+
+    status = capture_status(conn)
+    assert status["enabled"] is False
+    assert status["visible_to_default_recall"] is False
+
+    with pytest.raises(CaptureDisabled, match="disabled"):
+        queue.enqueue_session_capture(_context(), "Avery prefers local memory.")
+
+    assert conn.execute("SELECT count(*) FROM extract_queue").fetchone()[0] == 0
+    assert conn.execute("SELECT count(*) FROM facts").fetchone()[0] == 0
+    conn.close()
+
+
+def test_capture_enable_refuses_silent_invisible_rows(tmp_path):
+    conn = _v1_connection(tmp_path)
+
+    with pytest.raises(CaptureEnableError, match="allow-unreviewed"):
+        enable_capture(conn)
+
+    assert capture_status(conn)["enabled"] is False
+    conn.close()
+
+
+def test_session_capture_enqueues_without_memory_write_after_opt_in(tmp_path):
+    conn = _v1_connection(tmp_path)
+    queue = ExtractionEnqueuer(conn)
+
+    enable_capture(conn, allow_unreviewed=True)
+    status = capture_status(conn)
+    assert status["enabled"] is True
+    assert status["allow_unreviewed"] is True
+    assert status["visible_to_default_recall"] is False
+
+    result = queue.enqueue_session_capture(
+        _context(), "Avery prefers local memory."
+    )
+
+    assert result.replayed is False
+    assert conn.execute("SELECT count(*) FROM facts").fetchone()[0] == 0
+    payload = json.loads(
+        conn.execute("SELECT payload FROM extract_queue").fetchone()[0]
+    )
+    assert payload["source"] == "session_capture"
+    assert payload["transcript"] == "Avery prefers local memory."
+    assert payload["metadata"]["capture"] is True
+    conn.close()

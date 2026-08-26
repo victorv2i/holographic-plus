@@ -23,6 +23,37 @@ DecisionAction = Literal["add", "dedup", "supersede", "conflict"]
 
 _SUBJECT_KEY = re.compile(r"^[a-z0-9][a-z0-9._:/-]{0,127}$")
 _PREDICATE_KEY = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+_CANONICAL_SUBJECT_KINDS = {
+    "agent": "software agent as agent:<stable-name>",
+    "bot": "named bot as bot:<stable-name>",
+    "course": "catalog course as course:<letters><digits>; omit section suffixes",
+    "course_section": "specific course section as course_section:<stable-name>",
+    "cron": "scheduled job as cron:<stable-name>",
+    "environment": "runtime environment as environment:<stable-name>",
+    "person": "named person as person:<stable-name>",
+    "project": "named project as project:<stable-name>",
+    "service": "software service as service:<stable-name>",
+    "trip": "specific trip as trip:<stable-name>",
+}
+_CANONICAL_PREDICATES = {
+    "clothing_store": "preferred store for clothing",
+    "data_analysis_course": "preferred course for a data analysis requirement",
+    "decision_council": "preferred council or panel for decisions",
+    "employer": "current employer",
+    "cru_schedule_mode": "preferred CRU schedule delivery mode",
+    "job_status": "current job status",
+    "keyboard": "preferred keyboard type",
+    "live_version": "currently deployed or live version",
+    "location": "current location",
+    "model": "current or preferred model",
+    "model_routing": "preferred routing of work among models",
+    "port": "network port",
+    "quiz_time_accommodation": "quiz time accommodation or multiplier",
+    "response_style": "preferred response, answer, or reply style",
+    "result_format": "preferred format for final results",
+    "typography": "typography style",
+    "threadwell_use": "constraint on when to use or buy from Threadwell",
+}
 _STATE_SLOT_INDEX_SQL = """
     CREATE UNIQUE INDEX uq_facts_current_state_slot
     ON facts(scope, subject_key, predicate_key)
@@ -65,6 +96,142 @@ def normalize_predicate_key(value: str) -> str:
     if not _PREDICATE_KEY.fullmatch(normalized):
         raise ValueError("predicate_key is not a canonical slot key")
     return normalized
+
+
+def canonical_slot_registry(
+    conn: sqlite3.Connection | None = None, *, scope: str | None = None
+) -> dict[str, dict[str, str]]:
+    """Return the provider-neutral canonical vocabulary for typed extraction."""
+
+    predicates = dict(_CANONICAL_PREDICATES)
+    if conn is not None:
+        if not isinstance(scope, str) or not scope.strip():
+            raise ValueError("scope is required for a store-backed slot registry")
+        rows = conn.execute(
+            "SELECT DISTINCT predicate_key FROM facts "
+            "WHERE scope = ? AND predicate_key IS NOT NULL "
+            "AND invalid_at IS NULL AND superseded_by IS NULL "
+            "AND conflict_group IS NULL ORDER BY predicate_key",
+            (scope.strip(),),
+        ).fetchall()
+        for row in rows:
+            try:
+                predicate = normalize_predicate_key(str(row[0]))
+            except ValueError:
+                continue
+            predicates.setdefault(predicate, "existing canonical store predicate")
+    return {
+        "subject_kinds": dict(_CANONICAL_SUBJECT_KINDS),
+        "predicates": predicates,
+    }
+
+
+def _plural_key(value: str) -> str:
+    prefix, separator, final = value.rpartition("_")
+    if final.endswith(("s", "x", "z", "ch", "sh")):
+        plural = final + "es"
+    elif len(final) > 1 and final.endswith("y") and final[-2] not in "aeiou":
+        plural = final[:-1] + "ies"
+    else:
+        plural = final + "s"
+    return f"{prefix}{separator}{plural}" if separator else plural
+
+
+def resolve_extracted_subject_key(value: str) -> str:
+    """Resolve only syntactic subject near-misses from extractor output."""
+
+    if not isinstance(value, str):
+        raise ValueError("subject_key must be text")
+    normalized = normalize_subject_key(re.sub(r"\s*:\s*", ":", value))
+    if ":" not in normalized:
+        return normalized
+    kind, payload = normalized.split(":", 1)
+    kinds = set(_CANONICAL_SUBJECT_KINDS)
+    kind_matches = [candidate for candidate in kinds if _plural_key(candidate) == kind]
+    if kind not in kinds and len(kind_matches) == 1:
+        kind = kind_matches[0]
+    payload = payload.strip("_-")
+    if kind == "course":
+        match = re.fullmatch(
+            r"([a-z]{2,4})[_-]*(\d{4})(?:[_-]*[a-z][a-z0-9]{1,7})?",
+            payload,
+        )
+        if match is not None:
+            payload = "".join(match.groups()[:2])
+    return normalize_subject_key(f"{kind}:{payload}")
+
+
+def resolve_extracted_predicate_key(
+    value: str, *, known_predicates: tuple[str, ...] = ()
+) -> str:
+    """Resolve separators and unambiguous final-token plurals only."""
+
+    normalized = normalize_predicate_key(value)
+    known = {
+        normalize_predicate_key(candidate)
+        for candidate in (*_CANONICAL_PREDICATES, *known_predicates)
+    }
+    if normalized in known:
+        return normalized
+    matches = [candidate for candidate in known if _plural_key(candidate) == normalized]
+    return matches[0] if len(matches) == 1 else normalized
+
+
+def _entity_aliases(value: object) -> frozenset[str]:
+    if not isinstance(value, str) or not value.strip():
+        return frozenset()
+    try:
+        decoded = json.loads(value)
+    except json.JSONDecodeError:
+        decoded = None
+    if isinstance(decoded, list) and all(isinstance(item, str) for item in decoded):
+        aliases = decoded
+    else:
+        aliases = re.split(r"[,;|\n]", value)
+    return frozenset(alias.strip().casefold() for alias in aliases if alias.strip())
+
+
+def resolve_stored_subject_key(
+    conn: sqlite3.Connection, value: str, *, scope: str
+) -> str | None:
+    """Resolve a generic user subject only from unique trusted store evidence."""
+
+    subject = resolve_extracted_subject_key(value)
+    if subject not in {"user", "person:user", "person:the_user", "person:the-user"}:
+        return subject
+    rows = conn.execute(
+        """
+        SELECT DISTINCT f.subject_key, e.name, e.entity_type, e.aliases
+        FROM facts AS f
+        JOIN fact_entities AS fe ON fe.fact_id = f.fact_id
+        JOIN entities AS e ON e.entity_id = fe.entity_id
+        JOIN fact_provenance AS fp ON fp.fact_id = f.fact_id
+        JOIN observations AS o ON o.observation_id = fp.observation_id
+        WHERE f.scope = ? AND f.memory_kind = 'state'
+          AND f.subject_key IS NOT NULL
+          AND f.invalid_at IS NULL AND f.superseded_by IS NULL
+          AND f.conflict_group IS NULL
+          AND (f.correction_status = 'human_confirmed'
+               OR (o.asserted_by = 'user'
+                   AND o.source_type != 'automatic_extraction'))
+        ORDER BY f.subject_key, e.entity_id
+        """,
+        (scope,),
+    ).fetchall()
+    candidates: set[str] = set()
+    for stored_subject, name, entity_type, aliases in rows:
+        if str(entity_type).casefold() != "person":
+            continue
+        if not {"user", "the user"}.intersection(_entity_aliases(aliases)):
+            continue
+        try:
+            candidate = resolve_extracted_subject_key(str(stored_subject))
+            entity_subject = resolve_extracted_subject_key(f"person:{name}")
+        except ValueError:
+            continue
+        if candidate == entity_subject and candidate.startswith("person:"):
+            candidates.add(candidate)
+    return next(iter(candidates)) if len(candidates) == 1 else None
 
 
 def _json_object(value: str, name: str = "detail_json") -> str:
@@ -165,49 +332,7 @@ def _canonicalize_existing_state_slots(
                 predicate_key,
                 (subject_key, predicate_key) != row[1:3],
             )
-        )
-
-    active: dict[
-        tuple[str, str, str],
-        list[tuple[sqlite3.Row | tuple[object, ...], str, str, bool]],
-    ] = {}
-    for item in canonical:
-        row, subject_key, predicate_key, _changed = item
-        if (
-            row[4] == "state"
-            and row[5] is None
-            and row[6] is None
-            and row[7] is None
-        ):
-            active.setdefault((str(row[3]), subject_key, predicate_key), []).append(item)
-
-    repaired_at = _utc_now()
-    minimum = datetime.min.replace(tzinfo=timezone.utc)
-
-    def newest(item: tuple[sqlite3.Row | tuple[object, ...], str, str, bool]):
-        row = item[0]
-        for value in row[8:]:
-            try:
-                parsed = _parse_timestamp(str(value)) if value is not None else None
-            except ValueError:
-                parsed = None
-            if parsed is not None:
-                return (parsed, int(row[0]))
-        return (minimum, int(row[0]))
-
-    for members in active.values():
-        if len(members) < 2 or not any(item[3] for item in members):
-            continue
-        winner = max(members, key=newest)
-        winner_id = int(winner[0][0])
-        for loser in members:
-            loser_id = int(loser[0][0])
-            if loser_id != winner_id:
-                conn.execute(
-                    "UPDATE facts SET invalid_at = ?, superseded_by = ? "
-                    "WHERE fact_id = ?",
-                    (repaired_at, winner_id, loser_id),
-                )
+            )
 
     for row, subject_key, predicate_key, changed in canonical:
         if changed:
@@ -216,6 +341,44 @@ def _canonicalize_existing_state_slots(
                 "WHERE fact_id = ?",
                 (subject_key, predicate_key, int(row[0])),
             )
+
+
+def _open_conflicts_for_duplicate_current_slots(conn: sqlite3.Connection) -> None:
+    groups = conn.execute(
+        """
+        SELECT scope, subject_key, predicate_key
+        FROM facts
+        WHERE memory_kind = 'state'
+          AND subject_key IS NOT NULL AND predicate_key IS NOT NULL
+          AND invalid_at IS NULL AND superseded_by IS NULL
+          AND conflict_group IS NULL
+        GROUP BY scope, subject_key, predicate_key
+        HAVING COUNT(*) > 1
+        """
+    ).fetchall()
+    for scope, subject_key, predicate_key in groups:
+        ids = tuple(
+            int(row[0])
+            for row in conn.execute(
+                """
+                SELECT fact_id FROM facts
+                WHERE memory_kind = 'state'
+                  AND scope = ? AND subject_key = ? AND predicate_key = ?
+                  AND invalid_at IS NULL AND superseded_by IS NULL
+                  AND conflict_group IS NULL
+                ORDER BY fact_id
+                """,
+                (scope, subject_key, predicate_key),
+            )
+        )
+        open_state_conflict(
+            conn,
+            str(subject_key),
+            str(predicate_key),
+            ids,
+            scope=str(scope),
+            detail_json='{"reason":"schema repair duplicate current slot"}',
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -228,6 +391,7 @@ class StateCandidate:
     valid_from: Optional[str] = None
     memory_kind: str = "state"
     scope: str = "private"
+    valid_to: Optional[str] = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -242,7 +406,10 @@ class StateCandidate:
         )
         if not 0.0 <= self.source_authority <= 1.0:
             raise ValueError("source_authority must be between 0 and 1")
-        _parse_timestamp(self.valid_from)
+        start = _parse_timestamp(self.valid_from)
+        end = _parse_timestamp(self.valid_to)
+        if start is not None and end is not None and end <= start:
+            raise ValueError("valid_to must be after valid_from")
 
 
 @dataclass(frozen=True, slots=True)
@@ -256,6 +423,7 @@ class CurrentStateFact:
     source_authority: float
     valid_from: Optional[str]
     conflict_group: Optional[str]
+    valid_to: Optional[str] = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -290,6 +458,42 @@ class ConflictResolution:
     resolved_at: str
 
 
+@dataclass(frozen=True, slots=True)
+class ReviewRecord:
+    review_id: str
+    scope: str
+    reason: str
+    content: Optional[str]
+    subject_key: Optional[str]
+    predicate_key: Optional[str]
+    recorded_at: str
+    detail_json: str
+
+
+@dataclass(frozen=True, slots=True)
+class ConflictReceipt:
+    conflict_id: str
+    scope: str
+    subject_key: str
+    predicate_key: str
+    member_fact_ids: tuple[int, ...]
+    summary: str
+
+
+def format_conflict_receipt_summary(
+    conflict_id: str,
+    subject_key: str,
+    predicate_key: str,
+    member_count: int,
+) -> str:
+    """Return the one-line recall receipt for an open conflict."""
+
+    return (
+        f"[conflict:{conflict_id} slot:{subject_key}.{predicate_key} "
+        f"members:{member_count} - do not treat either as current]"
+    )
+
+
 _TYPED_COLUMNS = (
     ("memory_kind", "TEXT"),
     ("subject_key", "TEXT"),
@@ -310,8 +514,8 @@ def ensure_state_slot_schema(conn: sqlite3.Connection) -> bool:
     """Add typed-fact columns, conflict tables, and the strict-slot index.
 
     Returns ``True`` when the partial uniqueness invariant is installed.
-    It is skipped when temporal columns are absent or legacy duplicate current
-    slots already exist; those stores require an explicit cleanup migration.
+    It is skipped when temporal columns are absent. Remaining active
+    duplicate slots are opened as conflicts so the unique index can install.
     No commit is performed.
     """
 
@@ -321,7 +525,11 @@ def ensure_state_slot_schema(conn: sqlite3.Connection) -> bool:
         raise RuntimeError("facts table must exist before state-slot schema")
 
     columns = {row[1] for row in conn.execute("PRAGMA table_info(facts)")}
-    for name, column_type in _TYPED_COLUMNS:
+    for name, column_type in (
+        *_TYPED_COLUMNS,
+        ("valid_to", "TIMESTAMP"),
+        ("expired_at", "TIMESTAMP"),
+    ):
         if name not in columns:
             conn.execute(f"ALTER TABLE facts ADD COLUMN {name} {column_type}")
             columns.add(name)
@@ -370,6 +578,21 @@ def ensure_state_slot_schema(conn: sqlite3.Connection) -> bool:
     )
     conn.execute(
         """
+        CREATE TABLE IF NOT EXISTS memory_review_queue (
+            review_id TEXT PRIMARY KEY,
+            scope TEXT NOT NULL DEFAULT 'private',
+            reason TEXT NOT NULL,
+            content TEXT,
+            subject_key TEXT,
+            predicate_key TEXT,
+            detail_json TEXT NOT NULL DEFAULT '{}',
+            recorded_at TEXT NOT NULL,
+            resolved_at TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS fact_conflict_resolutions (
             conflict_id TEXT PRIMARY KEY,
             resolution_fact_id INTEGER NOT NULL,
@@ -391,29 +614,35 @@ def ensure_state_slot_schema(conn: sqlite3.Connection) -> bool:
     if conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'index' "
         "AND name = 'uq_facts_current_state_slot'"
-    ).fetchone() is not None and not _state_slot_index_has_expected_shape(conn):
+    ).fetchone() is not None:
         conn.execute("DROP INDEX uq_facts_current_state_slot")
     _canonicalize_existing_state_slots(conn, columns)
-    duplicate = conn.execute(
-        """
-        SELECT 1 FROM facts
-        WHERE memory_kind = 'state'
-          AND subject_key IS NOT NULL AND predicate_key IS NOT NULL
-          AND invalid_at IS NULL AND superseded_by IS NULL
-          AND conflict_group IS NULL
-        GROUP BY scope, subject_key, predicate_key
-        HAVING COUNT(*) > 1
-        LIMIT 1
-        """
-    ).fetchone()
-    if duplicate is not None:
-        return False
-    conn.execute(
-        _STATE_SLOT_INDEX_SQL.replace(
-            "CREATE UNIQUE INDEX", "CREATE UNIQUE INDEX IF NOT EXISTS", 1
-        )
-    )
+    _open_conflicts_for_duplicate_current_slots(conn)
+    conn.execute(_STATE_SLOT_INDEX_SQL)
     return _state_slot_index_has_expected_shape(conn)
+
+
+def _intervals_overlap(
+    left_from: Optional[str],
+    left_to: Optional[str],
+    right_from: Optional[str],
+    right_to: Optional[str],
+) -> bool:
+    """True unless one ``[start, end)`` interval ends at or before the other starts."""
+
+    left_start = _parse_timestamp(left_from)
+    left_end = _parse_timestamp(left_to)
+    right_start = _parse_timestamp(right_from)
+    right_end = _parse_timestamp(right_to)
+    if left_end is not None and right_start is not None and left_end <= right_start:
+        return False
+    if right_end is not None and left_start is not None and right_end <= left_start:
+        return False
+    return True
+
+
+def _fact_columns(conn: sqlite3.Connection) -> set[str]:
+    return {str(row[1]) for row in conn.execute("PRAGMA table_info(facts)")}
 
 
 def current_state_facts(
@@ -427,14 +656,19 @@ def current_state_facts(
     subject_key = _required(subject_key, "subject_key")
     predicate_key = _required(predicate_key, "predicate_key")
     scope = _required(scope, "scope")
+    columns = _fact_columns(conn)
+    valid_to_select = "valid_to" if "valid_to" in columns else "NULL"
+    open_interval = "AND valid_to IS NULL" if "valid_to" in columns else ""
     rows = conn.execute(
-        """
+        f"""
         SELECT fact_id, content, subject_key, predicate_key, scope, object_value,
-               COALESCE(source_authority, 0.5), valid_from, conflict_group
+               COALESCE(source_authority, 0.5), valid_from, conflict_group,
+               {valid_to_select}
         FROM facts
         WHERE memory_kind = 'state'
           AND scope = ? AND subject_key = ? AND predicate_key = ?
           AND invalid_at IS NULL AND superseded_by IS NULL
+          {open_interval}
         ORDER BY fact_id
         """,
         (scope, subject_key, predicate_key),
@@ -450,6 +684,56 @@ def current_state_facts(
             source_authority=float(row[6]),
             valid_from=row[7],
             conflict_group=row[8],
+            valid_to=row[9],
+        )
+        for row in rows
+    )
+
+
+def _believed_state_facts(
+    conn: sqlite3.Connection,
+    subject_key: str,
+    predicate_key: str,
+    scope: str,
+) -> tuple[CurrentStateFact, ...]:
+    """Return same-slot facts the store still believes, including closed intervals."""
+
+    columns = _fact_columns(conn)
+    valid_to_select = "valid_to" if "valid_to" in columns else "NULL"
+    if "expired_at" in columns and "valid_to" in columns:
+        believed = (
+            "AND expired_at IS NULL "
+            "AND (invalid_at IS NULL OR valid_to IS NOT NULL)"
+        )
+    elif "expired_at" in columns:
+        believed = "AND expired_at IS NULL"
+    else:
+        believed = "AND invalid_at IS NULL AND superseded_by IS NULL"
+    rows = conn.execute(
+        f"""
+        SELECT fact_id, content, subject_key, predicate_key, scope, object_value,
+               COALESCE(source_authority, 0.5), valid_from, conflict_group,
+               {valid_to_select}
+        FROM facts
+        WHERE memory_kind = 'state'
+          AND scope = ? AND subject_key = ? AND predicate_key = ?
+          {believed}
+        ORDER BY fact_id
+        """,
+        (scope, subject_key, predicate_key),
+    ).fetchall()
+    return tuple(
+        CurrentStateFact(
+            fact_id=int(row[0]),
+            content=row[1],
+            subject_key=row[2],
+            predicate_key=row[3],
+            scope=row[4],
+            object_value=row[5],
+            source_authority=float(row[6]),
+            valid_from=row[7],
+            conflict_group=row[8],
+            valid_to=row[9],
         )
         for row in rows
     )
@@ -584,6 +868,141 @@ def list_state_conflicts(
     )
 
 
+def list_conflict_receipts(
+    conn: sqlite3.Connection,
+    scope: str = "private",
+    *,
+    limit: int = _MAX_CONFLICT_LIMIT,
+    offset: int = 0,
+    visibility_scopes: tuple[str, ...] | None = None,
+) -> tuple[ConflictReceipt, ...]:
+    """Return compact receipts for unresolved conflicts on the default read path."""
+
+    records = list_state_conflicts(
+        conn,
+        scope,
+        unresolved_only=True,
+        limit=limit,
+        offset=offset,
+        visibility_scopes=visibility_scopes,
+    )
+    return tuple(
+        ConflictReceipt(
+            record.conflict_id,
+            record.scope,
+            record.subject_key,
+            record.predicate_key,
+            record.member_fact_ids,
+            format_conflict_receipt_summary(
+                record.conflict_id,
+                record.subject_key,
+                record.predicate_key,
+                len(record.member_fact_ids),
+            ),
+        )
+        for record in records
+    )
+
+
+def record_needs_review(
+    conn: sqlite3.Connection,
+    *,
+    reason: str,
+    scope: str = "private",
+    content: Optional[str] = None,
+    subject_key: Optional[str] = None,
+    predicate_key: Optional[str] = None,
+    detail_json: str = "{}",
+    recorded_at: Optional[str] = None,
+) -> ReviewRecord:
+    """Persist a policy needs_review row so default recall can list it."""
+
+    scope = _required(scope, "scope")
+    reason = _required(reason, "reason")
+    detail_json = _json_object(detail_json)
+    recorded_at = recorded_at or _utc_now()
+    _parse_timestamp(recorded_at)
+    if subject_key is not None:
+        subject_key = normalize_subject_key(subject_key)
+    if predicate_key is not None:
+        predicate_key = normalize_predicate_key(predicate_key)
+    review_id = str(uuid.uuid4())
+    conn.execute(
+        """
+        INSERT INTO memory_review_queue (
+            review_id, scope, reason, content, subject_key, predicate_key,
+            detail_json, recorded_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            review_id,
+            scope,
+            reason,
+            content,
+            subject_key,
+            predicate_key,
+            detail_json,
+            recorded_at,
+        ),
+    )
+    return ReviewRecord(
+        review_id,
+        scope,
+        reason,
+        content,
+        subject_key,
+        predicate_key,
+        recorded_at,
+        detail_json,
+    )
+
+
+def list_needs_review(
+    conn: sqlite3.Connection,
+    scope: str = "private",
+    *,
+    unresolved_only: bool = True,
+    limit: int = _MAX_CONFLICT_LIMIT,
+    offset: int = 0,
+) -> tuple[ReviewRecord, ...]:
+    """List persisted needs_review rows with the same pagination as conflicts."""
+
+    scope = _required(scope, "scope")
+    if (
+        isinstance(limit, bool)
+        or not isinstance(limit, int)
+        or not 1 <= limit <= _MAX_CONFLICT_LIMIT
+    ):
+        raise ValueError(f"limit must be between 1 and {_MAX_CONFLICT_LIMIT}")
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        raise ValueError("offset must be a non-negative integer")
+    predicate = "AND resolved_at IS NULL" if unresolved_only else ""
+    rows = conn.execute(
+        f"""
+        SELECT review_id, scope, reason, content, subject_key, predicate_key,
+               recorded_at, detail_json
+        FROM memory_review_queue
+        WHERE scope = ? {predicate}
+        ORDER BY recorded_at, review_id
+        LIMIT ? OFFSET ?
+        """,
+        (scope, limit, offset),
+    ).fetchall()
+    return tuple(
+        ReviewRecord(
+            str(row[0]),
+            str(row[1]),
+            str(row[2]),
+            row[3],
+            row[4],
+            row[5],
+            str(row[6]),
+            str(row[7]),
+        )
+        for row in rows
+    )
+
+
 def decide_state_write(
     conn: sqlite3.Connection, candidate: StateCandidate
 ) -> SlotDecision:
@@ -607,19 +1026,30 @@ def decide_state_write(
     current = current_state_facts(
         conn, candidate.subject_key, candidate.predicate_key, candidate.scope
     )
-    if not current:
+    believed = _believed_state_facts(
+        conn, candidate.subject_key, candidate.predicate_key, candidate.scope
+    )
+    overlapping = tuple(
+        fact
+        for fact in believed
+        if _intervals_overlap(
+            fact.valid_from, fact.valid_to, candidate.valid_from, candidate.valid_to
+        )
+    )
+    if not current and not overlapping:
         return SlotDecision(
             "add",
             candidate.scope,
             candidate.subject_key,
             candidate.predicate_key,
-            reason="slot has no current value",
+            reason="slot has no current overlapping value",
         )
 
+    peers = current if current else overlapping
     exact = next(
         (
             fact
-            for fact in current
+            for fact in peers
             if fact.content == candidate.content
             or (
                 candidate.object_value is not None
@@ -632,6 +1062,41 @@ def decide_state_write(
     # may add evidence to one member, but must never make an ordinary write
     # look like an unambiguous deduplication.
     if len(current) > 1 or any(fact.conflict_group for fact in current):
+        candidate_time = _parse_timestamp(candidate.valid_from)
+        current_with_times = tuple(
+            (fact, _parse_timestamp(fact.valid_from)) for fact in current
+        )
+        dated_candidate_wins = candidate_time is not None and all(
+            (
+                candidate.source_authority > fact.source_authority
+                and (existing_time is None or candidate_time >= existing_time)
+            )
+            or (
+                candidate.source_authority == fact.source_authority
+                and (existing_time is None or candidate_time > existing_time)
+            )
+            for fact, existing_time in current_with_times
+        )
+        if dated_candidate_wins:
+            return SlotDecision(
+                "supersede",
+                candidate.scope,
+                candidate.subject_key,
+                candidate.predicate_key,
+                tuple(fact.fact_id for fact in current),
+                reason="dated claim supersedes every open conflict member",
+            )
+        if candidate.source_authority > max(
+            fact.source_authority for fact in current
+        ):
+            return SlotDecision(
+                "supersede",
+                candidate.scope,
+                candidate.subject_key,
+                candidate.predicate_key,
+                tuple(fact.fact_id for fact in current),
+                reason="higher authority resolves open conflict",
+            )
         return SlotDecision(
             "conflict",
             candidate.scope,
@@ -648,12 +1113,22 @@ def decide_state_write(
             candidate.scope,
             candidate.subject_key,
             candidate.predicate_key,
-            tuple(fact.fact_id for fact in current),
+            tuple(fact.fact_id for fact in peers),
             target_fact_id=exact.fact_id,
             reason="identical current content or structured value",
         )
 
-    existing = current[0]
+    if not overlapping:
+        return SlotDecision(
+            "add",
+            candidate.scope,
+            candidate.subject_key,
+            candidate.predicate_key,
+            tuple(fact.fact_id for fact in current),
+            reason="valid intervals do not overlap",
+        )
+
+    existing = overlapping[0] if overlapping else current[0]
     candidate_time = _parse_timestamp(candidate.valid_from)
     existing_time = _parse_timestamp(existing.valid_from)
     candidate_is_not_older = existing_time is None or (
@@ -768,6 +1243,127 @@ def open_state_conflict(
     )
 
 
+def open_untyped_conflict(
+    conn: sqlite3.Connection,
+    existing_fact_ids: tuple[int, ...],
+    *,
+    scope: str,
+    subject_key: str,
+    predicate_key: str,
+    detected_at: Optional[str] = None,
+    detail_json: str = "{}",
+) -> ConflictRecord:
+    """Open a conflict for current untyped facts that disagree in the same scope.
+
+    Slot keys are caller-supplied labels for the receipt, not inferred here.
+    Members stay non-state so the typed unique projection is unchanged.
+    """
+
+    subject_key = normalize_subject_key(_required(subject_key, "subject_key"))
+    predicate_key = normalize_predicate_key(_required(predicate_key, "predicate_key"))
+    scope = _required(scope, "scope")
+    if not existing_fact_ids:
+        raise ValueError("a conflict requires at least one existing fact")
+    if len(set(existing_fact_ids)) != len(existing_fact_ids):
+        raise ValueError("conflict member ids must be unique")
+    detail_json = _json_object(detail_json)
+    detected_at = detected_at or _utc_now()
+    _parse_timestamp(detected_at)
+
+    columns = _fact_columns(conn)
+    kind_pred = ""
+    if "memory_kind" in columns:
+        kind_pred = "AND (memory_kind IS NULL OR memory_kind != 'state')"
+    placeholders = ",".join("?" for _ in existing_fact_ids)
+    rows = conn.execute(
+        f"""
+        SELECT fact_id FROM facts
+        WHERE fact_id IN ({placeholders})
+          AND scope = ?
+          AND invalid_at IS NULL AND superseded_by IS NULL
+          AND conflict_group IS NULL
+          {kind_pred}
+        """,
+        (*existing_fact_ids, scope),
+    ).fetchall()
+    found = {int(row[0]) for row in rows}
+    if found != set(existing_fact_ids):
+        raise StateSlotInvariantError(
+            "every untyped conflict member must be an active non-state fact in scope"
+        )
+
+    conflict_id = str(uuid.uuid4())
+    conn.execute(
+        """
+        INSERT INTO fact_conflicts (
+            conflict_id, scope, subject_key, predicate_key, detected_at, detail_json
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (conflict_id, scope, subject_key, predicate_key, detected_at, detail_json),
+    )
+    assignments = ["conflict_group = ?"]
+    values: list[object] = [conflict_id]
+    if "subject_key" in columns:
+        assignments.append("subject_key = COALESCE(subject_key, ?)")
+        values.append(subject_key)
+    if "predicate_key" in columns:
+        assignments.append("predicate_key = COALESCE(predicate_key, ?)")
+        values.append(predicate_key)
+    conn.execute(
+        f"UPDATE facts SET {', '.join(assignments)} WHERE fact_id IN ({placeholders})",
+        (*values, *existing_fact_ids),
+    )
+    conn.executemany(
+        "INSERT INTO fact_conflict_members(conflict_id, fact_id) VALUES (?, ?)",
+        ((conflict_id, fact_id) for fact_id in existing_fact_ids),
+    )
+    return ConflictRecord(
+        conflict_id,
+        scope,
+        subject_key,
+        predicate_key,
+        tuple(existing_fact_ids),
+        detected_at,
+    )
+
+
+def add_untyped_conflict_member(
+    conn: sqlite3.Connection, conflict_id: str, fact_id: int
+) -> None:
+    """Attach a newly inserted untyped fact to an open conflict."""
+
+    row = conn.execute(
+        """
+        SELECT c.scope FROM fact_conflicts c
+        WHERE c.conflict_id = ? AND c.resolved_at IS NULL
+        """,
+        (conflict_id,),
+    ).fetchone()
+    if row is None:
+        raise ValueError("conflict does not exist or is already resolved")
+    columns = _fact_columns(conn)
+    kind_select = "memory_kind" if "memory_kind" in columns else "NULL"
+    fact = conn.execute(
+        f"""
+        SELECT scope, conflict_group, {kind_select}, invalid_at, superseded_by
+        FROM facts WHERE fact_id = ?
+        """,
+        (fact_id,),
+    ).fetchone()
+    if fact is None or fact[0] != row[0] or str(fact[1]) != conflict_id:
+        raise StateSlotInvariantError(
+            "new untyped conflict member must be current in the same scope and group"
+        )
+    if fact[2] == "state":
+        raise StateSlotInvariantError("typed state must use the state conflict path")
+    if fact[3] is not None or fact[4] is not None:
+        raise StateSlotInvariantError("new conflict member must be current")
+    conn.execute(
+        "INSERT INTO fact_conflict_members(conflict_id, fact_id) VALUES (?, ?)",
+        (conflict_id, fact_id),
+    )
+
+
 def add_conflict_member(
     conn: sqlite3.Connection, conflict_id: str, fact_id: int
 ) -> None:
@@ -846,11 +1442,22 @@ def resolve_state_conflict(
         placeholders = ",".join("?" for _ in losers)
         cursor = conn.execute(
             f"""
-            UPDATE facts SET invalid_at = ?, superseded_by = ?
+            UPDATE facts
+            SET invalid_at = ?, expired_at = ?, superseded_by = ?,
+                valid_to = (
+                    SELECT valid_from FROM facts WHERE fact_id = ?
+                )
             WHERE fact_id IN ({placeholders})
               AND conflict_group = ? AND invalid_at IS NULL
             """,
-            (resolved_at, resolution_fact_id, *losers, conflict_id),
+            (
+                resolved_at,
+                resolved_at,
+                resolution_fact_id,
+                resolution_fact_id,
+                *losers,
+                conflict_id,
+            ),
         )
         if cursor.rowcount != len(losers):
             raise StateSlotInvariantError("not all losing conflict members are current")

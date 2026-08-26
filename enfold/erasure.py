@@ -47,6 +47,59 @@ def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
     return {str(row[1]) for row in conn.execute(f'PRAGMA table_info("{table}")')}
 
 
+def _clone_shared_observation(
+    conn: sqlite3.Connection,
+    observation_id: int,
+    erased_fact_id: int,
+    erasure_id: str,
+) -> None:
+    """Keep other facts' evidence when they share the erased observation."""
+
+    others = [
+        int(row[0])
+        for row in conn.execute(
+            "SELECT DISTINCT fact_id FROM fact_provenance "
+            "WHERE observation_id = ? AND fact_id != ?",
+            (observation_id, erased_fact_id),
+        )
+    ]
+    if not others:
+        return
+    columns = [
+        str(row[1])
+        for row in conn.execute('PRAGMA table_info("observations")')
+        if str(row[1]) != "observation_id"
+    ]
+    source = conn.execute(
+        f'SELECT {", ".join(columns)} FROM observations WHERE observation_id = ?',
+        (observation_id,),
+    ).fetchone()
+    if source is None:
+        return
+    values = {name: source[index] for index, name in enumerate(columns)}
+    values["content_sha256"] = f"clone:{erasure_id}:{observation_id}"
+    insert_columns = list(values)
+    conn.execute(
+        f'INSERT INTO observations ({", ".join(insert_columns)}) '
+        f'VALUES ({", ".join("?" for _ in insert_columns)})',
+        tuple(values[name] for name in insert_columns),
+    )
+    clone_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+    conn.execute(
+        "UPDATE fact_provenance SET observation_id = ? "
+        "WHERE observation_id = ? AND fact_id != ?",
+        (clone_id, observation_id, erased_fact_id),
+    )
+    if _table_exists(conn, "memory_write_log") and "observation_id" in _columns(
+        conn, "memory_write_log"
+    ):
+        conn.execute(
+            "UPDATE memory_write_log SET observation_id = ? "
+            "WHERE observation_id = ? AND (fact_id IS NULL OR fact_id != ?)",
+            (clone_id, observation_id, erased_fact_id),
+        )
+
+
 def erase_fact(
     conn: sqlite3.Connection,
     fact_id: int,
@@ -114,6 +167,8 @@ def erase_fact(
     resolved_conflicts = 0
     try:
         conn.execute("BEGIN IMMEDIATE")
+        for observation_id in observation_ids:
+            _clone_shared_observation(conn, observation_id, fact_id, erasure_id)
         for observation_id in observation_ids:
             conn.execute(
                 """
@@ -205,10 +260,7 @@ def erase_fact(
                         or payload_digest in linked_payload_hashes
                         or stored_hash in linked_payload_hashes
                     )
-                    content_match = original and (
-                        original in payload_text or original in proposal_text
-                    )
-                    if not linked and not content_match:
+                    if not linked:
                         continue
                     replacement = json.dumps(
                         {"privacy_erased": True, "queue_id": int(queue_id)},
@@ -273,22 +325,15 @@ def erase_fact(
                     )
                 ]
                 if len(remaining) <= 1:
-                    winner = remaining[0] if remaining else None
-                    if winner is not None:
-                        conn.execute(
-                            "UPDATE facts SET conflict_group = NULL WHERE fact_id = ?",
-                            (winner,),
-                        )
                     conn.execute(
                         """
                         UPDATE fact_conflicts
-                        SET resolved_at = ?, resolution_fact_id = ?,
+                        SET resolved_at = ?, resolution_fact_id = NULL,
                             resolved_by = ?, resolution_reason = ?
                         WHERE conflict_id = ? AND resolved_at IS NULL
                         """,
                         (
                             erased_at,
-                            winner,
                             requested_by,
                             "privacy erasure removed a conflict member",
                             conflict_id,

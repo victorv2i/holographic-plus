@@ -47,6 +47,7 @@ def test_slow_query_embedding_does_not_block_write_or_second_read(
     conn = sqlite3.connect(database_path)
     migrate(conn)
     conn.close()
+    database_path.chmod(0o600)
     config_path = tmp_path / "server.json"
     config_path.write_text(
         json.dumps(
@@ -160,6 +161,7 @@ def test_read_only_connection_rejects_insert(tmp_path):
     conn = sqlite3.connect(database_path)
     migrate(conn)
     conn.close()
+    database_path.chmod(0o600)
     config = ServerConfig(
         database_path=database_path,
         socket_path=tmp_path / "enfold.sock",

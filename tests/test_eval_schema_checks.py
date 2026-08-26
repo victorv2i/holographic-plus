@@ -34,10 +34,25 @@ def test_inspect_memory_schema_flags_missing_sota_layers(tmp_path):
 
     report = inspect_memory_schema(db)
 
-    assert report["sota_gates"]["provenance_tables"] is True
+    assert report["sota_gates"]["provenance_tables"] is False
     assert report["sota_gates"]["temporal_supersession"] is False
     assert "fact_provenance" in report["warnings"]["missing_provenance_tables"]
     assert "valid_from" in report["missing"]["fact_columns"]
+
+
+def test_inspect_memory_schema_passes_provenance_gate_only_when_tables_exist(tmp_path):
+    db = tmp_path / "memory.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE facts (fact_id INTEGER PRIMARY KEY, content TEXT)")
+    conn.execute("CREATE TABLE raw_episodes (episode_id INTEGER PRIMARY KEY)")
+    conn.execute("CREATE TABLE fact_provenance (fact_id INTEGER, episode_id INTEGER)")
+    conn.commit()
+    conn.close()
+
+    report = inspect_memory_schema(db)
+
+    assert report["sota_gates"]["provenance_tables"] is True
+    assert report["warnings"]["missing_provenance_tables"] == []
 
 
 def test_inspect_memory_schema_counts_non_terminal_extract_queue_statuses(tmp_path):

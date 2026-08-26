@@ -112,6 +112,9 @@ def connect_database(
 
     This does not create tables.  Call :func:`ensure_core_schema` explicitly
     for a new store or run the migration layer for an existing store.
+    ``check_same_thread=False`` does not make the connection safe for
+    concurrent threads.  The caller must give the connection one owner
+    thread and serialize every use of it.
     """
 
     if busy_timeout_ms < 0:

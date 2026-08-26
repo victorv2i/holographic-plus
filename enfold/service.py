@@ -19,25 +19,37 @@ from typing import Any, Callable, Mapping, Sequence
 from .context import TRUNCATION_MARKER, pack_context
 from .core_store import build_visibility_predicate, insert_fact
 from .extraction_enqueue import ExtractionEnqueuer, MAX_EXTRACTION_PAYLOAD_BYTES
+from .extraction_spans import TranscriptInput, normalize_transcript
 from .embedding_jobs import EmbeddingOutbox
 from .hybrid_retrieval import RetrieverFactory, deterministic_retriever_factory
 from .policy import (
     MemoryPolicy,
     UnknownMemoryClient,
     default_credential_screen,
+    is_run_scope,
+    scope_authorized,
     validate_scope,
 )
 from .protocol import (
     IMMUTABLE_CONTEXT_FIELDS,
     ClientContext,
+    ProtocolValidationError,
     Request,
     RequestHandlingError,
     SUPPORTED_SCHEMA_VERSION,
+    optional_as_of_timestamp,
 )
 from .provenance import ConnectionContext, WriteRequest
 from .projections import changes, entities, entity_dossier, timeline
 from .schema import require_compatible_schema
-from .state_slots import StateCandidate, list_state_conflicts, resolve_state_conflict
+from .state_slots import (
+    ConflictReceipt,
+    StateCandidate,
+    list_conflict_receipts,
+    list_state_conflicts,
+    resolve_state_conflict,
+)
+from .temporal import row_matches_as_of
 from .write_service import (
     FactWriteResult,
     IdempotencyConflict,
@@ -72,7 +84,9 @@ _FACT_FIELDS = (
     "created_at",
     "updated_at",
     "valid_from",
+    "valid_to",
     "invalid_at",
+    "expired_at",
     "superseded_by",
     "memory_kind",
     "subject_key",
@@ -155,6 +169,15 @@ class OutputBounds:
 
 
 DEFAULT_OUTPUT_BOUNDS = OutputBounds()
+_QUERY_STOPWORDS = frozenset(
+    "a an the is are was were be of to in on at for and or with by as it this "
+    "that from what does do did how why who where when use uses using".split()
+)
+
+
+def _query_tokens(text: str) -> set[str]:
+    cleaned = "".join(char.lower() if char.isalnum() else " " for char in text)
+    return {token for token in cleaned.split() if token}
 
 
 def _check_keys(
@@ -317,14 +340,14 @@ def _json_object(value: Any, name: str) -> str:
 
 def _extraction_payload_bytes(
     context: ConnectionContext,
-    transcript: str,
+    transcript: TranscriptInput,
     source: str,
     scope: str,
     metadata: Mapping[str, Any],
 ) -> int:
+    transcript_text, turns = normalize_transcript(transcript)
     envelope = {
         "version": 1,
-        "transcript": transcript,
         "source": source,
         "scope": scope,
         "provenance": {
@@ -341,6 +364,10 @@ def _extraction_payload_bytes(
         },
         "metadata": dict(metadata),
     }
+    if turns is None:
+        envelope["transcript"] = transcript_text
+    else:
+        envelope["turns"] = list(turns)
     payload = json.dumps(
         envelope,
         sort_keys=True,
@@ -405,11 +432,11 @@ class EnfoldService:
         output_bounds: OutputBounds = DEFAULT_OUTPUT_BOUNDS,
         embedding_identity: str | None = None,
         query_embedder: Callable[[str], object] | None = None,
-        near_dedup_enabled: bool = True,
+        near_dedup_enabled: bool = False,
     ):
         if conn.in_transaction:
             raise RuntimeError("EnfoldService requires an idle connection")
-        version = require_compatible_schema(conn)
+        version = require_compatible_schema(conn, for_writer=True)
         if version != SUPPORTED_SCHEMA_VERSION:
             raise RuntimeError(
                 f"EnfoldService requires schema v{SUPPORTED_SCHEMA_VERSION}; found v{version}"
@@ -448,13 +475,28 @@ class EnfoldService:
         }:
             raise ValueError("extraction_processing_mode is invalid")
         self._extraction_processing_mode = extraction_processing_mode
+        available = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(facts)")
+        }
+        self._fact_field_names = tuple(
+            name for name in _FACT_FIELDS if name in available
+        )
+
+    def retrieval_metadata_for(self, conn: sqlite3.Connection) -> dict[str, Any]:
+        """Inspect retrieval capabilities on a caller-owned connection.
+
+        Health must pass a read-only snapshot connection, not the writer
+        connection used by ``MemoryWriteService``.
+        """
+
+        retriever = self._retriever_factory(conn, ("private",))
+        return dict(retriever.metadata)
 
     @property
     def retrieval_metadata(self) -> dict[str, Any]:
         """Non-sensitive retrieval capabilities for health/inspection output."""
 
-        retriever = self._retriever_factory(self._conn, ("private",))
-        return dict(retriever.metadata)
+        return self.retrieval_metadata_for(self._conn)
 
     def __call__(self, context: ClientContext, request: Request) -> dict[str, Any]:
         return self.handle(context, request)
@@ -480,6 +522,7 @@ class EnfoldService:
             "memory.conflicts": self._conflicts,
             "memory.resolve_conflict": self._resolve_conflict,
             "memory.extraction.enqueue": self._enqueue_extraction,
+            "memory.promote": self._promote,
         }
         route = routes.get(request.method)
         if route is None:
@@ -639,6 +682,95 @@ class EnfoldService:
         result["detail"] = json.loads(result.pop("detail_json"))
         return result
 
+    def _promote(
+        self, context: ConnectionContext, params: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Copy a current run-scoped fact onto a durable granted scope."""
+
+        _check_keys(params, {"fact_id", "idempotency_key"}, {"target_scope"})
+        fact_id = _positive_int(params["fact_id"], "fact_id")
+        try:
+            target_scope = validate_scope(
+                _text(params.get("target_scope", "private"), "target_scope")
+            )
+        except ValueError as exc:
+            raise ServiceRequestError("invalid_params", str(exc)) from exc
+        if is_run_scope(target_scope):
+            raise ServiceRequestError(
+                "invalid_params", "promote target must be a durable granted scope"
+            )
+        if target_scope not in context.access_scopes:
+            raise ServiceRequestError(
+                "access_denied", "requested memory scope is not authorized"
+            )
+        source = self._load_fact(fact_id)
+        if source is None or not self._fact_is_visible(context, source):
+            raise ServiceRequestError("access_denied", "fact is not visible")
+        if not is_run_scope(source["scope"]):
+            raise ServiceRequestError(
+                "invalid_params", "only run-scoped facts can be promoted"
+            )
+        if source["invalid_at"] is not None or source["superseded_by"] is not None:
+            raise ServiceRequestError("invalid_params", "source fact is not current")
+        return self._write(
+            context,
+            {
+                "idempotency_key": _text(params["idempotency_key"], "idempotency_key"),
+                "content": source["content"],
+                "source_type": "promotion",
+                "category": source["category"] or "general",
+                "tags": source["tags"] or "",
+                "trust_score": source["trust_score"],
+                "source_authority": source["source_authority"],
+                "source_uri": f"enfold:fact:{fact_id}",
+                "scope": target_scope,
+                "sensitivity": source["sensitivity"] or "normal",
+                "relation": "derived_from",
+                "metadata": {
+                    "promoted_from_fact_id": fact_id,
+                    "promoted_from_scope": source["scope"],
+                },
+            },
+        )
+
+    def _fact_fields(self) -> tuple[str, ...]:
+        cached = getattr(self, "_fact_field_names", None)
+        if cached is not None:
+            return cached
+        available = {
+            str(row[1]) for row in self._conn.execute("PRAGMA table_info(facts)")
+        }
+        return tuple(name for name in _FACT_FIELDS if name in available)
+
+    def _load_fact(self, fact_id: int) -> dict[str, Any] | None:
+        fields = self._fact_fields()
+        columns = ", ".join(fields)
+        row = self._conn.execute(
+            f"SELECT {columns} FROM facts WHERE fact_id = ?",
+            (fact_id,),
+        ).fetchone()
+        return dict(zip(fields, row)) if row is not None else None
+
+    @staticmethod
+    def _fact_is_visible(
+        context: ConnectionContext, source: Mapping[str, Any]
+    ) -> bool:
+        if not scope_authorized(str(source["scope"]), context.access_scopes):
+            return False
+        sensitivity = source.get("sensitivity") or "normal"
+        return not (
+            sensitivity in {"sensitive", "secret"}
+            and sensitivity not in context.access_scopes
+        )
+
+    def _authorized_read_scopes(
+        self, context: ConnectionContext, fact_id: int
+    ) -> tuple[str, ...] | None:
+        source = self._load_fact(fact_id)
+        if source is None or not self._fact_is_visible(context, source):
+            return None
+        return tuple(dict.fromkeys((*context.access_scopes, str(source["scope"]))))
+
     @staticmethod
     def _invalid(message: str) -> Any:
         raise ServiceRequestError("invalid_params", message)
@@ -653,7 +785,7 @@ class EnfoldService:
         _check_keys(
             value,
             {"subject_key", "predicate_key"},
-            {"object_value", "valid_from"},
+            {"object_value", "valid_from", "valid_to"},
         )
         return StateCandidate(
             content=write.content,
@@ -664,28 +796,65 @@ class EnfoldService:
             ),
             source_authority=write.source_authority,
             valid_from=_optional_text(value.get("valid_from"), "state.valid_from"),
+            valid_to=_optional_text(value.get("valid_to"), "state.valid_to"),
             scope=write.scope,
         )
 
     def _search(
         self, context: ConnectionContext, params: Mapping[str, Any]
     ) -> dict[str, Any]:
-        _check_keys(params, {"query"}, {"category", "min_trust", "limit"})
+        _check_keys(
+            params,
+            {"query"},
+            {
+                "category",
+                "min_trust",
+                "limit",
+                "scope",
+                "include_unreviewed",
+                "as_of_valid",
+                "as_of_tx",
+            },
+        )
         query = _text(params["query"], "query")
         category = _optional_text(params.get("category"), "category")
         bounds = self._output_bounds
         min_trust = _number(
             params.get("min_trust"), "min_trust", bounds.default_min_trust
         )
+        include_unreviewed = _boolean(
+            params.get("include_unreviewed"), "include_unreviewed", False
+        )
         requested_limit = _limit(params.get("limit"), default=20)
         limit = min(requested_limit, bounds.search_max_results)
-        retriever = self._retriever_factory(self._conn, context.access_scopes)
-        rows = retriever.search(
-            query,
-            category=category,
-            min_trust=min_trust,
-            limit=limit + 1,
-        )
+        scopes = self._requested_scopes(context, params.get("scope"))
+        try:
+            as_of_valid = optional_as_of_timestamp(
+                params.get("as_of_valid"), "as_of_valid"
+            )
+            as_of_tx = optional_as_of_timestamp(params.get("as_of_tx"), "as_of_tx")
+        except ProtocolValidationError as exc:
+            raise ServiceRequestError("invalid_params", str(exc)) from exc
+        retriever = self._retriever_factory(self._conn, scopes)
+        if as_of_valid is not None or as_of_tx is not None:
+            rows = self._search_as_of(
+                query,
+                scopes=scopes,
+                category=category,
+                min_trust=min_trust,
+                limit=limit + 1,
+                include_unreviewed=include_unreviewed,
+                as_of_valid=as_of_valid,
+                as_of_tx=as_of_tx,
+            )
+        else:
+            rows = retriever.search(
+                query,
+                category=category,
+                min_trust=min_trust,
+                limit=limit + 1,
+                include_unreviewed=include_unreviewed,
+            )
         result_cap_truncated = len(rows) > limit
         rows = rows[:limit]
         facts = []
@@ -693,7 +862,7 @@ class EnfoldService:
         for row in rows:
             fact = self._safe_fact(row)
             fact["attribution"] = self._authorized_attribution(
-                int(fact["fact_id"]), context.access_scopes
+                int(fact["fact_id"]), scopes
             )
             content_truncated |= _truncate_fact_content(fact, bounds.max_fact_chars)
             facts.append(fact)
@@ -703,6 +872,10 @@ class EnfoldService:
             "output_truncated": (
                 content_truncated or requested_limit > limit or result_cap_truncated
             ),
+            "open_conflicts": [
+                self._receipt_as_dict(item)
+                for item in self._relevant_conflict_receipts(scopes, query)
+            ],
         }
         while facts and _serialized_chars(response) > bounds.search_max_total_chars:
             facts.pop()
@@ -712,6 +885,65 @@ class EnfoldService:
         if _serialized_chars(response) > bounds.search_max_total_chars:
             response["retrieval"] = {}
         return response
+
+    def _search_as_of(
+        self,
+        query: str,
+        *,
+        scopes: Sequence[str],
+        category: str | None,
+        min_trust: float,
+        limit: int,
+        include_unreviewed: bool,
+        as_of_valid: str | None,
+        as_of_tx: str | None,
+    ) -> list[dict[str, Any]]:
+        selected = list(self._fact_fields())
+        available = set(selected)
+        columns = ", ".join(f"f.{name}" for name in selected)
+        visibility_sql, visibility_params = build_visibility_predicate(
+            scopes,
+            scope_column="f.scope",
+            sensitivity_column="f.sensitivity",
+        )
+        tokens = [token for token in query.replace(",", " ").split() if token]
+        if not tokens:
+            return []
+        match = " AND ".join(tokens)
+        predicates = [
+            "facts_fts MATCH ?",
+            visibility_sql,
+            "f.trust_score >= ?",
+        ]
+        params: list[Any] = [match, *visibility_params, min_trust]
+        if as_of_tx is None:
+            predicates.append("f.conflict_group IS NULL")
+        if category is not None:
+            predicates.append("f.category = ?")
+            params.append(category)
+        if not include_unreviewed and "correction_status" in available:
+            predicates.append("f.correction_status IS NOT ?")
+            params.append("unreviewed")
+        rows = self._conn.execute(
+            f"""
+            SELECT {columns}
+            FROM facts f
+            JOIN facts_fts ON facts_fts.rowid = f.fact_id
+            WHERE {" AND ".join(predicates)}
+            ORDER BY f.trust_score DESC, f.fact_id
+            """,
+            params,
+        ).fetchall()
+        matched: list[dict[str, Any]] = []
+        for row in rows:
+            fact = dict(zip(selected, row))
+            if row_matches_as_of(
+                fact, as_of_valid=as_of_valid, as_of_tx=as_of_tx
+            ):
+                matched.append(fact)
+            if len(matched) >= limit:
+                break
+        return matched
 
     def _context(
         self, context: ConnectionContext, params: Mapping[str, Any]
@@ -749,6 +981,8 @@ class EnfoldService:
                 int(fact["fact_id"]), scopes
             )
             candidates.append(fact)
+        receipts = self._relevant_conflict_receipts(scopes, query)
+        receipt_maps = [self._receipt_as_dict(item) for item in receipts]
         output_truncated = result_cap_truncated
         while True:
             packed = pack_context(
@@ -757,12 +991,19 @@ class EnfoldService:
                 max_fact_chars=bounds.max_fact_chars,
                 max_facts=bounds.context_max_results,
                 mmr_lambda=bounds.context_mmr_lambda,
+                conflict_receipts=receipt_maps,
             ).as_dict()
             output_truncated |= any(
                 bool(fact.get("context_truncated")) for fact in packed["facts"]
             )
             packed["retrieval"] = dict(retriever.metadata)
             packed["output_truncated"] = output_truncated
+            packed["open_conflicts"] = receipt_maps
+            packed["facts"] = [
+                fact
+                for fact in packed["facts"]
+                if fact.get("exclusion_reason") != "open_conflict"
+            ]
             if _serialized_chars(packed) <= bounds.context_max_total_chars:
                 return packed
             output_truncated = True
@@ -789,7 +1030,7 @@ class EnfoldService:
             scope = validate_scope(scope)
         except ValueError as exc:
             raise ServiceRequestError("invalid_params", str(exc)) from exc
-        if scope not in context.access_scopes:
+        if not scope_authorized(scope, context.access_scopes):
             raise ServiceRequestError(
                 "access_denied", "extraction scope is not authorized"
             )
@@ -799,7 +1040,11 @@ class EnfoldService:
                 "reason": "secret durable extraction payloads are disabled",
                 "queue_id": None,
             }
-        transcript = _text(params["transcript"], "transcript")
+        try:
+            transcript_text, turns = normalize_transcript(params["transcript"])
+        except (TypeError, ValueError) as exc:
+            raise ServiceRequestError("invalid_params", str(exc)) from exc
+        transcript: TranscriptInput = transcript_text if turns is None else turns
         source = _text(params["source"], "source")
         metadata_json = _json_object(params.get("metadata"), "metadata")
         metadata = json.loads(metadata_json)
@@ -814,7 +1059,7 @@ class EnfoldService:
             )
         screen_request = WriteRequest(
             idempotency_key="extraction-screen",
-            content=transcript,
+            content=transcript_text,
             source_type="conversation_transcript",
             scope=scope,
             metadata_json=metadata_json,
@@ -845,10 +1090,19 @@ class EnfoldService:
         limit = _limit(params.get("limit"), default=100)
         fact = self._historical_fact(fact_id, context.access_scopes)
         if fact is None:
-            raise ServiceRequestError("not_found", "fact was not found")
+            scopes = self._authorized_read_scopes(context, fact_id)
+            if scopes is None:
+                raise ServiceRequestError("not_found", "fact was not found")
+            fact = self._historical_fact(fact_id, scopes)
+            if fact is None:
+                raise ServiceRequestError("not_found", "fact was not found")
+        else:
+            scopes = tuple(
+                dict.fromkeys((*context.access_scopes, str(fact["scope"])))
+            )
         observation_visibility_sql, observation_visibility_params = (
             build_visibility_predicate(
-                context.access_scopes,
+                scopes,
                 scope_column="o.scope",
                 sensitivity_column="o.sensitivity",
             )
@@ -953,7 +1207,16 @@ class EnfoldService:
             fact_id = _positive_int(params["fact_id"], "fact_id")
             anchor = self._historical_fact(fact_id, context.access_scopes)
             if anchor is None:
-                raise ServiceRequestError("not_found", "fact was not found")
+                scopes = self._authorized_read_scopes(context, fact_id)
+                if scopes is None:
+                    raise ServiceRequestError("not_found", "fact was not found")
+                anchor = self._historical_fact(fact_id, scopes)
+                if anchor is None:
+                    raise ServiceRequestError("not_found", "fact was not found")
+            else:
+                scopes = tuple(
+                    dict.fromkeys((*context.access_scopes, str(anchor["scope"])))
+                )
             if anchor.get("subject_key") and anchor.get("predicate_key"):
                 scopes = tuple(
                     dict.fromkeys(
@@ -971,9 +1234,7 @@ class EnfoldService:
                 predicate = str(anchor["predicate_key"])
                 rows = self._slot_history(scopes, subject, predicate, limit + 1)
             else:
-                rows = self._fact_history(
-                    context.access_scopes, fact_id, limit + 1
-                )
+                rows = self._fact_history(scopes, fact_id, limit + 1)
         else:
             if "subject_key" not in params or "predicate_key" not in params:
                 raise ServiceRequestError(
@@ -1014,6 +1275,55 @@ class EnfoldService:
         finally:
             rows.close()
         return response
+
+    @staticmethod
+    def _receipt_as_dict(receipt: ConflictReceipt) -> dict[str, Any]:
+        return {
+            "conflict_id": receipt.conflict_id,
+            "scope": receipt.scope,
+            "subject_key": receipt.subject_key,
+            "predicate_key": receipt.predicate_key,
+            "member_fact_ids": list(receipt.member_fact_ids),
+            "summary": receipt.summary,
+        }
+
+    def _relevant_conflict_receipts(
+        self, scopes: Sequence[str], query: str
+    ) -> tuple[ConflictReceipt, ...]:
+        tokens = _query_tokens(query) - _QUERY_STOPWORDS
+        if not tokens:
+            tokens = _query_tokens(query)
+        if not tokens:
+            return ()
+        receipts: list[ConflictReceipt] = []
+        seen: set[str] = set()
+        for scope in scopes:
+            for receipt in list_conflict_receipts(
+                self._conn,
+                scope,
+                visibility_scopes=tuple(scopes),
+            ):
+                if receipt.conflict_id in seen:
+                    continue
+                seen.add(receipt.conflict_id)
+                receipts.append(receipt)
+        matched: list[ConflictReceipt] = []
+        for receipt in receipts:
+            haystack = _query_tokens(
+                f"{receipt.subject_key} {receipt.predicate_key} {receipt.summary}"
+            )
+            for fact_id in receipt.member_fact_ids:
+                row = self._conn.execute(
+                    "SELECT content FROM facts WHERE fact_id = ?",
+                    (fact_id,),
+                ).fetchone()
+                if row is not None:
+                    haystack.update(_query_tokens(str(row[0])))
+            overlap = tokens & haystack
+            distinctive = {token for token in tokens if len(token) >= 6}
+            if len(overlap) >= 2 or distinctive & haystack:
+                matched.append(receipt)
+        return tuple(matched)
 
     def _conflicts(
         self, context: ConnectionContext, params: Mapping[str, Any]
@@ -1062,7 +1372,8 @@ class EnfoldService:
         if member_ids:
             placeholders = ",".join("?" for _ in member_ids)
             scope_placeholders = ",".join("?" for _ in scopes)
-            columns = ", ".join(_FACT_FIELDS)
+            fields = self._fact_fields()
+            columns = ", ".join(fields)
             rows = self._conn.execute(
                 f"SELECT {columns} FROM facts "
                 f"WHERE fact_id IN ({placeholders}) "
@@ -1070,7 +1381,7 @@ class EnfoldService:
                 (*member_ids, *scopes),
             ).fetchall()
             members_by_id = {
-                int(row[0]): dict(zip(_FACT_FIELDS, row)) for row in rows
+                int(row[0]): dict(zip(fields, row)) for row in rows
             }
         conflicts: list[dict[str, Any]] = []
         response = {"conflicts": conflicts, "output_truncated": output_truncated}
@@ -1300,18 +1611,19 @@ class EnfoldService:
     def _historical_fact(
         self, fact_id: int, scopes: Sequence[str]
     ) -> dict[str, Any] | None:
-        columns = ", ".join(_FACT_FIELDS)
+        fields = self._fact_fields()
+        columns = ", ".join(fields)
         visibility_sql, visibility_params = build_visibility_predicate(scopes)
         row = self._conn.execute(
             f"SELECT {columns} FROM facts WHERE fact_id = ? AND {visibility_sql}",
             (fact_id, *visibility_params),
         ).fetchone()
-        return dict(zip(_FACT_FIELDS, row)) if row is not None else None
+        return dict(zip(fields, row)) if row is not None else None
 
     def _slot_history(
         self, scopes: Sequence[str], subject: str, predicate: str, limit: int
     ) -> sqlite3.Cursor:
-        columns = ", ".join(_FACT_FIELDS)
+        columns = ", ".join(self._fact_fields())
         visibility_sql, visibility_params = build_visibility_predicate(scopes)
         return self._conn.execute(
             f"""
@@ -1327,7 +1639,7 @@ class EnfoldService:
     def _fact_history(
         self, scopes: Sequence[str], fact_id: int, limit: int
     ) -> sqlite3.Cursor:
-        columns = ", ".join(f"f.{name}" for name in _FACT_FIELDS)
+        columns = ", ".join(f"f.{name}" for name in self._fact_fields())
         anchor_sql, anchor_params = build_visibility_predicate(scopes)
         previous_sql, previous_params = build_visibility_predicate(
             scopes,
@@ -1387,7 +1699,7 @@ class EnfoldService:
             scope = validate_scope(_text(requested, "scope"))
         except ValueError as exc:
             raise ServiceRequestError("invalid_params", str(exc)) from exc
-        if scope not in context.access_scopes:
+        if not scope_authorized(scope, context.access_scopes):
             raise ServiceRequestError(
                 "access_denied", "requested memory scope is not authorized"
             )

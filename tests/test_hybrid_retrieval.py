@@ -15,6 +15,7 @@ from enfold.hybrid_retrieval import (
     VectorFallbackTelemetry,
     VersionedStoredEmbeddingAdapter,
     deterministic_retriever_factory,
+    lexical_retriever_factory,
     named_anchor_tokens,
 )
 from enfold.embeddings import embedding_to_bytes
@@ -96,7 +97,11 @@ def test_negative_dense_cosine_is_clamped_to_zero(tmp_path):
     )
 
     base_only = RankingConfig(
-        trust_weight=0.0, memory_kind_weight=0.0, recency_weight=0.0
+        trust_weight=0.0,
+        memory_kind_weight=0.0,
+        recency_weight=0.0,
+        review_weight=0.0,
+        named_subject_weight=0.0,
     )
     rows = HybridRetriever(
         conn, embedder, min_score=0.0, ranking_config=base_only
@@ -122,15 +127,20 @@ def test_combined_score_orders_lexical_and_dense_signals_together(tmp_path):
     )
 
     base_only = RankingConfig(
-        trust_weight=0.0, memory_kind_weight=0.0, recency_weight=0.0
+        trust_weight=0.0,
+        memory_kind_weight=0.0,
+        recency_weight=0.0,
+        review_weight=0.0,
+        named_subject_weight=0.0,
     )
     rows = HybridRetriever(conn, embedder, ranking_config=base_only).search(
         "ranking query"
     )
 
     assert [row["fact_id"] for row in rows] == [2, 1]
-    assert rows[0]["score"] == pytest.approx(0.35 + 0.25 * 0.5 + 0.4 * 0.5)
-    assert rows[1]["score"] == pytest.approx(0.4)
+    assert rows[0]["fusion_score"] > rows[1]["fusion_score"]
+    assert rows[0]["score"] == pytest.approx(rows[0]["fusion_score"])
+    assert rows[1]["score"] == pytest.approx(rows[1]["fusion_score"])
     conn.close()
 
 
@@ -308,6 +318,49 @@ def test_named_anchor_abstains_before_calling_dense_embedder(tmp_path):
     conn.close()
 
 
+def test_multi_person_query_keeps_the_strongest_shared_name_cluster(tmp_path):
+    conn = _store(tmp_path)
+    nira = "Nira Solano Voss is Ada's partner."
+    mira = "Mira Calder works with Ada on CRU projects."
+    _fact(conn, 1, nira, tags="people,nira")
+    _fact(conn, 2, mira, tags="people,mira")
+    conn.commit()
+    query = "Nira Solano Voss Mira Calder Pia Renwick relationship"
+    embedder = TableEmbedder(
+        {
+            query: (1.0, 0.0),
+            nira: (0.9, 0.1),
+            mira: (0.8, 0.2),
+        }
+    )
+
+    rows = HybridRetriever(conn, embedder).search(query)
+
+    assert {row["fact_id"] for row in rows} == {1}
+    conn.close()
+
+
+def test_overconstrained_named_anchors_keep_the_best_supported_cluster(tmp_path):
+    conn = _store(tmp_path)
+    content = "Ada Morrow works for Northline Online."
+    _fact(conn, 1, content, tags="work,northline")
+    _fact(conn, 2, "A recipe calls for toasted walnuts")
+    conn.commit()
+    query = "Ada Morrow lives in Seaview Northline Enfold"
+    embedder = TableEmbedder(
+        {
+            query: (1.0, 0.0),
+            content: (1.0, 0.0),
+            "A recipe calls for toasted walnuts": (0.0, 1.0),
+        }
+    )
+
+    rows = HybridRetriever(conn, embedder).search(query)
+
+    assert [row["fact_id"] for row in rows] == [1]
+    conn.close()
+
+
 def test_polite_sentence_opener_is_not_a_named_anchor(tmp_path):
     conn = _store(tmp_path)
     content = "Orchid status is ready for review"
@@ -333,16 +386,16 @@ def test_polite_sentence_opener_is_not_a_named_anchor(tmp_path):
         ("How should Atlas-5 work through Relay?", frozenset({"atlas", "5", "relay"})),
         ("I need the Nimbus monitor status", frozenset({"nimbus"})),
         ("How do I inspect the Nimbus Monitor cron?", frozenset({"nimbus", "monitor"})),
-        ("What changed in July for Avery's persona?", frozenset({"july", "avery"})),
-        ("What did the April 11 system audit find?", frozenset({"april"})),
-        ("What did April decide?", frozenset({"april"})),
+        ("What changed in July for Avery's persona?", frozenset({"avery"})),
+        ("What did the April 11 system audit find?", frozenset()),
+        ("What did April decide?", frozenset()),
         (
             "What did the Avery-maintained Hermes note say?",
             frozenset({"avery", "hermes"}),
         ),
         ("Can you Show Orchid status?", frozenset({"orchid"})),
         ("Please Tell me about Orchid", frozenset({"orchid"})),
-        ("Tell me about May", frozenset({"may"})),
+        ("Tell me about May", frozenset()),
         ("Please find Orchid status", frozenset({"orchid"})),
     ],
 )
@@ -484,6 +537,53 @@ def test_deterministic_factory_reports_nonproduction_metadata(tmp_path):
     assert retriever.metadata["embedder_identity"] == "ci-feature-hash-v1:64"
     assert retriever.metadata["embedder_production_ready"] is False
     assert retriever.metadata["filter_before_dense_ranking"] is True
+    conn.close()
+
+
+def test_local_lexical_factory_is_production_ready_and_never_embeds(tmp_path):
+    conn = _store(tmp_path)
+    _fact(conn, 1, "The test preference is dark mode")
+    conn.commit()
+    retriever = lexical_retriever_factory()(conn, ("private",))
+
+    rows = retriever.search("test preference dark mode")
+
+    assert [row["fact_id"] for row in rows] == [1]
+    assert rows[0]["dense_score"] == 0.0
+    assert retriever.metadata["embedder_identity"] == "local-lexical-v1"
+    assert retriever.metadata["embedder_production_ready"] is True
+    assert retriever.metadata["dense_scoring"] == "disabled"
+    assert retriever.metadata["vector_backend"] == "disabled"
+    assert retriever.metadata["candidate_generation"] == "lexical"
+    assert retriever.metadata["weights"]["dense"] == 0.0
+    conn.close()
+
+
+def test_local_lexical_cannot_invent_paraphrase_matches(tmp_path):
+    conn = _store(tmp_path)
+    _fact(conn, 1, "Atlas vault retains tuesday snapshots")
+    conn.commit()
+    retriever = lexical_retriever_factory()(conn, ("private",))
+
+    rows = retriever.search("Where are nightly copies kept?")
+
+    assert rows == []
+    conn.close()
+
+
+def test_local_lexical_keeps_unreviewed_and_conflicted_facts_out_of_default_recall(
+    tmp_path,
+):
+    conn = _store(tmp_path)
+    _fact(conn, 1, "eligible current private memory")
+    _fact(conn, 2, "unreviewed private memory", correction_status="unreviewed")
+    _fact(conn, 3, "unsettled conflict memory", conflict_group="conflict-1")
+    conn.commit()
+    retriever = lexical_retriever_factory()(conn, ("private",))
+
+    rows = retriever.search("private memory")
+
+    assert [row["fact_id"] for row in rows] == [1]
     conn.close()
 
 
@@ -632,6 +732,110 @@ def test_sqlite_vec_prefilters_named_anchors_before_dense_scoring(
 
     assert scored_fact_ids == [(1,)]
     assert [row["fact_id"] for row in rows] == [1]
+    conn.close()
+
+
+def test_sqlite_vec_eligible_set_excludes_unreviewed_unless_opted_in(
+    tmp_path, monkeypatch
+):
+    conn = _store(tmp_path)
+    _embedding_table(conn)
+    _fact(conn, 1, "Avery prefers tea in the Cedar kitchen.")
+    _fact(
+        conn,
+        2,
+        "Avery is the chief executive of Cedar.",
+        correction_status="unreviewed",
+    )
+    _stored(conn, 1, (1.0, 0.0))
+    _stored(conn, 2, (1.0, 0.0))
+    conn.commit()
+    rebuild_sqlite_vec_index(conn, "fake:model:document:prefix:v1", 2)
+    retriever = HybridRetriever(
+        conn,
+        VersionedStoredEmbeddingAdapter(
+            _sqlite_backend(conn, FakeQueryEmbedder((1.0, 0.0)))
+        ),
+        allowed_scopes=("private",),
+        min_score=0.0,
+    )
+    assert retriever._vector_index is not None
+    scored_fact_ids = []
+
+    def capture_scores(query_vector, fact_ids):
+        scored_fact_ids.append(tuple(fact_ids))
+        return {fact_id: 1.0 for fact_id in fact_ids}
+
+    monkeypatch.setattr(retriever._vector_index, "scores", capture_scores)
+
+    default_rows = retriever.search("Avery Cedar", min_trust=0)
+    opted_in = retriever.search(
+        "Avery Cedar", min_trust=0, include_unreviewed=True
+    )
+
+    assert scored_fact_ids[0] == (1,)
+    assert [row["fact_id"] for row in default_rows] == [1]
+    assert {row["fact_id"] for row in opted_in} == {1, 2}
+    conn.close()
+
+
+def test_stored_mmr_embeddings_omit_partial_set_when_any_blob_is_unusable(tmp_path):
+    conn = _store(tmp_path)
+    _embedding_table(conn)
+    _fact(conn, 1, "Tuesday preference")
+    _fact(conn, 2, "Wednesday preference")
+    _stored(conn, 1, (1.0, 0.0))
+    conn.execute(
+        "INSERT INTO fact_embeddings(fact_id, embedding, dim, embedding_identity) "
+        "VALUES (?, ?, ?, ?)",
+        (2, b"not-a-vector", 2, "fake:model:document:prefix:v1"),
+    )
+    conn.commit()
+    retriever = HybridRetriever(
+        conn,
+        VersionedStoredEmbeddingAdapter(
+            _sqlite_backend(conn, FakeQueryEmbedder((1.0, 0.0)))
+        ),
+        allowed_scopes=("private",),
+    )
+
+    loaded = retriever._stored_mmr_embeddings([1, 2])
+
+    assert loaded == {}
+    conn.close()
+
+
+def test_search_does_not_attach_mixed_mmr_embeddings_with_a_queued_fact(tmp_path):
+    conn = _store(tmp_path)
+    _embedding_table(conn)
+    gold = "Nightly copies live in the west vault"
+    distractor = "The kitchen pantry holds dry goods"
+    query = "Where are west vault copies kept?"
+    _fact(conn, 1, distractor, trust_score=0.5)
+    _fact(conn, 2, gold, trust_score=0.5)
+    _stored(conn, 1, (1.0, 0.0))
+    conn.execute(
+        """
+        INSERT INTO embedding_jobs(
+            fact_id, document_identity, embedding_version, dimensions,
+            content_sha256, status, attempts, available_at, created_at, updated_at
+        ) VALUES (2, 'fake:model:document:prefix:v1', 'v1', 2, 'pending-hash',
+                  'pending', 0, '2026-07-12 12:00:00', '2026-07-12 12:00:00',
+                  '2026-07-12 12:00:00')
+        """
+    )
+    conn.commit()
+
+    rows = HybridRetriever(
+        conn,
+        VersionedStoredEmbeddingAdapter(
+            _sqlite_backend(conn, FakeQueryEmbedder((1.0, 0.0)))
+        ),
+        allowed_scopes=("private",),
+    ).search(query, min_trust=0)
+
+    assert {row["fact_id"] for row in rows} >= {1, 2}
+    assert all(row.get("_mmr_embedding") is None for row in rows)
     conn.close()
 
 

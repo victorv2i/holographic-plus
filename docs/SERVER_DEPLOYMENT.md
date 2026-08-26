@@ -12,9 +12,7 @@ Example configuration (store as a user-owned, non-group/world-writable file):
   "database_path": "/absolute/path/to/memory.db",
   "socket_path": "/absolute/private/directory/enfold.sock",
   "retrieval": {
-    "mode": "ci",
-    "allow_nonproduction": true,
-    "dimensions": 256
+    "mode": "local-lexical"
   },
   "grants": {
     "client-a-install-1": ["private", "work", "sensitive", "project:enfold"],
@@ -45,8 +43,13 @@ the daemon's Unix user may be able to inspect another process or its launch
 environment. Without `client_credentials`, every process under that UID is
 explicitly trusted to claim any configured client ID. Do not offer mutually
 untrusted tenants one daemon: use separate Unix accounts and separate Enfold
-daemon/database/socket instances. The daemon intentionally rejects socket
-peers whose kernel-reported UID differs from its own.
+daemon/database/socket instances. When Linux ``SO_PEERCRED`` is available
+and the kernel returns credentials, the daemon refuses a peer whose UID
+differs from its own. If ``SO_PEERCRED`` is missing or ``getsockopt``
+fails, that UID check is skipped and the client is served. Bootstrap writes a per-client credential digest with the grant.
+``.mcp-write.lock`` serializes only the legacy v0 MCP/Hermes
+writer. The v1 daemon holds ``.enfold.lock`` for its lifetime and uses
+``BEGIN IMMEDIATE`` per mutation. Maintenance waits on both sidecars.
 
 Sensitivity is an additional capability, not an alternative name for a data
 scope. A fact with `scope: "private"` and `sensitivity: "sensitive"` is visible
@@ -56,18 +59,38 @@ sensitive durable writes. `secret` durable writes remain disabled. The same
 filter applies to search, context, evidence, history, projections, and conflict
 members.
 
-Prompt-ready `memory.context` is stricter than search. It renders only facts
-whose correction status is `human_confirmed` or `human_corrected`, then applies
-normalized control-syntax rejection as defense in depth. Other matches return
-only redacted receipts with an exclusion reason. Grant correction authority
-only to a trusted review surface; ordinary extraction or agent writes are not
-implicitly prompt-trusted. Arbitrary stored text remains inspectable through
-the structured `memory.search` path.
+Prompt-ready `memory.context` is stricter than search. It omits
+`correction_status='unreviewed'` rows and instruction-shaped content from
+Markdown, returning redacted receipts for those matches. Writes with a null
+correction status may still render and are labeled untrusted. Reviewed facts
+(`human_confirmed` / `human_corrected`) are packed first. Grant correction
+authority only to a trusted review surface; ordinary extraction or agent
+writes are not implicitly prompt-trusted. Arbitrary stored text remains
+inspectable through the structured `memory.search` path.
 
-The `retrieval` object is required. `ci` mode is an offline plumbing test, not
-a semantic production retriever, and therefore requires the conspicuous
-`allow_nonproduction: true` opt-in. Health output preserves
-`embedder_production_ready: false`.
+The `retrieval` object is required. The production-honest default is
+`local-lexical`: FTS, Jaccard, current-state priors, review, and trust, with
+dense scoring disabled rather than faked. It needs no model, no network, and
+no `sqlite-vec`. Health reports `embedder_production_ready: true` and
+`dense_scoring: "disabled"`. Prove the path with
+`enfold doctor` (write, recall, evidence through an isolated local-lexical daemon).
+
+Lexical recall matches overlapping tokens. It will not recover a paraphrase
+that shares no terms the way embeddings can. That is the tradeoff, not a
+hidden weakness. Compare the two stacks with
+`memory_eval.retrieval_scorecard` (see `memory_eval/README.md`). `ci` mode
+remains the explicit non-production plumbing test and still requires
+`allow_nonproduction: true`. Local Ollama embeddings plus optional
+`sqlite-vec` (`pip install "enfold[sqlite-vec] @ git+https://github.com/victorv2i/enfold@v0.8.1"`) are the documented upgrade:
+set `retrieval.mode` to `stored` and pin the artifact as shown below.
+
+Entity-graph expansion across up to two hops is also off by default for every
+`HybridRetriever` search. Direct library callers can opt in for a retriever by
+constructing `HybridRetriever(..., entity_expansion=True)`. Callers using the
+local lexical factory can request the same behavior with
+`lexical_retriever_factory(entity_expansion=True)`. The opt-in path retains the
+ordinary lifecycle, conflict, review, scope, and trust eligibility filters on
+every hop.
 
 The staged stored retrieval stack has a concrete SQLite backend and validates all
 of the following before use: exact query-to-document identity-role mapping,
@@ -140,6 +163,8 @@ lexical-only with a zero dense score. Health metadata reports
 `dense_candidate_coverage: "global"` and
 `candidate_generation: "global-index-plus-lexical"`; non-indexed and explicit
 CI modes instead honestly report the bounded `"recent-plus-lexical"` path.
+`local-lexical` reports `candidate_generation: "lexical"` and
+`dense_scoring: "disabled"`.
 
 The vec0 table is derived state. Rebuild validates all canonical vectors and
 records a source/index generation ledger; normal fresh opens use that ledger
@@ -331,11 +356,16 @@ emits exactly one canonical `{"proposals": [...], "version": 1}` object.
 Configuration, invalid-data, unavailable-service, and unexpected failures use
 stable statuses 64, 65, 69, and 70 without a diagnostic body.
 
-### Bundled OpenAI Luna child
+### Eval only: OpenAI Luna child (not daemon-supervised)
 
-`enfold-openai-extractor` implements the same `durable-memory-v2` subprocess
-contract for benchmark and evaluation use with the OpenAI Responses API. It is
-pinned to the official
+`enfold-openai-extractor` is an evaluation and Arena helper. It is not an
+activation path. Daemon-supervised `enfold-server ... run` attests only the
+bundled local Ollama child, requires an empty `environment`, and rejects
+this block with "automatic extraction artifact attestation failed". Do not
+paste the JSON below into `extraction.host`.
+
+The child implements the same `durable-memory-v2` subprocess contract for
+benchmark use with the OpenAI Responses API. It is pinned to the official
 `https://api.openai.com/v1/responses` endpoint, sends no tools, uses strict
 Structured Outputs, sets `store` to `false`, hashes the Enfold client identity
 into a privacy-preserving `safety_identifier`, and applies the same local span
@@ -365,14 +395,12 @@ environment, never through argv. Keep the user-owned server configuration
 private and permission-restricted. Optional environment fields are
 `OPENAI_ORG_ID`, `OPENAI_PROJECT_ID`, `ENFOLD_OPENAI_MODEL`,
 `ENFOLD_OPENAI_TIMEOUT_SECONDS`, `ENFOLD_OPENAI_MAX_RESPONSE_BYTES`, and
-`ENFOLD_OPENAI_MAX_OUTPUT_TOKENS`. Start with reasoning effort `none` and
-compare `low` in the extraction Arena before activation. Authentication and
-schema/request errors fail permanently; throttling and service failures remain
-retryable.
+`ENFOLD_OPENAI_MAX_OUTPUT_TOKENS`. Authentication and schema/request errors
+fail permanently; throttling and service failures remain retryable.
 
 This child requires a dedicated OpenAI Platform API key and usage billing.
 Consumer-product sessions and cached login credentials are unsupported and
 must never be copied, parsed, or forwarded. If no Platform API key is
-available, leave the child disabled. Daemon-supervised activation also rejects
+available, leave the child unused. Daemon-supervised activation also rejects
 hosted mutable model names that cannot be resolved to a locally verifiable
 immutable artifact.

@@ -61,7 +61,7 @@ def _write(
     value: str,
     *,
     authority: float = 0.8,
-    valid_from: str = "2026-07-11T12:00:00Z",
+    valid_from: str | None = "2026-07-11T12:00:00Z",
     scope: str = "private",
     correction_status: str | None = None,
 ):
@@ -241,6 +241,145 @@ def test_migrated_store_conflicts_abstain_and_remain_durable_on_matching_write()
     assert same_member.outcome == "conflict"
     assert conn.execute("SELECT count(*) FROM facts").fetchone()[0] == 2
     assert len(list_state_conflicts(conn)) == 1
+
+
+@pytest.mark.parametrize(
+    ("authority", "correction_status"),
+    ((0.9, None), (0.1, "human_corrected")),
+    ids=("higher-authority", "human-correction"),
+)
+def test_authoritative_write_resolves_open_conflict_and_supersedes_losers(
+    authority,
+    correction_status,
+):
+    conn = _store()
+    service = MemoryWriteService(
+        conn,
+        _writer,
+        MemoryPolicy(
+            {"client-a-state-tests": ("private", "work")},
+            correction_authorities=("client-a-state-tests",),
+            conflict_resolution_authorities=("client-a-state-tests",),
+        ),
+    )
+    first = _write(service, "drain-1", "terra-5.5", authority=0.5)
+    second = _write(service, "drain-2", "terra-5.6", authority=0.5)
+    conflict_id = list_state_conflicts(conn)[0].conflict_id
+
+    winner = _write(
+        service,
+        "drain-3",
+        "terra-5.7",
+        authority=authority,
+        correction_status=correction_status,
+    )
+
+    assert second.outcome == "conflict"
+    assert winner.outcome == "supersede"
+    current = read_current_state(conn, "cron:morning-briefing", "model")
+    assert current is not None and current.fact_id == winner.fact_id
+    assert list_state_conflicts(conn) == ()
+    assert conn.execute(
+        "SELECT resolution_fact_id FROM fact_conflicts WHERE conflict_id = ?",
+        (conflict_id,),
+    ).fetchone()[0] == winner.fact_id
+    losers = conn.execute(
+        "SELECT fact_id, superseded_by, invalid_at FROM facts "
+        "WHERE fact_id IN (?, ?) ORDER BY fact_id",
+        (first.fact_id, second.fact_id),
+    ).fetchall()
+    assert [(row[0], row[1]) for row in losers] == [
+        (first.fact_id, winner.fact_id),
+        (second.fact_id, winner.fact_id),
+    ]
+    assert all(row[2] is not None for row in losers)
+
+
+def test_higher_authority_write_without_resolve_grant_joins_open_conflict():
+    conn = _store()
+    service = MemoryWriteService(
+        conn,
+        _writer,
+        MemoryPolicy({"client-a-state-tests": ("private", "work")}),
+    )
+    first = _write(service, "ungranted-1", "terra-5.5", authority=0.5)
+    second = _write(service, "ungranted-2", "terra-5.6", authority=0.5)
+
+    third = _write(service, "ungranted-3", "terra-5.7", authority=0.9)
+
+    assert second.outcome == "conflict"
+    assert third.outcome == "conflict"
+    conflicts = list_state_conflicts(conn)
+    assert len(conflicts) == 1
+    assert set(conflicts[0].member_fact_ids) == {
+        first.fact_id,
+        second.fact_id,
+        third.fact_id,
+    }
+
+
+def test_dated_equal_authority_write_resolves_undated_open_conflict():
+    conn = _store()
+    service = MemoryWriteService(
+        conn,
+        _writer,
+        MemoryPolicy(
+            {"client-a-state-tests": ("private", "work")},
+            conflict_resolution_authorities=("client-a-state-tests",),
+        ),
+    )
+    first = _write(
+        service, "dated-drain-1", "terra-5.5", authority=0.5, valid_from=None
+    )
+    second = _write(
+        service, "dated-drain-2", "terra-5.6", authority=0.5, valid_from=None
+    )
+    third = _write(
+        service, "dated-drain-3", "terra-5.7", authority=0.5, valid_from=None
+    )
+    assert second.outcome == "conflict"
+    assert third.outcome == "conflict"
+
+    winner = _write(
+        service,
+        "dated-drain-4",
+        "terra-5.8",
+        authority=0.5,
+        valid_from="2026-07-18T12:00:00Z",
+    )
+
+    assert winner.outcome == "supersede"
+    current = read_current_state(conn, "cron:morning-briefing", "model")
+    assert current is not None and current.fact_id == winner.fact_id
+    assert list_state_conflicts(conn) == ()
+    losers = conn.execute(
+        "SELECT superseded_by FROM facts WHERE fact_id IN (?, ?, ?) ORDER BY fact_id",
+        (first.fact_id, second.fact_id, third.fact_id),
+    ).fetchall()
+    assert losers == [(winner.fact_id,), (winner.fact_id,), (winner.fact_id,)]
+
+
+def test_equal_authority_write_joins_open_conflict():
+    conn = _store()
+    service = MemoryWriteService(
+        conn,
+        _writer,
+        MemoryPolicy({"client-a-state-tests": ("private", "work")}),
+    )
+    first = _write(service, "join-1", "terra-5.5", authority=0.5)
+    second = _write(service, "join-2", "terra-5.6", authority=0.5)
+
+    third = _write(service, "join-3", "terra-5.7", authority=0.5)
+
+    assert second.outcome == "conflict"
+    assert third.outcome == "conflict"
+    conflict = list_state_conflicts(conn)
+    assert len(conflict) == 1
+    assert set(conflict[0].member_fact_ids) == {
+        first.fact_id,
+        second.fact_id,
+        third.fact_id,
+    }
 
 
 def test_migrated_store_state_slot_identity_isolated_by_scope():

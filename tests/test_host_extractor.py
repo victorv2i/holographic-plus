@@ -19,7 +19,7 @@ from enfold.protocol import ClientContext
 
 def _envelope() -> ExtractionEnvelope:
     return ExtractionEnvelope(
-        transcript="USER: Avery prefers local tools.",
+        transcript="Avery prefers local tools.",
         source="session_end",
         scope="private",
         context=ClientContext(
@@ -29,6 +29,7 @@ def _envelope() -> ExtractionEnvelope:
             session_id="thread-1",
             access_scopes=("private",),
         ),
+        turns=({"role": "user", "content": "Avery prefers local tools."},),
     )
 
 

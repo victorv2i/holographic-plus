@@ -37,6 +37,16 @@ def test_schema_status_is_read_only(tmp_path, capsys):
         ).fetchone() is None
 
 
+def test_connect_enforces_foreign_keys_on_read_and_write(tmp_path):
+    database = tmp_path / "fk.db"
+    _database(database)
+
+    with _connect(database, read_only=False) as conn:
+        assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+    with _connect(database, read_only=True) as conn:
+        assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+
+
 def test_read_only_connect_percent_encodes_sqlite_uri_path(tmp_path):
     database = tmp_path / "live?tenant=1.sqlite"
     _database(database)
@@ -583,6 +593,45 @@ def test_browse_snapshot_rechecks_destination_before_replace(
 
     assert "is not an Enfold browse snapshot" in capsys.readouterr().err
     assert destination.read_text(encoding="utf-8") == "concurrent owner"
+
+
+def test_capture_enable_is_opt_in_and_session_enqueues_without_write(
+    tmp_path, capsys
+):
+    database = tmp_path / "memory.db"
+    _database(database)
+    assert main(["migrate", str(database)]) == 0
+    capsys.readouterr()
+
+    assert main(["capture", "status", str(database)]) == 0
+    status = json.loads(capsys.readouterr().out)
+    assert status["enabled"] is False
+
+    assert main(["capture", "enable", str(database)]) == 2
+    assert "allow-unreviewed" in capsys.readouterr().err
+
+    assert main(["capture", "enable", str(database), "--allow-unreviewed"]) == 0
+    enabled = json.loads(capsys.readouterr().out)
+    assert enabled["enabled"] is True
+    assert enabled["visible_to_default_recall"] is False
+
+    transcript = tmp_path / "session.txt"
+    transcript.write_text("Avery prefers local memory.\n", encoding="utf-8")
+    assert main([
+        "capture", "session", str(database),
+        "--transcript", str(transcript),
+        "--client-id", "owner-install",
+        "--session-id", "first-session",
+        "--agent-id", "owner",
+        "--surface", "cli",
+    ]) == 0
+    queued = json.loads(capsys.readouterr().out)
+    assert queued["replayed"] is False
+    with sqlite3.connect(database) as conn:
+        assert conn.execute("SELECT content FROM facts").fetchall() == [
+            ("shared memory",)
+        ]
+        assert conn.execute("SELECT count(*) FROM extract_queue").fetchone()[0] == 1
 
 
 def test_browse_snapshot_rechecks_metadata_before_replace(

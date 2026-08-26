@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 import re
 from types import SimpleNamespace
 
@@ -164,3 +165,186 @@ def test_main_starts_stdio_proxy_in_process(monkeypatch):
 
     assert mcp_launcher.main(["ignored-by-test-parser"]) == 0
     assert calls == [{"transport": "stdio"}]
+
+
+def test_product_entry_self_test_creates_store_starts_daemon_and_recalls(
+    tmp_path, capsys
+):
+    config_dir = tmp_path / "config"
+    data_dir = tmp_path / "data"
+    pid_path = data_dir / "enfold.pid"
+    try:
+        result = mcp_launcher.product_main(
+            [
+                "--self-test",
+                "--config-dir",
+                str(config_dir),
+                "--data-dir",
+                str(data_dir),
+            ]
+        )
+        assert result == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["ok"] is True
+        assert payload["fact_id"]
+        assert (config_dir / "server.json").is_file()
+        assert (data_dir / "memory.db").is_file()
+        first = payload["fact_id"]
+
+        again = mcp_launcher.product_main(
+            [
+                "--self-test",
+                "--config-dir",
+                str(config_dir),
+                "--data-dir",
+                str(data_dir),
+            ]
+        )
+        assert again == 0
+        reused = json.loads(capsys.readouterr().out)
+        assert reused["ok"] is True
+        assert reused["fact_id"] != first
+        assert reused["daemon"] == "reused"
+    finally:
+        if pid_path.is_file():
+            import os
+            import signal
+            import time
+
+            pid = int(pid_path.read_text(encoding="utf-8").strip())
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                try:
+                    os.kill(pid, 0)
+                except OSError:
+                    break
+                time.sleep(0.02)
+
+
+def test_product_first_run_with_client_id_uses_minted_token_without_env(
+    tmp_path, capsys, monkeypatch
+):
+    monkeypatch.delenv("ENFOLD_CLIENT_CREDENTIAL", raising=False)
+    config_dir = tmp_path / "config"
+    data_dir = tmp_path / "data"
+    pid_path = data_dir / "enfold.pid"
+    try:
+        result = mcp_launcher.product_main(
+            [
+                "--self-test",
+                "--config-dir",
+                str(config_dir),
+                "--data-dir",
+                str(data_dir),
+                "--client-id",
+                "fresh-install",
+            ]
+        )
+        captured = capsys.readouterr()
+        assert result == 0, captured.err
+        payload = json.loads(captured.out)
+        assert payload["ok"] is True
+        raw = json.loads((config_dir / "server.json").read_text(encoding="utf-8"))
+        assert "fresh-install" in raw["grants"]
+    finally:
+        if pid_path.is_file():
+            import os
+            import signal
+            import time
+
+            pid = int(pid_path.read_text(encoding="utf-8").strip())
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                try:
+                    os.kill(pid, 0)
+                except OSError:
+                    break
+                time.sleep(0.02)
+
+
+def test_product_launcher_does_not_self_serve_another_clients_stored_credential(
+    tmp_path, capsys, monkeypatch
+):
+    from enfold.bootstrap import (
+        bootstrap,
+        credential_digest,
+        new_client_token,
+        replace_config,
+        write_client_credential,
+    )
+
+    config_dir = tmp_path / "config"
+    data_dir = tmp_path / "data"
+    pid_path = data_dir / "enfold.pid"
+    bootstrap(config_dir=config_dir, data_dir=data_dir, owner_client_id="low")
+    privileged_token = new_client_token()
+    raw = json.loads((config_dir / "server.json").read_text(encoding="utf-8"))
+    raw["grants"]["privileged"] = ["private"]
+    raw["client_credentials"]["privileged"] = credential_digest(privileged_token)
+    replace_config(config_dir / "server.json", raw)
+    write_client_credential(config_dir, "privileged", privileged_token)
+    monkeypatch.delenv("ENFOLD_CLIENT_CREDENTIAL", raising=False)
+
+    try:
+        result = mcp_launcher.product_main(
+            [
+                "--self-test",
+                "--config-dir",
+                str(config_dir),
+                "--data-dir",
+                str(data_dir),
+                "--client-id",
+                "privileged",
+            ]
+        )
+        captured = capsys.readouterr()
+        assert result == 2
+        assert privileged_token not in captured.out
+        assert privileged_token not in captured.err
+        assert "credential" in captured.err
+        assert "ok" not in captured.out
+
+        monkeypatch.setenv("ENFOLD_CLIENT_CREDENTIAL", privileged_token)
+        held = mcp_launcher.product_main(
+            [
+                "--self-test",
+                "--config-dir",
+                str(config_dir),
+                "--data-dir",
+                str(data_dir),
+                "--client-id",
+                "privileged",
+            ]
+        )
+        held_out = capsys.readouterr()
+        assert held == 0, held_out.err
+        payload = json.loads(held_out.out)
+        assert payload["ok"] is True
+        assert payload["fact_id"]
+        assert privileged_token not in held_out.out
+    finally:
+        if pid_path.is_file():
+            import os
+            import signal
+            import time
+
+            pid = int(pid_path.read_text(encoding="utf-8").strip())
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                try:
+                    os.kill(pid, 0)
+                except OSError:
+                    break
+                time.sleep(0.02)

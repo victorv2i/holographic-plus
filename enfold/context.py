@@ -13,7 +13,8 @@ from dataclasses import dataclass
 import math
 import re
 from typing import Any
-import unicodedata
+
+from .prompt_safety import instruction_shaped
 
 
 TOKEN_ESTIMATE_METHOD = "unicode_chars_divided_by_four"
@@ -24,20 +25,7 @@ _HEADER = (
 _ELLIPSIS = "…"
 TRUNCATION_MARKER = "… [truncated]"
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
-_PROMPT_CONTROL_RE = re.compile(
-    r"(?:"
-    r"(?:^|\n)[ \t]*(?:[#>*-]+[ \t]*)?(?:system|developer|assistant)\s*"
-    r"(?:(?:message|prompt|instructions?)\s*)?:"
-    r"|\[(?:/?inst|system)\]"
-    r"|<\/?(?:system|developer|assistant)(?:\s|>)"
-    r"|\b(?:ignore|disregard|forget|override|bypass|follow|obey)\b"
-    r".{0,96}\b(?:instructions?|prompt|rules?|policy|memory)\b"
-    r"|\b(?:reveal|expose|exfiltrate|disclose)\b"
-    r".{0,64}\b(?:secrets?|private\s+data|hidden\s+instructions?)\b"
-    r")",
-    re.IGNORECASE,
-)
-_REVIEWED_CORRECTION_STATUSES = frozenset({"human_confirmed", "human_corrected"})
+_REVIEWED_STATUSES = frozenset({"human_confirmed", "human_corrected"})
 
 
 def estimate_tokens(text: str) -> int:
@@ -157,28 +145,28 @@ def _safe_candidate(fact: Mapping[str, Any]) -> bool:
     )
 
 
-def _normalized_prompt_text(value: str) -> str:
-    normalized = unicodedata.normalize("NFKC", value)
-    return "".join(
-        character
-        for character in normalized
-        if unicodedata.category(character) != "Cf"
-    )
+def _review_status(fact: Mapping[str, Any]) -> str:
+    status = fact.get("correction_status")
+    if status == "human_confirmed":
+        return "confirmed"
+    if status == "human_corrected":
+        return "corrected"
+    return "unreviewed"
 
 
 def _prompt_rejection_reason(fact: Mapping[str, Any]) -> str | None:
-    """Reject content that tries to act as an instruction instead of a claim.
+    """Reject content that is not safe to render as prompt memory.
 
-    Context rendering is a higher-trust boundary than search.  The structured
-    search API remains available for arbitrary text, while prompt-ready context
-    requires an explicit human review status.  Normalized control-language and
-    role-marker rejection is a second defense, not the source of trust.
+    Context rendering is a higher-trust boundary than search. Explicit
+    correction_status='unreviewed' rows and instruction-shaped content are
+    quarantined from prompt markdown. NULL-status agent writes may still
+    render and are labeled as untrusted.
     """
 
-    if fact.get("correction_status") not in _REVIEWED_CORRECTION_STATUSES:
-        return "human_review_required"
-    content = _normalized_prompt_text(_text(fact.get("content")))
-    if not content.strip() or _PROMPT_CONTROL_RE.search(content) is not None:
+    if fact.get("correction_status") == "unreviewed":
+        return "unreviewed_content"
+    content = _text(fact.get("content"))
+    if instruction_shaped(content):
         return "instruction_shaped_content"
     return None
 
@@ -194,6 +182,18 @@ def _redacted_prompt_receipt(
         "content_omitted": True,
         "exclusion_reason": reason,
     }
+
+
+def _is_reviewed(fact: Mapping[str, Any]) -> bool:
+    return fact.get("correction_status") in _REVIEWED_STATUSES
+
+
+def _reviewed_first(facts: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    """Spend a tight token budget on reviewed claims before unreviewed ones."""
+
+    reviewed = [fact for fact in facts if _is_reviewed(fact)]
+    unreviewed = [fact for fact in facts if not _is_reviewed(fact)]
+    return [*reviewed, *unreviewed]
 
 
 def _state_slot(fact: Mapping[str, Any]) -> tuple[str, str, str] | None:
@@ -231,7 +231,8 @@ def _line_prefix(fact: Mapping[str, Any]) -> str:
         else None
     )
     evidence = f" evidence:{evidence_count}" if isinstance(evidence_count, int) else ""
-    return f"- [fact:{fact_id} score:{score_text} by:{_compact_source(attribution)}{evidence}] "
+    review = f" review:{_review_status(fact)}"
+    return f"- [fact:{fact_id} score:{score_text} by:{_compact_source(attribution)}{evidence}{review}] "
 
 
 def _truncate_to_budget(text: str, budget: int) -> tuple[str, bool]:
@@ -264,6 +265,42 @@ def _truncate_to_chars(text: str, maximum: int) -> tuple[str, bool]:
     return prefix + TRUNCATION_MARKER, True
 
 
+def _conflict_receipt_from_fact(fact: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Build a non-executable receipt for a conflict-dropped candidate."""
+
+    conflict_id = fact.get("conflict_group") or fact.get("conflict_id")
+    if not conflict_id:
+        return None
+    subject = _text(fact.get("subject_key")) or "untyped"
+    predicate = _text(fact.get("predicate_key")) or "claim"
+    members = fact.get("member_fact_ids")
+    if isinstance(members, (list, tuple)) and members:
+        member_fact_ids = tuple(int(item) for item in members)
+    elif fact.get("fact_id") is not None:
+        try:
+            member_fact_ids = (int(fact["fact_id"]),)
+        except (TypeError, ValueError):
+            member_fact_ids = ()
+    else:
+        member_fact_ids = ()
+    member_count = len(member_fact_ids) or 1
+    summary = (
+        f"[conflict:{conflict_id} slot:{subject}.{predicate} "
+        f"members:{member_count} - do not treat either as current]"
+    )
+    return {
+        "prompt_eligible": False,
+        "content_omitted": True,
+        "exclusion_reason": "open_conflict",
+        "conflict_id": str(conflict_id),
+        "scope": _text(fact.get("scope")) or "private",
+        "subject_key": subject,
+        "predicate_key": predicate,
+        "member_fact_ids": member_fact_ids,
+        "summary": summary,
+    }
+
+
 def pack_context(
     facts: Sequence[Mapping[str, Any]],
     *,
@@ -271,13 +308,15 @@ def pack_context(
     max_fact_chars: int | None = None,
     max_facts: int | None = None,
     mmr_lambda: float = 0.7,
+    conflict_receipts: Sequence[Mapping[str, Any]] = (),
 ) -> ContextPack:
-    """Pack ranked safe facts in input order without exceeding ``token_budget``.
+    """Pack ranked safe facts without exceeding ``token_budget``.
 
-    The input order is authoritative ranking order.  At most one current fact
-    per exact state slot is selected; non-state facts coexist normally.  The
-    returned structured facts carry an explicit ``context_truncated`` marker
-    when their Markdown content was shortened to honor the conservative budget.
+    Reviewed facts are packed before unreviewed ones so a tight budget spends
+    tokens on human-confirmed or human-corrected claims first.  Within each
+    group, input/MMR order is preserved.  At most one current fact per exact
+    state slot is selected.  Structured facts carry ``context_truncated`` when
+    Markdown was shortened to honor the conservative budget.
     """
 
     if isinstance(token_budget, bool) or not isinstance(token_budget, int):
@@ -303,14 +342,42 @@ def pack_context(
     omitted = 0
     unsafe = 0
     prompt_unsafe = 0
+    emitted_conflicts: set[str] = set()
 
-    ranked_facts = _mmr_select(facts, max_facts=max_facts, mmr_lambda=float(mmr_lambda))
+    def _emit_conflict_receipt(receipt: dict[str, Any]) -> bool:
+        if receipt["conflict_id"] in emitted_conflicts:
+            return False
+        line = receipt["summary"] + "\n"
+        if estimate_tokens(markdown + line) > token_budget:
+            return False
+        selected.append(receipt)
+        emitted_conflicts.add(receipt["conflict_id"])
+        return True
+
+    for raw_receipt in conflict_receipts:
+        receipt = _conflict_receipt_from_fact(dict(raw_receipt))
+        if receipt is None:
+            continue
+        if _emit_conflict_receipt(receipt):
+            markdown += receipt["summary"] + "\n"
+        else:
+            omitted += 1
+
+    ranked_facts = _reviewed_first(
+        _mmr_select(facts, max_facts=max_facts, mmr_lambda=float(mmr_lambda))
+    )
     omitted += len(facts) - len(ranked_facts)
     for raw_fact in ranked_facts:
         fact = dict(raw_fact)
         fact.pop("_mmr_embedding", None)
         if not _safe_candidate(fact):
             unsafe += 1
+            if fact.get("conflict_group") is not None:
+                receipt = _conflict_receipt_from_fact(fact)
+                if receipt is not None and _emit_conflict_receipt(receipt):
+                    markdown += receipt["summary"] + "\n"
+                else:
+                    omitted += 1
             continue
         rejection_reason = _prompt_rejection_reason(fact)
         if rejection_reason is not None:
@@ -344,6 +411,7 @@ def pack_context(
             continue
         fact["content"] = content
         fact["prompt_eligible"] = True
+        fact["review_status"] = _review_status(fact)
         fact["context_truncated"] = truncated
         if content_truncated:
             fact["content_truncated"] = True
@@ -354,6 +422,18 @@ def pack_context(
 
     prompt_selected = any(fact.get("prompt_eligible") for fact in selected)
     if not prompt_selected:
+        if emitted_conflicts:
+            used = estimate_tokens(markdown)
+            return ContextPack(
+                markdown,
+                tuple(selected),
+                True,
+                token_budget,
+                used,
+                omitted,
+                unsafe,
+                prompt_unsafe,
+            )
         return ContextPack(
             "", tuple(selected), True, token_budget, 0, omitted, unsafe, prompt_unsafe
         )

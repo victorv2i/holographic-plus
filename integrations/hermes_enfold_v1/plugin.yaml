@@ -1,5 +1,5 @@
 name: enfold_v1
-version: 0.8.0
+version: 0.8.1
 description: "Optional Hermes bridge to the standalone, scoped Enfold v1 daemon."
 provides_hooks:
   - on_session_end

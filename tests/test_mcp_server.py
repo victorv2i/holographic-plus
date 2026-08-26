@@ -343,6 +343,96 @@ def test_memory_add_value_update_supersedes(mcp_server_mod, provider):
     fact_ids = [h["fact_id"] for h in history["history"]]
     assert first["fact_id"] in fact_ids
     assert updated["fact_id"] in fact_ids
+    assert updated["superseded"] == first["fact_id"]
+    assert updated["supersede_via"] == "value_update"
+
+
+def test_memory_add_does_not_implicitly_supersede_typed_state(mcp_server_mod, provider):
+    server = mcp_server_mod.build_server(provider, read_only=False)
+    first = _content_json(_call(server, "memory_add", {
+        "content": "The Springfield API rate limit is 100 requests per minute",
+        "category": "general",
+        "source": "editor",
+    }))
+    with provider._store._lock:
+        conn = provider._store._conn
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(facts)")}
+        for column, coltype in (
+            ("memory_kind", "TEXT"),
+            ("subject_key", "TEXT"),
+            ("predicate_key", "TEXT"),
+            ("object_value", "TEXT"),
+            ("conflict_group", "TEXT"),
+        ):
+            if column not in columns:
+                conn.execute(f"ALTER TABLE facts ADD COLUMN {column} {coltype}")
+        conn.execute(
+            """
+            UPDATE facts
+               SET memory_kind = 'state',
+                   subject_key = 'springfield',
+                   predicate_key = 'rate_limit',
+                   object_value = '100'
+             WHERE fact_id = ?
+            """,
+            (first["fact_id"],),
+        )
+        conn.commit()
+
+    updated = _content_json(_call(server, "memory_add", {
+        "content": "The Springfield API rate limit is 200 requests per minute",
+        "category": "general",
+        "source": "editor",
+    }))
+    assert updated["status"] == "added"
+    assert "superseded" not in updated
+    rows = provider._store._conn.execute(
+        """
+        SELECT fact_id, invalid_at, superseded_by, memory_kind
+          FROM facts
+         ORDER BY fact_id
+        """
+    ).fetchall()
+    assert len(rows) == 2
+    assert rows[0]["fact_id"] == first["fact_id"]
+    assert rows[0]["invalid_at"] is None
+    assert rows[0]["superseded_by"] is None
+    assert rows[0]["memory_kind"] == "state"
+    assert rows[1]["invalid_at"] is None
+
+
+def test_memory_add_does_not_implicitly_supersede_conflict_members(
+    mcp_server_mod, provider
+):
+    server = mcp_server_mod.build_server(provider, read_only=False)
+    first = _content_json(_call(server, "memory_add", {
+        "content": "The Springfield API rate limit is 100 requests per minute",
+        "category": "general",
+        "source": "editor",
+    }))
+    with provider._store._lock:
+        conn = provider._store._conn
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(facts)")}
+        if "conflict_group" not in columns:
+            conn.execute("ALTER TABLE facts ADD COLUMN conflict_group TEXT")
+        conn.execute(
+            "UPDATE facts SET conflict_group = 'open-conflict' WHERE fact_id = ?",
+            (first["fact_id"],),
+        )
+        conn.commit()
+
+    updated = _content_json(_call(server, "memory_add", {
+        "content": "The Springfield API rate limit is 200 requests per minute",
+        "category": "general",
+        "source": "editor",
+    }))
+    assert updated["status"] == "added"
+    row = provider._store._conn.execute(
+        "SELECT invalid_at, superseded_by FROM facts WHERE fact_id = ?",
+        (first["fact_id"],),
+    ).fetchone()
+    assert row["invalid_at"] is None
+    assert row["superseded_by"] is None
 
 
 def test_memory_add_reports_store_deduplication(mcp_server_mod, provider):

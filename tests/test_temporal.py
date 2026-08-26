@@ -24,6 +24,7 @@ from enfold.temporal import (
     find_value_update_target,
     supersede,
     fact_history,
+    row_matches_as_of,
 )
 
 _SCHEMA = """
@@ -248,6 +249,64 @@ def test_supersede_marks_old_fact_invalid():
         "SELECT invalid_at FROM facts WHERE fact_id = ?", (new_id,)
     ).fetchone()
     assert new_row["invalid_at"] is None
+
+
+def test_supersede_leaves_commit_to_the_caller():
+    conn = _conn()
+    ensure_temporal_schema(conn)
+    old_id = _add(conn, "The Skylark dashboard port is 3100.")
+    new_id = _add(conn, "The Skylark dashboard port is 3200.")
+
+    conn.execute("BEGIN")
+    assert supersede(conn, old_id, new_id) is True
+    conn.rollback()
+
+    row = conn.execute(
+        "SELECT invalid_at, superseded_by FROM facts WHERE fact_id = ?", (old_id,)
+    ).fetchone()
+    assert row["invalid_at"] is None
+    assert row["superseded_by"] is None
+
+
+def test_supersede_refuses_typed_state_and_open_conflict_members():
+    conn = _conn()
+    ensure_temporal_schema(conn)
+    conn.execute("ALTER TABLE facts ADD COLUMN memory_kind TEXT")
+    conn.execute("ALTER TABLE facts ADD COLUMN conflict_group TEXT")
+    state_id = _add(conn, "The Skylark dashboard port is 3100.", memory_kind="state")
+    conflict_id = _add(
+        conn, "Alex Rivera lives in Boston.", conflict_group="open-conflict"
+    )
+    replacement = _add(conn, "The Skylark dashboard port is 3200.")
+
+    assert supersede(conn, state_id, replacement) is False
+    assert supersede(conn, conflict_id, replacement) is False
+    for fact_id in (state_id, conflict_id):
+        row = conn.execute(
+            "SELECT invalid_at, superseded_by FROM facts WHERE fact_id = ?",
+            (fact_id,),
+        ).fetchone()
+        assert row["invalid_at"] is None
+        assert row["superseded_by"] is None
+
+
+def test_find_value_update_target_skips_state_and_conflicted_facts():
+    target = find_value_update_target(
+        "The Skylark dashboard port is 3200.",
+        [
+            {
+                "fact_id": 7,
+                "content": "The Skylark dashboard port is 3100.",
+                "memory_kind": "state",
+            },
+            {
+                "fact_id": 9,
+                "content": "The Skylark dashboard port is 3100 on staging.",
+                "conflict_group": "open-conflict",
+            },
+        ],
+    )
+    assert target is None
 
 
 def test_supersede_is_idempotent_and_does_not_overwrite_an_existing_link():
@@ -559,7 +618,7 @@ def test_provider_fact_history_walks_the_chain(make_provider):
     assert [f["fact_id"] for f in chain_from_new] == ids
 
 
-def test_extraction_insert_supersedes_a_value_update(make_provider, aux_module, waiter):
+def test_extraction_insert_leaves_existing_value_current(make_provider, aux_module, waiter):
     import json
     import types
 
@@ -587,12 +646,12 @@ def test_extraction_insert_supersedes_a_value_update(make_provider, aux_module, 
     old_row = provider._store._conn.execute(
         "SELECT invalid_at, superseded_by FROM facts WHERE fact_id = ?", (old_id,)
     ).fetchone()
-    assert old_row["invalid_at"] is not None
-    assert old_row["superseded_by"] is not None
+    assert old_row["invalid_at"] is None
+    assert old_row["superseded_by"] is None
 
     facts = provider._store.list_facts(min_trust=0.0, limit=50)
     contents = [f["content"] for f in facts]
-    assert "The Skylark dashboard port is 3200." in contents
+    assert "The Skylark dashboard port is 3100." in contents
 
 
 def test_extraction_insert_batch_uses_cross_process_write_lock(
@@ -613,7 +672,7 @@ def test_extraction_insert_batch_uses_cross_process_write_lock(
 
     monkeypatch.setattr(hp, "cross_process_write_lock", fake_lock, raising=False)
     provider = make_provider(extraction_provider="testprov", extraction_model="testmodel")
-    old_id = provider._store.add_fact(
+    provider._store.add_fact(
         "The Skylark dashboard port is 3100.", category="project"
     )
 
@@ -635,11 +694,6 @@ def test_extraction_insert_batch_uses_cross_process_write_lock(
     assert lock_events
     assert lock_events[0][0] == "enter"
     assert lock_events[-1][0] == "exit"
-
-    old_row = provider._store._conn.execute(
-        "SELECT superseded_by FROM facts WHERE fact_id = ?", (old_id,)
-    ).fetchone()
-    assert old_row["superseded_by"] is not None
 
 
 def test_reflection_insert_uses_cross_process_write_lock(make_provider, hp, monkeypatch):
@@ -664,3 +718,72 @@ def test_reflection_insert_uses_cross_process_write_lock(make_provider, hp, monk
 
     assert fact_id
     assert [event[0] for event in lock_events] == ["enter", "exit"]
+
+
+def test_row_matches_as_of_tx_uses_invalid_at_for_legacy_supersession():
+    row = {
+        "created_at": "2020-01-01T00:00:00Z",
+        "expired_at": None,
+        "valid_from": "2020-01-01T00:00:00Z",
+        "valid_to": None,
+        "invalid_at": "2026-08-01T12:00:00+00:00",
+        "superseded_by": 2,
+        "conflict_group": None,
+    }
+    assert row_matches_as_of(row, as_of_tx="2021-01-01T00:00:00Z") is True
+    assert row_matches_as_of(row, as_of_tx="2026-09-01T00:00:00Z") is False
+
+
+def test_row_matches_as_of_tx_keeps_closed_interval_with_valid_to():
+    row = {
+        "created_at": "2018-01-01T00:00:00Z",
+        "expired_at": None,
+        "valid_from": "2018-01-01T00:00:00Z",
+        "valid_to": "2022-01-01T00:00:00Z",
+        "invalid_at": "2026-08-01T12:00:00+00:00",
+        "superseded_by": 2,
+        "conflict_group": None,
+    }
+    assert row_matches_as_of(row, as_of_tx="2026-09-01T00:00:00Z") is True
+
+
+def test_row_matches_as_of_valid_rejects_unknown_end_on_superseded_fact():
+    row = {
+        "created_at": "2020-01-01T00:00:00Z",
+        "expired_at": None,
+        "valid_from": "2020-01-01T00:00:00Z",
+        "valid_to": None,
+        "invalid_at": "2026-08-01T12:00:00+00:00",
+        "superseded_by": 2,
+        "conflict_group": None,
+    }
+
+    assert row_matches_as_of(row, as_of_valid="2026-09-01T00:00:00Z") is False
+
+
+def test_row_matches_as_of_valid_keeps_history_before_pending_end():
+    row = {
+        "created_at": "2020-01-01T00:00:00Z",
+        "expired_at": None,
+        "valid_from": "2020-01-01T00:00:00Z",
+        "valid_to": None,
+        "invalid_at": "2026-08-01T12:00:00+00:00",
+        "superseded_by": 2,
+        "conflict_group": None,
+    }
+
+    assert row_matches_as_of(row, as_of_valid="2021-01-01T00:00:00Z") is True
+
+
+def test_row_matches_as_of_valid_keeps_current_null_end_open():
+    row = {
+        "created_at": "2020-01-01T00:00:00Z",
+        "expired_at": None,
+        "valid_from": "2020-01-01T00:00:00Z",
+        "valid_to": None,
+        "invalid_at": None,
+        "superseded_by": None,
+        "conflict_group": None,
+    }
+
+    assert row_matches_as_of(row, as_of_valid="2026-09-01T00:00:00Z") is True

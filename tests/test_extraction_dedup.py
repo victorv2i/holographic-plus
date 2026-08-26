@@ -101,7 +101,9 @@ def test_queue_drain_retries_when_fact_insert_fails(make_provider, aux_module):
         raise RuntimeError("database is locked")
 
     provider._store.add_fact = locked_add_fact
-    row_id = provider._extract_queue.enqueue("USER: a transcript that extracts one fact")
+    row_id = provider._extract_queue.enqueue(
+        [{"role": "user", "content": "a transcript that extracts one fact"}]
+    )
 
     import threading
     stop = threading.Event()
@@ -257,7 +259,9 @@ def test_drain_extract_queue_caps_items_processed_per_tick(make_provider, aux_mo
 
     import threading
     for i in range(5):
-        provider._extract_queue.enqueue(f"USER: transcript number {i}")
+        provider._extract_queue.enqueue(
+            [{"role": "user", "content": f"transcript number {i}"}]
+        )
 
     stop = threading.Event()
     provider._drain_extract_queue(stop, provider._extract_queue)

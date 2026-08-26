@@ -85,6 +85,33 @@ class SocketPathError(DaemonError):
     """The configured socket path cannot be safely claimed."""
 
 
+# Linux sockaddr_un.sun_path is 108 bytes including the trailing NUL.
+AF_UNIX_PATH_MAX = 107
+
+
+def unix_socket_path_bytes(path: Path) -> int:
+    """Return the filesystem-encoded length of a Unix socket path."""
+
+    return len(os.fsencode(os.fspath(path)))
+
+
+def check_unix_socket_path(path: Path) -> None:
+    """Refuse a path the kernel cannot bind as AF_UNIX.
+
+    The store is not moved. Callers that can choose a new path should pass a
+    shorter ``--socket-path`` or place the socket under ``/tmp`` or
+    ``XDG_RUNTIME_DIR``.
+    """
+
+    length = unix_socket_path_bytes(path)
+    if length > AF_UNIX_PATH_MAX:
+        raise SocketPathError(
+            f"Unix socket path is {length} bytes; AF_UNIX allows at most "
+            f"{AF_UNIX_PATH_MAX} bytes. Use a shorter --socket-path under "
+            f"/tmp or XDG_RUNTIME_DIR. The store stays where it is."
+        )
+
+
 class DaemonAlreadyRunning(SocketPathError):
     """Another process is accepting connections on the socket."""
 
@@ -125,6 +152,72 @@ def inspect_peer_credentials(client: socket.socket) -> PeerCredentials | None:
     return PeerCredentials(pid=pid, uid=uid, gid=gid)
 
 
+def socket_liveness(path: Path, *, timeout: float = 0.25) -> str:
+    """Return ``absent``, ``live``, or ``stale`` for a Unix socket path."""
+
+    candidate = Path(path)
+    try:
+        info = candidate.lstat()
+    except FileNotFoundError:
+        return "absent"
+    if not stat.S_ISSOCK(info.st_mode):
+        raise SocketPathError("socket path exists and is not a Unix socket")
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    probe.settimeout(timeout)
+    try:
+        probe.connect(os.fspath(candidate))
+    except OSError as exc:
+        if exc.errno in {errno.ECONNREFUSED, errno.ENOENT}:
+            return "stale"
+        raise SocketPathError(
+            f"cannot safely inspect existing socket: {exc}"
+        ) from exc
+    else:
+        return "live"
+    finally:
+        probe.close()
+
+
+def remove_stale_socket(path: Path) -> bool:
+    """Unlink a stale socket inode.  Live sockets are left untouched."""
+
+    candidate = Path(path)
+    try:
+        info = candidate.lstat()
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISSOCK(info.st_mode):
+        raise SocketPathError("socket path exists and is not a Unix socket")
+    status = socket_liveness(candidate)
+    if status == "live":
+        raise DaemonAlreadyRunning("another daemon is accepting on socket")
+    if status == "absent":
+        return False
+    current = candidate.lstat()
+    if (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino):
+        raise SocketPathError("socket path changed during stale check")
+    candidate.unlink()
+    return True
+
+
+def wait_for_live_socket(path: Path, *, timeout: float = 5.0) -> None:
+    """Block until the socket accepts connections or the deadline expires."""
+
+    if (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, (int, float))
+        or not math.isfinite(timeout)
+        or timeout <= 0
+    ):
+        raise ValueError("timeout must be positive")
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if socket_liveness(path) == "live":
+            return
+        time.sleep(0.02)
+    raise DaemonError(f"daemon socket was not ready within {timeout} seconds")
+
+
 class FrameCodec(Protocol):
     """Narrow boundary for later integration with the shared protocol module."""
 
@@ -162,6 +255,7 @@ class DaemonConfig:
     max_frame_bytes: int = MAX_FRAME_SIZE
     client_timeout: float = 5.0
     shutdown_timeout: float = 5.0
+    handler_timeout: float = 35.0
     backlog: int = 16
     cleanup_stale_socket: bool = False
     client_credentials: Mapping[str, str] = field(default_factory=dict)
@@ -180,7 +274,11 @@ class DaemonConfig:
             or not isinstance(timeout, (int, float))
             or not math.isfinite(timeout)
             or timeout <= 0
-            for timeout in (self.client_timeout, self.shutdown_timeout)
+            for timeout in (
+                self.client_timeout,
+                self.shutdown_timeout,
+                self.handler_timeout,
+            )
         ):
             raise ValueError("timeouts must be positive")
         if self.backlog <= 0:
@@ -336,6 +434,7 @@ class UnixJsonDaemon:
         path = self.socket_path
         if not path.is_absolute():
             raise SocketPathError("socket_path must be absolute")
+        check_unix_socket_path(path)
         if not path.parent.is_dir():
             raise SocketPathError("socket parent directory does not exist")
         self._prepare_socket_path(path)
@@ -409,6 +508,10 @@ class UnixJsonDaemon:
                     return
                 raise
             peer = inspect_peer_credentials(client)
+            if getattr(socket, "SO_PEERCRED", None) is not None and peer is None:
+                logger.warning("refusing Enfold socket peer without kernel credentials")
+                client.close()
+                continue
             if peer is not None:
                 if peer.uid != os.getuid():
                     logger.warning(
@@ -441,6 +544,12 @@ class UnixJsonDaemon:
                 if self._stop.is_set():
                     client.close()
                     return
+                if len(self._clients) >= self.config.backlog:
+                    logger.warning(
+                        "refusing Enfold socket client: connection cap reached"
+                    )
+                    client.close()
+                    continue
                 self._clients.add(client)
                 self._client_threads.add(thread)
                 thread.start()
@@ -557,15 +666,21 @@ class UnixJsonDaemon:
 
         try:
             if decoded.method == "health":
-                result = self._health(connection.context)
+                result = self._run_with_deadline(
+                    lambda: self._health(connection.context)
+                )
+            elif decoded.method in READ_ONLY_METHODS:
+                result = self._run_with_deadline(
+                    lambda: self._handler(connection.context, decoded)
+                )
             else:
                 # Unknown/future methods fail safe into the exclusive lane;
                 # only explicitly classified reads may execute concurrently.
-                if decoded.method in READ_ONLY_METHODS:
-                    result = self._handler(connection.context, decoded)
-                else:
+                def mutate() -> Any:
                     with self._handler_lock:
-                        result = self._handler(connection.context, decoded)
+                        return self._handler(connection.context, decoded)
+
+                result = self._run_with_deadline(mutate)
             response = Response(
                 decoded.request_id,
                 True,
@@ -665,6 +780,30 @@ class UnixJsonDaemon:
                 "request schema differs from the accepted handshake",
             )
         return None
+
+    def _run_with_deadline(self, work: Callable[[], Any]) -> Any:
+        box: list[Any] = []
+        errors: list[BaseException] = []
+
+        def run() -> None:
+            try:
+                box.append(work())
+            except BaseException as exc:
+                errors.append(exc)
+
+        worker = threading.Thread(
+            target=run, name="enfold-daemon-handler", daemon=True
+        )
+        worker.start()
+        worker.join(self.config.handler_timeout)
+        if worker.is_alive():
+            raise RequestError(
+                "request_timeout",
+                "request handler exceeded deadline",
+            )
+        if errors:
+            raise errors[0]
+        return box[0]
 
     def _health(self, context: ClientContext) -> JsonObject:
         result: JsonObject = {

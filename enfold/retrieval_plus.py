@@ -99,13 +99,16 @@ class PlusFactRetriever(FactRetriever):
         clauses = []
         if "conflict_group" in columns and not include_conflicts:
             clauses.append(f"{alias}.conflict_group IS NULL")
+        params: list = []
+        if "correction_status" in columns:
+            clauses.append(f"{alias}.correction_status IS NOT ?")
+            params.append("unreviewed")
         if include_lifecycle and self.lifecycle_filter:
             clauses.extend(
                 f"{alias}.{name} IS NULL"
                 for name in ("invalid_at", "superseded_by")
                 if name in columns
             )
-        params: list = []
         if "scope" in columns:
             if self.allowed_scopes is not None:
                 if self.allowed_scopes:
@@ -144,7 +147,7 @@ class PlusFactRetriever(FactRetriever):
         1. FTS5 candidates (limit * 3, lean columns)
         2. Jaccard + FTS + HRR relevance, trust weighted, optional entity boost
         3. Optional temporal decay
-        4. Optional 1-hop entity expansion, ranked below the direct hits
+        4. Optional 1-hop entity expansion, merged by its uncapped score
 
         When *explain* is true, each returned fact carries a ``_breakdown``
         dict with the component scores (fts, jaccard, hrr, entity_boost,
@@ -253,7 +256,9 @@ class PlusFactRetriever(FactRetriever):
         expanded = self._expand_via_entities(
             direct, candidate_entities, category, min_trust, limit
         )
-        return (direct + expanded)[:limit]
+        combined = direct + expanded
+        combined.sort(key=lambda fact: (-fact["score"], fact["fact_id"]))
+        return combined[:limit]
 
     # ------------------------------------------------------------------
     # Entity graph
@@ -334,8 +339,7 @@ class PlusFactRetriever(FactRetriever):
         query. Hub entities (linked to more than ``entity_hub_degree_limit``
         facts) are excluded so a ubiquitous entity like the user's own name
         cannot flood the results. Returned facts are marked
-        ``expanded_from_entity`` and never outrank a direct hit (the caller
-        appends this list after ``direct``).
+        ``expanded_from_entity`` and compete with direct hits by score.
         """
         direct_ids = {f["fact_id"] for f in direct}
         seed_entities: set = set()
@@ -391,15 +395,11 @@ class PlusFactRetriever(FactRetriever):
             fact = dict(row)
             fact.pop("via_entity", None)
             fact["expanded_from_entity"] = row["via_entity"]
-            # Ranked strictly below every direct hit: trust-scaled but capped
-            # under the lowest direct score so expansion can never displace a
-            # real match, only supplement it.
-            floor = min((f["score"] for f in direct), default=0.0)
-            fact["score"] = min(floor, self.entity_boost_weight * fact["trust_score"])
+            fact["score"] = self.entity_boost_weight * fact["trust_score"]
             expanded.append(fact)
 
         expanded.sort(key=lambda x: x["score"], reverse=True)
-        return expanded[: max(0, limit - len(direct))]
+        return expanded[:limit]
 
     def _load_hrr_vectors(self, fact_ids: List[int]) -> Dict[int, bytes]:
         """Fetch hrr_vector blobs for *fact_ids* in a single query."""

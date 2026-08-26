@@ -335,6 +335,7 @@ def _is_superseded(content: str) -> bool:
 from .embed_store import EmbedStore  # noqa: E402
 from .backup import sqlite_file_uri  # noqa: E402
 from .extract_queue import ExtractQueue, is_quota_error, quota_retry_delay  # noqa: E402
+from .extraction_spans import eligible_transcript_spans, normalize_transcript, transcript_spans  # noqa: E402
 from .llm_extract import _format_conversation, extract_facts_from_transcript, insert_facts  # noqa: E402
 from .reflection import ensure_reflection_schema, invalidate_insights_citing, run_reflection  # noqa: E402
 from .schema import SchemaError, schema_version  # noqa: E402
@@ -938,7 +939,7 @@ class EnfoldProvider(HolographicMemoryProvider):
         self._enqueue_extraction(messages, source="session_end")
 
     def _enqueue_extraction(self, messages: List[Dict[str, Any]], source: str) -> bool:
-        """Format and persist a transcript for the extraction worker.
+        """Persist attributed turns for the extraction worker.
 
         Returns True when a row was enqueued. Skips quietly when no extraction
         model is configured (queued rows could never be processed).
@@ -948,10 +949,16 @@ class EnfoldProvider(HolographicMemoryProvider):
         if not self._extract_provider or not self._extract_model:
             return False
         try:
-            transcript = _format_conversation(messages)
-            if not transcript.strip():
+            turns = [
+                {"role": message.get("role"), "content": message.get("content")}
+                for message in messages
+                if message.get("role") in {"user", "assistant", "tool"}
+                and isinstance(message.get("content"), str)
+                and message["content"].strip()
+            ]
+            if not turns:
                 return False
-            self._extract_queue.enqueue(transcript)
+            self._extract_queue.enqueue(turns)
             if self._queue_wake is not None:
                 self._queue_wake.set()
             logger.debug("enfold: queued extraction from %s", source)
@@ -1063,13 +1070,30 @@ class EnfoldProvider(HolographicMemoryProvider):
             if row is None:
                 break
             try:
-                if row.get("proposal_json") is not None:
+                transcript_input: Any = row["payload"]
+                if row.get("role_structured"):
+                    transcript_input = json.loads(row["payload"])
+                else:
+                    transcript_text, attributed_turns = normalize_transcript(
+                        row["payload"]
+                    )
+                    if attributed_turns is not None:
+                        transcript_input = attributed_turns
+                    else:
+                        transcript_input = transcript_text
+                eligible_spans = eligible_transcript_spans(
+                    transcript_spans(transcript_input)
+                )
+                model_transcript = "\n\n".join(span.text for span in eligible_spans)
+                if not eligible_spans:
+                    facts = []
+                elif row.get("proposal_json") is not None:
                     facts = json.loads(row["proposal_json"])
                     if not isinstance(facts, list):
                         raise ValueError("stored extraction proposal is not a list")
                 else:
                     facts = extract_facts_from_transcript(
-                        row["payload"],
+                        model_transcript,
                         store,
                         provider=self._extract_provider,
                         model=self._extract_model,
@@ -1078,9 +1102,8 @@ class EnfoldProvider(HolographicMemoryProvider):
                             topic, min_trust=self._min_trust, limit=limit, bump=False
                         ),
                     )
-                    if not queue.save_proposals(
-                        row["id"], facts, row["lease_owner"]
-                    ):
+                if row.get("proposal_json") is None:
+                    if not queue.save_proposals(row["id"], facts, row["lease_owner"]):
                         raise RuntimeError("extraction queue lease was lost")
                 if not self._generation_current(generation, "extraction insert"):
                     break
@@ -1100,7 +1123,6 @@ class EnfoldProvider(HolographicMemoryProvider):
                                 store, facts, embed_callback=self._embed_cb,
                                 dedup_check=self._find_near_duplicate if self._dedup_on_add else None,
                                 update_check=self._find_update_target if self._dedup_on_add else None,
-                                supersede=self._supersede_fact if self._dedup_on_add else None,
                             )
                     inserted = result.inserted
                     if result.failed:

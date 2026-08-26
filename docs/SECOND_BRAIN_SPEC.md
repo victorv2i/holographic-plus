@@ -1,6 +1,10 @@
 # Enfold Shared Second Brain Specification
 
-Status: Draft for council review
+Status: Historical design note. Not current product documentation.
+The shipped contract is the code plus `README.md`, `docs/BOOTSTRAP.md`,
+`docs/MCP_PROXY.md`, and `docs/SERVER_DEPLOYMENT.md`.
+
+Original status: Draft for council review
 Target: Enfold 1.0
 Compatibility baseline: Enfold 0.7.x
 

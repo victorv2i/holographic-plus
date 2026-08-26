@@ -6,6 +6,10 @@ from enfold.policy import (
     MemoryPolicy,
     PolicyDecision,
     UnknownMemoryClient,
+    default_credential_screen,
+    is_run_scope,
+    run_scope_for_session,
+    scope_authorized,
     validate_relation,
     validate_scope,
     validate_sensitivity,
@@ -58,10 +62,22 @@ def test_unknown_client_and_empty_grant_intersection_fail_closed():
         policy.authorize_context(_context(access_scopes=("work",)))
 
 
-@pytest.mark.parametrize("scope", ["private ", "team", "project:", "project:a/b"])
+@pytest.mark.parametrize("scope", ["private ", "team", "project:", "project:a/b", "run:", "run:a/b"])
 def test_scope_vocabulary_is_strict(scope):
     with pytest.raises(ValueError, match="unsupported memory scope"):
         validate_scope(scope)
+
+
+def test_run_scope_is_a_private_partition_not_a_separate_grant():
+    assert validate_scope("run:child-session") == "run:child-session"
+    assert is_run_scope("run:child-session")
+    assert not is_run_scope("private")
+    assert scope_authorized("run:child-session", ("private", "work"))
+    assert not scope_authorized("run:child-session", ("work",))
+    assert run_scope_for_session("child-session") == "run:child-session"
+    hashed = run_scope_for_session("not a token")
+    assert hashed.startswith("run:")
+    assert hashed == validate_scope(hashed)
 
 
 def test_sensitivity_and_relation_vocabularies_are_strict():
@@ -168,5 +184,25 @@ def test_correction_claims_require_explicit_server_authority():
 def test_expanded_credential_shapes_are_rejected(value):
     policy = MemoryPolicy({"client-a-install": ("private",)})
     assert policy.evaluate_write(_request(asserted_by=value)) == PolicyDecision(
+        "rejected", "credential-shaped content"
+    )
+
+
+def test_extracted_proposal_screen_ignores_surrounding_transcript():
+    from enfold.policy import extracted_proposal_credential_decision
+
+    surrounding = "api_key = exampletestvalue"
+    content = "Ada prefers Terra for briefings."
+    assert extracted_proposal_credential_decision(content, content) is None
+    assert extracted_proposal_credential_decision(
+        "The deployment api_key = exampletestvalue.",
+        "The deployment api_key = exampletestvalue.",
+    ) == PolicyDecision("rejected", "credential-shaped content")
+    poisoned = _request(
+        content=content,
+        evidence_excerpt=content,
+        observation_content=surrounding,
+    )
+    assert default_credential_screen(poisoned) == PolicyDecision(
         "rejected", "credential-shaped content"
     )

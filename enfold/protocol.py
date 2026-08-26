@@ -6,6 +6,7 @@ databases, or services and has no import-time side effects.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
 import math
 import re
@@ -60,6 +61,7 @@ METHOD_CAPABILITIES = {
     "memory.conflicts": CAPABILITY_CONFLICTS,
     "memory.resolve_conflict": CAPABILITY_RESOLVE_CONFLICT,
     "memory.extraction.enqueue": CAPABILITY_ENQUEUE_EXTRACTION,
+    "memory.promote": CAPABILITY_WRITE,
 }
 IMMUTABLE_CONTEXT_FIELDS = frozenset({
     "client_id",
@@ -116,6 +118,23 @@ def _optional_string(value: Any, name: str) -> str | None:
     if value is None:
         return None
     return _required_string(value, name)
+
+
+def optional_as_of_timestamp(value: Any, name: str) -> str | None:
+    """Validate an optional ISO-8601 as-of clock without inventing a default."""
+
+    if value is None:
+        return None
+    text = _required_string(value, name)
+    candidate = text[:-1] + "+00:00" if text.endswith("Z") else text
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError as exc:
+        raise ProtocolValidationError(f"{name} must be an ISO-8601 timestamp") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    parsed.astimezone(timezone.utc)
+    return text
 
 
 def _strict_int(value: Any, name: str, *, minimum: int = 0) -> int:

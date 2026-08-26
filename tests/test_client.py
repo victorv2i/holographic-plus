@@ -189,6 +189,11 @@ def test_client_config_requires_absolute_socket_path():
         ClientConfig(socket_path="relative.sock", context=_context())
 
 
+def test_default_request_timeout_covers_retrieval_embed_budget(tmp_path):
+    config = ClientConfig(socket_path=tmp_path / "enfold.sock", context=_context())
+    assert config.request_timeout >= 35.0
+
+
 def test_client_timeout_is_typed_transport_error(tmp_path):
     path = tmp_path / "hung.sock"
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)

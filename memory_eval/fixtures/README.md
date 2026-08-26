@@ -20,3 +20,17 @@ access. Its dense component is deterministic feature hashing, **not a semantic
 model and not the production embedding stack**. It is meant to catch plumbing
 and filtering regressions; model-quality claims require a separately identified
 local production embedder and a disclosed benchmark run.
+
+`locomo_smoke.json` and `longmemeval_smoke.json` are tiny fictional fixtures
+for adapter tests. They are not LOCOMO or LongMemEval-S and must not be
+reported as those benchmarks. Acquire the real files outside git using the
+steps in `docs/BENCHMARK_PROTOCOL.md`.
+
+`transcript_gate_cases.jsonl` is the capture ship-gate fixture. Cases
+are synthetic and production-shaped: invented people, courses, and
+projects with the same turn mix and adversarial traps as a live
+capture failure. The seven-case `extraction_arena_seed.jsonl` is not
+that gate. Rebuild the committed bank with
+`build_transcript_gate_bank.py`. Do not paste private transcripts,
+live session ids, live fact ids, or private-arena cases into git.
+Do not re-mine a live store into this repository.

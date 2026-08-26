@@ -61,6 +61,9 @@ class EnfoldHandshakeError(EnfoldRemoteError):
     """The daemon explicitly refused the client handshake."""
 
 
+DEFAULT_REQUEST_TIMEOUT = 35.0
+
+
 @dataclass(frozen=True, slots=True)
 class ClientConfig:
     socket_path: Path
@@ -69,7 +72,7 @@ class ClientConfig:
     protocol: ProtocolVersion = ProtocolVersion()
     schema_version: int = SUPPORTED_SCHEMA_VERSION
     connect_timeout: float = 2.0
-    request_timeout: float = 5.0
+    request_timeout: float = DEFAULT_REQUEST_TIMEOUT
     max_frame_bytes: int = MAX_FRAME_SIZE
     credential: str | None = field(default=None, repr=False)
 

@@ -22,10 +22,12 @@ from enfold.hermes_adapter import (
     HermesProtocolAdapter,
     HermesSessionContext,
 )
+from enfold.policy import run_scope_for_session
 
 
 logger = logging.getLogger(__name__)
-_MAX_TRANSCRIPT_BYTES = 10 * 1024
+_MAX_TRANSCRIPT_BYTES = 6 * 1024
+MAX_DELEGATION_RESULT_CHARS = 500
 _PREFETCH_TOKEN_BUDGET = 384
 _IDENTITY_METADATA_KEYS = frozenset({
     "client_id",
@@ -64,20 +66,35 @@ def _client_failure(exc: EnfoldClientError) -> tuple[str, bool]:
     return "client_error", False
 
 
-def _format_messages(messages: List[Dict[str, Any]]) -> str:
-    lines = []
+def _format_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    turns = []
     for message in messages:
         role = message.get("role")
         content = message.get("content")
-        if role in {"user", "assistant"} and isinstance(content, str) and content.strip():
-            lines.append(f"{role.upper()}: {content.strip()}")
-    transcript = "\n\n".join(lines)
-    encoded = transcript.encode("utf-8")
-    if len(encoded) <= _MAX_TRANSCRIPT_BYTES:
-        return transcript
+        if (
+            role in {"user", "assistant", "tool"}
+            and isinstance(content, str)
+            and content.strip()
+        ):
+            turns.append({"role": role, "content": content.strip()})
+    kept = []
+    remaining = _MAX_TRANSCRIPT_BYTES
+    for turn in reversed(turns):
+        separator_bytes = 2 if kept else 0
+        available = remaining - separator_bytes
+        if available <= 0:
+            break
+        encoded = turn["content"].encode("utf-8")
+        if len(encoded) > available:
+            content = encoded[-available:].decode("utf-8", errors="ignore").strip()
+            if content:
+                kept.append({"role": turn["role"], "content": content})
+            break
+        kept.append(turn)
+        remaining -= separator_bytes + len(encoded)
     # Recent turns normally carry the active decisions and preferences.  Keep
     # a UTF-8-safe tail while leaving envelope room under the daemon's cap.
-    return encoded[-_MAX_TRANSCRIPT_BYTES:].decode("utf-8", errors="ignore")
+    return list(reversed(kept))
 
 
 _TOOL_SCHEMA = {
@@ -88,7 +105,7 @@ _TOOL_SCHEMA = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["search", "add", "evidence", "history", "conflicts"],
+                "enum": ["search", "add", "evidence", "history", "conflicts", "promote"],
             },
             "query": {"type": "string"},
             "content": {"type": "string"},
@@ -144,6 +161,11 @@ _TOOL_SCHEMA = {
                 "description": "Prior untyped fact replaced by an evidenced correction.",
             },
             "scope": {"type": "string", "default": "private"},
+            "target_scope": {
+                "type": "string",
+                "default": "private",
+                "description": "Durable scope for promote. Must not be a run: partition.",
+            },
             "category": {"type": "string"},
             "tags": {"type": "string"},
             "fact_id": {"type": "integer"},
@@ -299,10 +321,15 @@ class EnfoldV1MemoryProvider(MemoryProvider):
             session = self._current(str(kwargs.get("session_id") or ""))
             action = args.get("action")
             if action == "search":
+                search_kwargs: dict[str, Any] = {
+                    "category": args.get("category"),
+                    "limit": int(args.get("limit", 10)),
+                }
+                if args.get("scope") is not None:
+                    search_kwargs["scope"] = args.get("scope")
                 result = session.search(
                     str(args.get("query") or ""),
-                    category=args.get("category"),
-                    limit=int(args.get("limit", 10)),
+                    **search_kwargs,
                 )
             elif action == "add":
                 event_id = str(args.get("event_id") or "").strip()
@@ -340,6 +367,15 @@ class EnfoldV1MemoryProvider(MemoryProvider):
                 result = session.history(**_history_selector(args))
             elif action == "conflicts":
                 result = session.conflicts(scope=args.get("scope"))
+            elif action == "promote":
+                event_id = str(args.get("event_id") or "").strip()
+                if not event_id:
+                    raise ValueError("event_id is required for promote")
+                result = session.promote(
+                    int(args["fact_id"]),
+                    event_id=event_id,
+                    target_scope=str(args.get("target_scope") or "private"),
+                )
             else:
                 raise ValueError("unsupported Enfold memory action")
             return json.dumps({"ok": True, "result": result}, sort_keys=True)
@@ -430,6 +466,12 @@ class EnfoldV1MemoryProvider(MemoryProvider):
     ) -> None:
         if not child_session_id or not result:
             return
+        if len(result) > MAX_DELEGATION_RESULT_CHARS:
+            logger.info(
+                "Enfold skipped long delegation dump (%s chars)",
+                len(result),
+            )
+            return
         child_agent = str(kwargs.get("child_agent_id") or f"{self._identity}:subagent")
         child = self._session_for(
             child_session_id,
@@ -443,7 +485,7 @@ class EnfoldV1MemoryProvider(MemoryProvider):
                     "delegation", {"child_session_id": child_session_id, "task": task, "result": result}
                 ),
                 source_type="hermes_delegation_result",
-                scope="private",
+                scope=run_scope_for_session(child_session_id),
                 metadata={"task": task, "parent_session": self._session_id},
             )
         except EnfoldClientError as exc:

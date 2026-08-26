@@ -333,9 +333,15 @@ def test_initialize_auto_revives_young_quota_dead_only(hp, make_provider, aux_mo
     db_path = tmp_path / "facts.db"
     conn = sqlite3.connect(str(db_path), check_same_thread=False)
     queue = hp.extract_queue.ExtractQueue(conn)
-    quota_id = queue.enqueue("USER: I always use pnpm for node projects.")
-    other_id = queue.enqueue("USER: transcript killed by a real failure")
-    old_id = queue.enqueue("USER: quota transcript past the age cap")
+    quota_id = queue.enqueue(
+        [{"role": "user", "content": "I always use pnpm for node projects."}]
+    )
+    other_id = queue.enqueue(
+        [{"role": "user", "content": "transcript killed by a real failure"}]
+    )
+    old_id = queue.enqueue(
+        [{"role": "user", "content": "quota transcript past the age cap"}]
+    )
     row = _claim(queue, quota_id, max_attempts=1)
     queue.mark_failed(quota_id, QUOTA_ERROR, max_attempts=1, lease_owner=row["lease_owner"])
     row = _claim(queue, other_id, max_attempts=1)

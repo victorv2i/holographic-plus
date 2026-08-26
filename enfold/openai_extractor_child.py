@@ -32,7 +32,11 @@ from .extraction_contract import (
     normalize_proposal_document,
     proposal_schema,
 )
-from .extraction_spans import TranscriptSpan, transcript_spans
+from .extraction_spans import (
+    TranscriptSpan,
+    eligible_transcript_spans,
+    transcript_spans,
+)
 
 
 DEFAULT_ENDPOINT = "https://api.openai.com/v1/responses"
@@ -92,7 +96,7 @@ class OpenAIChildConfig:
     endpoint: str = DEFAULT_ENDPOINT
     model: str = DEFAULT_MODEL
     prompt_identity: str = PROMPT_IDENTITY
-    timeout_seconds: float = 120.0
+    timeout_seconds: float = 180.0
     max_response_bytes: int = DEFAULT_MAX_HTTP_BYTES
     max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS
     reasoning_effort: str = "none"
@@ -342,9 +346,10 @@ def transform(
     if not isinstance(raw, bytes) or not raw or len(raw) > MAX_STDIN_BYTES:
         raise ChildError(EXIT_INVALID_DATA)
     envelope = _decode_input(raw, config)
-    spans = transcript_spans(envelope["transcript"])
+    transcript = envelope.get("turns", envelope.get("transcript"))
+    spans = eligible_transcript_spans(transcript_spans(transcript))
     if not spans:
-        raise ChildError(EXIT_INVALID_DATA)
+        return b'{"proposals":[],"version":1}'
     response = _call_openai(
         _openai_payload(envelope, config, spans), config, opener=opener
     )
@@ -370,7 +375,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-identity", required=True)
     parser.add_argument("--prompt-identity", default=PROMPT_IDENTITY)
     parser.add_argument(
-        "--timeout-seconds", type=float, default=os.environ.get(_ENV_TIMEOUT, "120")
+        "--timeout-seconds", type=float, default=os.environ.get(_ENV_TIMEOUT, "180")
     )
     parser.add_argument(
         "--max-response-bytes",

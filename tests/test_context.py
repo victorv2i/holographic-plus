@@ -44,7 +44,14 @@ def test_pack_context_keeps_rank_order_one_current_state_per_slot_and_receipts()
         predicate_key="backup_schedule",
     )
     stale = _fact(3, "Former backup schedule ran Monday.", invalid_at="2026-07-10")
-    conflict = _fact(4, "Disputed backup schedule.", conflict_group="backup-conflict")
+    conflict = _fact(
+        4,
+        "Disputed backup schedule.",
+        conflict_group="backup-conflict",
+        subject_key="atlas",
+        predicate_key="backup_schedule",
+        member_fact_ids=(4, 9),
+    )
     reference = _fact(5, "The Atlas runbook is stored in the Cedar registry.")
 
     pack = pack_context(
@@ -52,15 +59,59 @@ def test_pack_context_keeps_rank_order_one_current_state_per_slot_and_receipts()
     )
 
     assert pack.abstained is False
-    assert [fact["fact_id"] for fact in pack.facts] == [1, 5]
+    assert [fact.get("fact_id") for fact in pack.facts] == [1, None, 5]
+    assert pack.facts[1]["exclusion_reason"] == "open_conflict"
+    assert pack.facts[1]["conflict_id"] == "backup-conflict"
     assert pack.unsafe_fact_count == 2
     assert pack.omitted_fact_count == 1
     assert "fact:1" in pack.markdown
     assert "score:0.990" in pack.markdown
     assert "by:avery" in pack.markdown
+    assert "review:confirmed" in pack.markdown
     assert "fact:2" not in pack.markdown
     assert "fact:3" not in pack.markdown
     assert "fact:4" not in pack.markdown
+    assert "Disputed backup schedule." not in pack.markdown
+    assert (
+        "[conflict:backup-conflict slot:atlas.backup_schedule members:2"
+        " - do not treat either as current]"
+    ) in pack.markdown
+
+
+def test_pack_context_emits_conflict_receipt_when_only_conflicted_candidates_remain():
+    conflicted = _fact(
+        4,
+        "Disputed backup schedule.",
+        conflict_group="backup-conflict",
+        subject_key="atlas",
+        predicate_key="backup_schedule",
+        member_fact_ids=(4, 8),
+    )
+
+    pack = pack_context([conflicted], token_budget=256)
+
+    assert pack.abstained is True
+    assert "Disputed backup schedule." not in pack.markdown
+    assert (
+        "[conflict:backup-conflict slot:atlas.backup_schedule members:2"
+        " - do not treat either as current]"
+    ) in pack.markdown
+    assert pack.facts == (
+        {
+            "prompt_eligible": False,
+            "content_omitted": True,
+            "exclusion_reason": "open_conflict",
+            "conflict_id": "backup-conflict",
+            "scope": "private",
+            "subject_key": "atlas",
+            "predicate_key": "backup_schedule",
+            "member_fact_ids": (4, 8),
+            "summary": (
+                "[conflict:backup-conflict slot:atlas.backup_schedule members:2"
+                " - do not treat either as current]"
+            ),
+        },
+    )
 
 
 def test_pack_context_uses_conservative_budget_and_deterministic_truncation():
@@ -159,7 +210,44 @@ def test_pack_context_abstains_but_returns_redacted_receipt_for_only_hostile_mem
     )
 
 
-def test_pack_context_requires_explicit_human_review_before_prompt_rendering():
+def test_pack_context_labels_human_corrected_facts_distinctly():
+    corrected = _fact(
+        13,
+        "Avery's preferred terminal is WezTerm.",
+        correction_status="human_corrected",
+    )
+
+    pack = pack_context([corrected], token_budget=256)
+
+    assert pack.abstained is False
+    assert "review:corrected" in pack.markdown
+    assert pack.facts[0]["review_status"] == "corrected"
+
+
+def test_pack_context_spends_budget_on_reviewed_facts_first():
+    unreviewed = _fact(
+        20,
+        "Unreviewed note that ranks first but should wait for budget.",
+        score=0.99,
+        correction_status=None,
+    )
+    reviewed = _fact(
+        21,
+        "Avery's preferred terminal is WezTerm.",
+        score=0.50,
+        correction_status="human_corrected",
+    )
+
+    pack = pack_context([unreviewed, reviewed], token_budget=52)
+
+    assert pack.abstained is False
+    assert "WezTerm" in pack.markdown
+    assert "Unreviewed note" not in pack.markdown
+    assert pack.facts[0]["fact_id"] == 21
+    assert pack.facts[0]["review_status"] == "corrected"
+
+
+def test_pack_context_renders_unreviewed_declarative_facts_as_untrusted():
     unreviewed = _fact(
         10,
         "Avery's preferred terminal is WezTerm.",
@@ -168,16 +256,11 @@ def test_pack_context_requires_explicit_human_review_before_prompt_rendering():
 
     pack = pack_context([unreviewed], token_budget=256)
 
-    assert pack.abstained is True
-    assert "WezTerm" not in pack.markdown
-    assert pack.facts == (
-        {
-            "fact_id": 10,
-            "prompt_eligible": False,
-            "content_omitted": True,
-            "exclusion_reason": "human_review_required",
-        },
-    )
+    assert pack.abstained is False
+    assert "WezTerm" in pack.markdown
+    assert "review:unreviewed" in pack.markdown
+    assert pack.facts[0]["prompt_eligible"] is True
+    assert pack.facts[0]["review_status"] == "unreviewed"
 
 
 @pytest.mark.parametrize(

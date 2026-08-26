@@ -28,6 +28,7 @@ class RecordingTransport:
         ("conflicts", "memory.conflicts"),
         ("resolve_conflict", "memory.resolve_conflict"),
         ("enqueue_extraction", "memory.extraction.enqueue"),
+        ("promote", "memory.promote"),
     ],
 )
 def test_proxy_is_one_to_one_transport_adapter(proxy_method, wire_method):

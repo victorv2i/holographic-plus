@@ -117,11 +117,10 @@ def test_entity_boost_weight_zero_gives_no_boost_even_with_entity_mention(hp, st
 
 
 # ---------------------------------------------------------------------------
-# (b) 1-hop expansion surfaces a related fact via shared entity, ranked below
-#     direct hits and clearly marked
+# (b) 1-hop expansion surfaces a related fact via a shared entity and marks it
 # ---------------------------------------------------------------------------
 
-def test_one_hop_expansion_surfaces_related_fact_below_direct_hits(hp, store):
+def test_one_hop_expansion_surfaces_and_marks_related_fact(hp, store):
     direct_id = store.add_fact(
         "Alex Rivera prefers pnpm for node projects", category="tool"
     )
@@ -143,16 +142,55 @@ def test_one_hop_expansion_surfaces_related_fact_below_direct_hits(hp, store):
     assert related_id in ids
     assert unrelated_id not in ids
 
-    direct_rank = ids.index(direct_id)
-    related_rank = ids.index(related_id)
-    assert direct_rank < related_rank, "expanded fact must rank below the direct hit"
-
     related_fact = next(f for f in results if f["fact_id"] == related_id)
     assert related_fact.get("expanded_from_entity"), (
         "expansion-only results must be clearly marked"
     )
     direct_fact = next(f for f in results if f["fact_id"] == direct_id)
     assert not direct_fact.get("expanded_from_entity")
+
+
+def test_one_hop_expansion_score_is_not_capped_by_direct_hits(hp, store):
+    direct_id = store.add_fact(
+        "Alex Rivera prefers pnpm for node projects", category="tool"
+    )
+    related_id = store.add_fact(
+        "Alex Rivera lives in Springfield", category="general"
+    )
+    plus = _retriever(
+        hp, store, entity_boost_weight=0.3, entity_expansion=True
+    )
+    direct = [{"fact_id": direct_id, "score": 0.05}]
+    candidate_entities = plus._load_fact_entities([direct_id])
+
+    expanded = plus._expand_via_entities(
+        direct, candidate_entities, None, 0.0, 10
+    )
+    related = next(fact for fact in expanded if fact["fact_id"] == related_id)
+
+    assert related["score"] == pytest.approx(
+        plus.entity_boost_weight * related["trust_score"]
+    )
+    assert related["score"] > direct[0]["score"]
+
+
+def test_one_hop_expansion_can_outrank_a_weaker_direct_hit(hp, store):
+    direct_id = store.add_fact(
+        "Alex Rivera prefers pnpm for node projects", category="tool"
+    )
+    related_id = store.add_fact(
+        "Alex Rivera lives in Springfield", category="general"
+    )
+    plus = _retriever(
+        hp, store, entity_boost_weight=1.0, entity_expansion=True
+    )
+
+    results = plus.search("pnpm preference for node", min_trust=0.0, limit=10)
+
+    assert results[0]["fact_id"] == related_id
+    assert results[0]["score"] > next(
+        fact["score"] for fact in results if fact["fact_id"] == direct_id
+    )
 
 
 def test_expansion_is_off_by_default_even_with_boost_weight_set(hp, store):

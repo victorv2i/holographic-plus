@@ -238,7 +238,12 @@ def _replay_case(
                 f"enqueue-{case.case_id}",
                 "memory.extraction.enqueue",
                 {
-                    "transcript": case.transcript,
+                    "transcript": (
+                        [{"role": "user", "content": case.transcript}]
+                        if "\n" not in case.transcript
+                        and case.transcript.startswith("USER: ")
+                        else case.transcript
+                    ),
                     "source": "extraction_runtime_arena",
                     "scope": "private",
                     "metadata": {"case_id": case.case_id},

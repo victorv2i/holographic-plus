@@ -6,6 +6,7 @@ from enfold.core_store import insert_fact, settled_fact_events
 from enfold.schema import (
     Migration,
     MigrationError,
+    SchemaError,
     SchemaLedgerError,
     SchemaTooNewError,
     migrate,
@@ -58,6 +59,64 @@ def test_newer_schema_fails_closed():
 
     with pytest.raises(SchemaTooNewError):
         require_compatible_schema(conn)
+
+
+def test_writer_open_requires_extraction_snapshot_columns(tmp_path):
+    conn = sqlite3.connect(tmp_path / "unpatched-v1.db")
+    migrate(conn)
+    conn.execute("ALTER TABLE extract_queue DROP COLUMN proposal_json")
+    conn.execute("ALTER TABLE extract_queue DROP COLUMN proposal_hash")
+    conn.commit()
+
+    assert schema_version(conn) == 1
+    assert require_compatible_schema(conn) == 1
+    with pytest.raises(SchemaError, match="migrate"):
+        require_compatible_schema(conn, for_writer=True)
+
+    assert migrate(conn) == 1
+    assert require_compatible_schema(conn, for_writer=True) == 1
+    columns = {
+        str(row[1]) for row in conn.execute("PRAGMA table_info(extract_queue)")
+    }
+    assert {"proposal_json", "proposal_hash"} <= columns
+    conn.close()
+
+
+def _drop_facts_columns(conn: sqlite3.Connection, *names: str) -> None:
+    present = {str(row[1]) for row in conn.execute("PRAGMA table_info(facts)")}
+    for name in names:
+        if name in present:
+            conn.execute(f'ALTER TABLE facts DROP COLUMN "{name}"')
+    conn.commit()
+
+
+def test_writer_open_requires_bitemporal_columns(tmp_path):
+    conn = sqlite3.connect(tmp_path / "unpatched-bitemporal.db")
+    migrate(conn)
+    _drop_facts_columns(conn, "valid_to", "expired_at")
+
+    assert schema_version(conn) == 1
+    assert require_compatible_schema(conn) == 1
+    with pytest.raises(SchemaError, match="migrate"):
+        require_compatible_schema(conn, for_writer=True)
+
+    assert migrate(conn) == 1
+    assert require_compatible_schema(conn, for_writer=True) == 1
+    columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(facts)")}
+    assert {"valid_to", "expired_at"} <= columns
+    conn.close()
+
+
+@pytest.mark.parametrize("missing", ("valid_to", "expired_at"))
+def test_writer_open_refuses_partial_bitemporal_columns(tmp_path, missing):
+    conn = sqlite3.connect(tmp_path / f"partial-{missing}.db")
+    migrate(conn)
+    _drop_facts_columns(conn, missing)
+
+    assert require_compatible_schema(conn) == 1
+    with pytest.raises(SchemaError, match="migrate"):
+        require_compatible_schema(conn, for_writer=True)
+    conn.close()
 
 
 def test_incomplete_or_disagreeing_ledger_fails_closed():

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import sqlite3
+import urllib.error
 
 import numpy as np
 import pytest
 
 from enfold import _is_semantic_duplicate
+from enfold.hybrid_retrieval import StoredEmbeddingError
 from enfold.policy import MemoryPolicy
 from enfold.provenance import ConnectionContext, WriteRequest, ensure_provenance_schema
 from enfold.temporal import fact_history
@@ -284,6 +286,49 @@ def test_near_duplicate_guards_keep_value_and_state_changes(existing, incoming):
     )
 
 
+@pytest.mark.parametrize(
+    "exc",
+    [
+        StoredEmbeddingError("production query embedding is unavailable"),
+        urllib.error.URLError("connection refused"),
+        TimeoutError("ollama embed timed out"),
+        OSError("network is unreachable"),
+    ],
+)
+def test_embedder_outage_skips_near_dedup_and_still_writes(exc):
+    conn = _connection()
+    existing_id = _writer(
+        conn, _request("Build service listens on port 3100."), 0
+    ).fact_id
+    conn.commit()
+    _embed(conn, existing_id, (1.0, 0.0))
+    _refresh_fts(conn)
+
+    def boom(_content):
+        raise exc
+
+    service = MemoryWriteService(
+        conn,
+        _writer,
+        MemoryPolicy({"client-a-install-1": ("private",)}),
+        near_dedup=NearDedupConfig(embedding_identity=_IDENTITY),
+        query_embedder=boom,
+    )
+
+    result = service.write(
+        _context(),
+        _request("The build uses port 3100.", idempotency_key="embedder-outage"),
+    )
+
+    assert result.outcome == "inserted"
+    assert result.fact_id != existing_id
+    existing = conn.execute(
+        "SELECT invalid_at, superseded_by FROM facts WHERE fact_id = ?",
+        (existing_id,),
+    ).fetchone()
+    assert tuple(existing) == (None, None)
+
+
 def test_near_duplicate_is_disabled_or_unavailable_without_a_stored_embedding():
     conn = _connection()
     existing_id = _writer(
@@ -301,6 +346,68 @@ def test_near_duplicate_is_disabled_or_unavailable_without_a_stored_embedding():
 
     assert result.outcome == "inserted"
     assert existing_id != result.fact_id
+
+
+def test_implicit_near_dedup_does_not_retire_typed_state():
+    conn = _connection()
+    conn.execute("ALTER TABLE facts ADD COLUMN memory_kind TEXT")
+    existing_id = conn.execute(
+        """INSERT INTO facts (content, trust_score, source_authority, memory_kind)
+           VALUES ('Build service listens on port 3100.', 0.5, 0.5, 'state')"""
+    ).lastrowid
+    conn.commit()
+    _embed(conn, existing_id, (1.0, 0.0))
+    _refresh_fts(conn)
+
+    result = _service(conn, config=NearDedupConfig(embedding_identity=_IDENTITY)).write(
+        _context(),
+        _request(
+            "The build uses port 3100.",
+            idempotency_key="keep-state",
+            trust_score=0.5,
+        ),
+    )
+
+    assert result.outcome == "near_dedup"
+    assert result.fact_id == existing_id
+    kept = conn.execute(
+        "SELECT invalid_at, superseded_by, memory_kind FROM facts WHERE fact_id = ?",
+        (existing_id,),
+    ).fetchone()
+    assert tuple(kept) == (None, None, "state")
+
+
+def test_unreviewed_write_skips_near_dedup_in_both_directions():
+    conn = _connection()
+    existing_id = _writer(
+        conn, _request("Build service listens on port 3100."), 0
+    ).fact_id
+    conn.commit()
+    _embed(conn, existing_id, (1.0, 0.0))
+    _refresh_fts(conn)
+
+    result = _service(conn, config=NearDedupConfig(embedding_identity=_IDENTITY)).write(
+        _context(),
+        _request(
+            "The build uses port 3100.",
+            idempotency_key="unreviewed-skip",
+            correction_status="unreviewed",
+            trust_score=0.9,
+        ),
+    )
+
+    assert result.outcome == "inserted"
+    assert result.fact_id != existing_id
+    existing = conn.execute(
+        "SELECT invalid_at, superseded_by FROM facts WHERE fact_id = ?",
+        (existing_id,),
+    ).fetchone()
+    incoming = conn.execute(
+        "SELECT invalid_at, superseded_by FROM facts WHERE fact_id = ?",
+        (result.fact_id,),
+    ).fetchone()
+    assert tuple(existing) == (None, None)
+    assert tuple(incoming) == (None, None)
 
 
 def test_near_duplicate_prefers_the_newer_fact_when_trust_ties():

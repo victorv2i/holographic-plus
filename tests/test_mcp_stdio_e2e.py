@@ -196,17 +196,16 @@ def test_mcp_stdio_subprocess_writes_and_searches_through_real_daemon(daemon):
                 "id": 2,
                 "method": "tools/call",
                 "params": {
-                    "name": "memory_write",
+                    "name": "memory_remember",
                     "arguments": {
-                        "idempotency_key": "mcp-e2e-1",
                         "content": "The MCP subprocess wrote this durable memory.",
-                        "source_type": "integration_test",
+                        "origin": "tool",
                     },
                 },
             },
         )
         written = _tool_result(_receive(process))
-        assert written["outcome"] == "inserted"
+        assert written["status"] == "stored"
 
         _send(
             process,
@@ -215,13 +214,13 @@ def test_mcp_stdio_subprocess_writes_and_searches_through_real_daemon(daemon):
                 "id": 3,
                 "method": "tools/call",
                 "params": {
-                    "name": "memory_search",
+                    "name": "memory_recall",
                     "arguments": {"query": "MCP subprocess durable memory"},
                 },
             },
         )
         found = _tool_result(_receive(process))
-        assert [row["fact_id"] for row in found["facts"]] == [written["fact_id"]]
+        assert [row["id"] for row in found["facts"]] == [written["fact_id"]]
     finally:
         _stop(process)
 

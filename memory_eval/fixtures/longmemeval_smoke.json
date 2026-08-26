@@ -1,0 +1,27 @@
+[
+  {
+    "question_id": "lme-ku-1",
+    "question": "Where does Mara work now?",
+    "answer": "Contoso Research",
+    "question_type": "knowledge-update",
+    "question_date": "2026-07-20",
+    "haystack_dates": ["2025-04-01", "2026-07-12"],
+    "haystack_sessions": [
+      [{"role": "user", "content": "Mara works at Northwind Labs."}],
+      [{"role": "user", "content": "As of July 12, 2026, Mara works at Contoso Research."}]
+    ],
+    "answer_session_ids": ["sess-1"]
+  },
+  {
+    "question_id": "lme-abs-1",
+    "question": "What is Mara's favorite color?",
+    "answer": "I don't know.",
+    "question_type": "abstention",
+    "question_date": "2026-07-20",
+    "haystack_dates": ["2026-07-12"],
+    "haystack_sessions": [
+      [{"role": "user", "content": "As of July 12, 2026, Mara works at Contoso Research."}]
+    ],
+    "answer_session_ids": []
+  }
+]
